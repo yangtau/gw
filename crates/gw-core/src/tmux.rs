@@ -1,8 +1,11 @@
 //! Thin wrapper over the tmux CLI. Scope is always the current session.
 
+use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct Pane {
@@ -17,30 +20,152 @@ pub struct Pane {
 
 /// Panes of the current session (`list-panes -s`).
 pub fn list_panes() -> Result<Vec<Pane>> {
-    todo!()
+    let stdout = run_tmux(&[
+        "list-panes".into(),
+        "-s".into(),
+        "-F".into(),
+        "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}".into(),
+    ])?;
+    parse_panes(&stdout)
 }
 
 /// Pane whose tty matches, if any.
 pub fn pane_for_tty(tty: &str) -> Result<Option<String>> {
-    todo!()
+    let tty = normalize_tty(tty);
+    Ok(list_panes()?
+        .into_iter()
+        .find(|pane| normalize_tty(&pane.tty) == tty)
+        .map(|pane| pane.id))
 }
 
 /// Open a new window running `argv` in `cwd`; returns the new pane id.
 pub fn new_window(name: &str, cwd: &Path, argv: &[String]) -> Result<String> {
-    todo!()
+    let mut args = vec![
+        "new-window".into(),
+        "-P".into(),
+        "-F".into(),
+        "#{pane_id}".into(),
+        "-n".into(),
+        name.into(),
+        "-c".into(),
+        cwd.as_os_str().to_owned(),
+        "--".into(),
+    ];
+    args.extend(argv.iter().map(|arg| OsString::from(arg.as_str())));
+    Ok(parse_pane_id(&run_tmux(&args)?))
 }
 
 /// Focus the window/pane containing `pane_id`.
 pub fn focus(pane_id: &str) -> Result<()> {
-    todo!()
+    run_tmux(&["select-window".into(), "-t".into(), pane_id.into()])?;
+    run_tmux(&["select-pane".into(), "-t".into(), pane_id.into()])?;
+    Ok(())
 }
 
 /// Last `lines` visible lines of the pane, for the preview.
 pub fn capture(pane_id: &str, lines: u32) -> Result<String> {
-    todo!()
+    run_tmux(&[
+        "capture-pane".into(),
+        "-p".into(),
+        "-t".into(),
+        pane_id.into(),
+        "-S".into(),
+        format!("-{lines}").into(),
+    ])
 }
 
-/// Whether we are running inside a tmux display-popup.
+/// Whether `GW_POPUP=1` marks this process as running in a tmux popup.
+/// The recommended binding is `bind g popup -E 'GW_POPUP=1 gw'`.
 pub fn inside_popup() -> bool {
-    todo!()
+    matches!(std::env::var("GW_POPUP").as_deref(), Ok("1"))
+}
+
+fn run_tmux(args: &[OsString]) -> Result<String> {
+    let mut not_found = None;
+    for bin in ["tmux", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"] {
+        match Command::new(bin).args(args).output() {
+            Ok(output) => {
+                if !output.status.success() {
+                    bail!(
+                        "{bin} failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                return String::from_utf8(output.stdout).context("tmux output was not UTF-8");
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => not_found = Some(error),
+            Err(error) => return Err(error).with_context(|| format!("failed to run {bin}")),
+        }
+    }
+    Err(not_found.expect("tmux candidates are non-empty"))
+        .context("tmux was not found on PATH or in common locations")
+}
+
+fn parse_panes(stdout: &str) -> Result<Vec<Pane>> {
+    stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.splitn(6, '\t');
+            let id = fields.next().context("missing pane id")?;
+            let pid = fields
+                .next()
+                .context("missing pane pid")?
+                .parse()
+                .context("invalid pane pid")?;
+            let tty = fields.next().context("missing pane tty")?;
+            let cwd = fields.next().context("missing pane cwd")?;
+            let window_index = fields
+                .next()
+                .context("missing window index")?
+                .parse()
+                .context("invalid window index")?;
+            let window_name = fields.next().context("missing window name")?;
+            Ok(Pane {
+                id: id.into(),
+                pid,
+                tty: tty.into(),
+                cwd: cwd.into(),
+                window_index,
+                window_name: window_name.into(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_tty(tty: &str) -> &str {
+    tty.strip_prefix("/dev/").unwrap_or(tty)
+}
+
+fn parse_pane_id(stdout: &str) -> String {
+    stdout.trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_list_panes_output() {
+        let panes = parse_panes(
+            "%1\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\n\
+             %2\t456\tttys002\t/tmp\t3\tsecond window\n",
+        )
+        .unwrap();
+
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].id, "%1");
+        assert_eq!(panes[0].pid, 123);
+        assert_eq!(panes[0].tty, "/dev/ttys001");
+        assert_eq!(panes[0].cwd, PathBuf::from("/Users/me/project one"));
+        assert_eq!(panes[0].window_index, 2);
+        assert_eq!(panes[0].window_name, "agent");
+        assert_eq!(panes[1].window_name, "second window");
+    }
+
+    #[test]
+    fn normalizes_tty_prefix_and_pane_id_output() {
+        assert_eq!(normalize_tty("/dev/ttys012"), normalize_tty("ttys012"));
+        assert_eq!(parse_pane_id("%7\n"), "%7");
+    }
 }
