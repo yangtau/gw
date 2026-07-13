@@ -120,8 +120,17 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
             let Some(message) = payload.get("message").and_then(Value::as_str) else {
                 return Vec::new();
             };
+            // The 60s idle nag is not attention — turn_end already means idle.
+            if message.contains("waiting for your input") {
+                return Vec::new();
+            }
+            let attention = if message.contains("permission") {
+                AttentionKind::Approval
+            } else {
+                AttentionKind::Notification
+            };
             EventKind::Attention {
-                attention: AttentionKind::Notification,
+                attention,
                 summary: Some(message.into()),
             }
         }
@@ -180,16 +189,32 @@ mod tests {
         }
 
         let notification = event(
-            r#"{"session_id":"s2","hook_event_name":"Notification","message":"Needs input","notification_type":"info"}"#,
+            r#"{"session_id":"s2","hook_event_name":"Notification","message":"Build finished","notification_type":"info"}"#,
         );
         assert_eq!(notification.session, "s2");
         assert_eq!(
             notification.kind,
             EventKind::Attention {
                 attention: AttentionKind::Notification,
-                summary: Some("Needs input".into()),
+                summary: Some("Build finished".into()),
             }
         );
+    }
+
+    #[test]
+    fn classifies_notifications() {
+        let approval = event(
+            r#"{"session_id":"s2","hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#,
+        );
+        assert!(matches!(
+            approval.kind,
+            EventKind::Attention { attention: AttentionKind::Approval, .. }
+        ));
+
+        let idle_nag = normalize_payload(
+            br#"{"session_id":"s2","hook_event_name":"Notification","message":"Claude is waiting for your input"}"#,
+        );
+        assert!(idle_nag.is_empty());
     }
 
     #[test]

@@ -568,6 +568,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-provider-agy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gw-plugin-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "gw-provider-claude"
 version = "0.1.0"
 dependencies = [
