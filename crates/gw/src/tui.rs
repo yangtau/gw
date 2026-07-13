@@ -289,6 +289,7 @@ impl App {
                 Span::styled(label, Style::new().fg(provider_color.unwrap_or(Color::Reset))).into(),
                 Line::from(format!("{}:{}", agent.pane.window_index, agent.pane.window_name)),
                 Line::from(shorten(&agent.cwd, 32)),
+                Line::from(git_branch(&agent.cwd).unwrap_or_default()),
                 Line::from(agent.since.map(|t| ago(t, now)).unwrap_or_default()),
             ]);
             if i == self.selected {
@@ -304,10 +305,11 @@ impl App {
                 Constraint::Length(10),
                 Constraint::Min(12),
                 Constraint::Length(32),
+                Constraint::Length(20),
                 Constraint::Length(8),
             ],
         )
-        .header(Row::new(["status", "agent", "window", "cwd", "for"]).style(Style::new().dim()))
+        .header(Row::new(["status", "agent", "window", "cwd", "branch", "for"]).style(Style::new().dim()))
         .block(Block::new().borders(Borders::ALL).title(" agents "));
         frame.render_widget(table, area);
     }
@@ -411,6 +413,15 @@ fn shorten(path: &std::path::Path, max: usize) -> String {
 
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn git_branch(cwd: &std::path::Path) -> Option<String> {
+    let head = cwd.ancestors().map(|dir| dir.join(".git/HEAD")).find(|p| p.exists())?;
+    let head = std::fs::read_to_string(head).ok()?;
+    match head.trim().strip_prefix("ref: refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        None => Some(head.trim().chars().take(8).collect()),
+    }
 }
 
 fn ago(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
