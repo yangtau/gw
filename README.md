@@ -8,9 +8,22 @@ A tmux-native status panel for coding agents. One popup shows every claude / cod
 
 ## Setup
 
+Via nix (installs `gw` and the official provider plugins):
+
+```sh
+nix profile install .        # or reference this repo as a flake input
+```
+
+Or with cargo:
+
 ```sh
 cargo install --path crates/gw --path crates/gw-provider-claude --path crates/gw-provider-codex
-gw setup        # installs hooks into provider configs (backed up, surgical, reversible)
+```
+
+Then install the provider hooks (backed up, surgical, reversible):
+
+```sh
+gw setup
 ```
 
 Bind a key in `~/.tmux.conf` for the switcher posture:
