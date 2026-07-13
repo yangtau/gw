@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod hook;
 mod setup;
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "gw", about = "Coding agent panel for tmux")]
@@ -27,12 +28,8 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd.unwrap_or(Cmd::Panel) {
-        Cmd::Panel => panel(),
+        Cmd::Panel => tui::run(),
         Cmd::Hook { provider } => hook::run(&provider),
         Cmd::Setup { remove } => setup::run(remove),
     }
-}
-
-fn panel() -> Result<()> {
-    anyhow::bail!("panel TUI not implemented yet")
 }
