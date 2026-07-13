@@ -152,9 +152,14 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
             attention: AttentionKind::Approval,
             summary: tool_summary(payload),
         },
-        "Notification" => EventKind::Attention {
-            attention: AttentionKind::Question,
-            summary: excerpt(payload, "message").or_else(|| text(payload, "notification_type")),
+        // Re-checked despite the installed matcher: a pre-matcher hook entry
+        // delivers every type until `gw setup` is re-run.
+        "Notification" => match payload.get("notification_type").and_then(Value::as_str) {
+            Some("elicitation_dialog") | Some("agent_needs_input") => EventKind::Attention {
+                attention: AttentionKind::Question,
+                summary: excerpt(payload, "message").or_else(|| text(payload, "notification_type")),
+            },
+            _ => return Vec::new(),
         },
         "PostToolUse" => EventKind::Heartbeat {
             activity: text(payload, "tool_name"),
@@ -166,7 +171,7 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
             summary: excerpt(payload, "last_assistant_message"),
         },
         "StopFailure" => EventKind::TurnError {
-            reason: text(payload, "error_type").unwrap_or_else(|| "unknown".into()),
+            reason: text(payload, "error_type"),
             summary: excerpt(payload, "error_message"),
         },
         "SessionEnd" => EventKind::SessionEnd,
@@ -282,7 +287,7 @@ mod tests {
             (
                 r#"{"session_id":"s1","hook_event_name":"StopFailure","error_type":"rate_limit","error_message":"try later"}"#,
                 EventKind::TurnError {
-                    reason: "rate_limit".into(),
+                    reason: Some("rate_limit".into()),
                     summary: Some("try later".into()),
                 },
             ),
@@ -373,6 +378,14 @@ mod tests {
                 summary: Some("agent_needs_input".into()),
             }
         );
+
+        // A stale pre-matcher hook entry delivers every type; the rest are noise.
+        for noise in ["permission_prompt", "idle_prompt", "auth_success"] {
+            let payload = format!(
+                r#"{{"session_id":"s2","hook_event_name":"Notification","notification_type":"{noise}","message":"hi"}}"#
+            );
+            assert!(normalize_payload(payload.as_bytes()).is_empty());
+        }
     }
 
     #[test]

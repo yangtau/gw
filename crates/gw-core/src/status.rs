@@ -49,11 +49,11 @@ pub fn derive(events: &[Event], now: DateTime<Utc>, stale_after: Duration) -> Op
         }
         EventKind::TurnEnd { summary } => derived(SessionStatus::Done, summary.clone()),
         EventKind::TurnError { reason, summary } => {
-            let detail = match summary {
-                Some(summary) => format!("{reason}: {summary}"),
-                None => reason.clone(),
+            let detail = match (reason, summary) {
+                (Some(reason), Some(summary)) => Some(format!("{reason}: {summary}")),
+                (reason, summary) => reason.clone().or_else(|| summary.clone()),
             };
-            derived(SessionStatus::Error, Some(detail))
+            derived(SessionStatus::Error, detail)
         }
         EventKind::TurnStart { .. } | EventKind::Heartbeat { .. } => {
             let status = if now - ts(last) > stale_after {
@@ -243,7 +243,7 @@ mod tests {
         let bare = [ev(
             0,
             EventKind::TurnError {
-                reason: "rate_limit".into(),
+                reason: Some("rate_limit".into()),
                 summary: None,
             },
         )];
@@ -254,7 +254,7 @@ mod tests {
         let explained = [ev(
             0,
             EventKind::TurnError {
-                reason: "billing_error".into(),
+                reason: Some("billing_error".into()),
                 summary: Some("credit exhausted".into()),
             },
         )];

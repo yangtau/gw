@@ -127,18 +127,20 @@ fn join(
     for candidate in &live {
         let session_index = match_session(candidate, sessions, &derived, &matched);
         let (session_id, agent_status, since, detail) = match session_index {
+            // A matched session can still derive nothing: a log whose every
+            // line is retired vocabulary reads back empty.
             Some(index) => {
                 matched.insert(index);
                 let session = &sessions[index];
-                let derived = derived[index]
-                    .as_ref()
-                    .expect("session logs contain events");
-                (
-                    Some(session.meta.session.clone()),
-                    map_status(derived.status),
-                    Some(derived.since),
-                    derived.detail.clone(),
-                )
+                let (status, since, detail) = match derived[index].as_ref() {
+                    Some(derived) => (
+                        map_status(derived.status),
+                        Some(derived.since),
+                        derived.detail.clone(),
+                    ),
+                    None => (AgentStatus::Unknown, None, None),
+                };
+                (Some(session.meta.session.clone()), status, since, detail)
             }
             None => (None, AgentStatus::Unknown, None, None),
         };
@@ -494,5 +496,37 @@ mod tests {
         assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
         assert_eq!(snapshot.agents[0].session_id.as_deref(), Some("done"));
         assert!(snapshot.ended.is_empty());
+    }
+
+    #[test]
+    fn matched_session_with_no_readable_events_is_unknown() {
+        let panes = [pane("%1", 100, 1, "/work")];
+        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
+        let manifests = [manifest("claude", true)];
+        // A log whose every line is retired vocabulary reads back empty.
+        let mut retired = session(
+            "claude",
+            "old",
+            Some("%1"),
+            Some(101),
+            Some("/work"),
+            10,
+            EventKind::SessionEnd,
+        );
+        retired.events.clear();
+        let sessions = [retired];
+
+        let snapshot = join(
+            &panes,
+            &procs,
+            &sessions,
+            &manifests,
+            at(20),
+            Duration::minutes(30),
+            |_| None,
+        );
+
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Unknown);
+        assert_eq!(snapshot.agents[0].session_id.as_deref(), Some("old"));
     }
 }

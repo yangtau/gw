@@ -67,9 +67,11 @@ impl Store {
         }
 
         let (log_path, meta_path) = self.paths(provider, &event.session);
+        // Only an identical heartbeat is throttled: a changed activity is new
+        // information the panel should show.
         let throttled = matches!(event.kind, EventKind::Heartbeat { .. })
             && last_complete_event(&log_path)?.is_some_and(|last| {
-                matches!(last.kind, EventKind::Heartbeat { .. })
+                last.kind == event.kind
                     && last.ts.is_some_and(|ts| ts > now - Duration::seconds(30))
             });
 
@@ -307,6 +309,16 @@ mod tests {
         let record = store.sessions().unwrap().remove(0);
         assert_eq!(record.events.len(), 1);
         assert!(record.meta.updated_at > before);
+
+        // A changed activity is not throttled: the panel shows the new tool.
+        let edit = event(
+            "session-1",
+            EventKind::Heartbeat {
+                activity: Some("Edit".into()),
+            },
+        );
+        store.append("test", &edit, None).unwrap();
+        assert_eq!(store.sessions().unwrap().remove(0).events.len(), 2);
     }
 
     #[test]

@@ -106,15 +106,14 @@ pub fn normalize(plugin: &Plugin, payload: &[u8]) -> Result<Vec<Event>> {
         );
     }
 
-    output
+    // Lines that don't parse are skipped, not fatal: same evolution policy
+    // as log replay — a plugin speaking a newer vocabulary keeps working.
+    Ok(output
         .stdout
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .map(|line| {
-            serde_json::from_slice(line)
-                .with_context(|| format!("invalid event from {}", plugin.bin.display()))
-        })
-        .collect()
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect())
 }
 
 fn candidate_id(path: &Path) -> Option<&str> {
@@ -269,14 +268,25 @@ esac
     }
 
     #[test]
-    fn normalize_rejects_garbage_and_nonzero_exit() {
+    fn normalize_skips_unparseable_lines_and_rejects_nonzero_exit() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let bin = write_plugin(temp.path(), "fixture", PROTOCOL_VERSION);
         let _env = EnvGuard::set(temp.path());
         let plugin = discover().unwrap().remove(0);
-        fs::write(&bin, "#!/bin/sh\nprintf '%s\\n' 'not json'\n").unwrap();
-        assert!(normalize(&plugin, b"payload").is_err());
+        fs::write(
+            &bin,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' 'not json'\n",
+                r#"printf '%s\n' '{"v":1,"session":"s","kind":"turn_start"}'"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = normalize(&plugin, b"payload").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session, "s");
 
         fs::write(&bin, "#!/bin/sh\nexit 7\n").unwrap();
         assert!(normalize(&plugin, b"payload").is_err());

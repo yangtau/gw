@@ -104,7 +104,8 @@ pub enum EventKind {
     /// The turn aborted with a provider-reported failure.
     /// `reason` is the provider's error type (e.g. `rate_limit`).
     TurnError {
-        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },

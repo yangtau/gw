@@ -64,7 +64,7 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 | `heartbeat` | `activity?` (e.g. tool name) | still working (e.g. after each tool use); emit sparingly |
 | `attention` | `attention`: `approval` \| `question`, `summary?` | blocked mid-turn on the user: a permission dialog (`approval`) or an explicit question (`question`) |
 | `turn_end` | `summary?` (final message excerpt) | the turn finished normally |
-| `turn_error` | `reason` (e.g. provider error type), `summary?` | the turn aborted with a provider-reported failure |
+| `turn_error` | `reason?` (e.g. provider error type), `summary?` | the turn aborted with a provider-reported failure |
 | `session_end` | | the native session ended |
 
 Excerpt fields (`summary`, `activity`) are display one-liners; plugins truncate them (~120 chars) — the core stores what it is given. Every field beyond `session` and `kind` is optional: emit what the provider knows, omit what it doesn't.
@@ -78,4 +78,4 @@ Unknown payloads must produce zero events and exit 0 — never fail the provider
 
 ## Versioning
 
-Bump `protocol` only on breaking changes. Adding event kinds or optional fields is **not** breaking: when replaying a log, the core skips lines it cannot parse, so vocabulary can evolve without migrating stored events. The core supports the current version; plugins should print a clear error on `manifest` if invoked by an incompatible core.
+Bump `protocol` only on breaking changes. Adding event kinds or optional fields is **not** breaking: both when ingesting plugin output and when replaying a log, the core skips lines it cannot parse, so vocabulary can evolve without migrating stored events or lock-stepping plugins. The core supports the current version; plugins should print a clear error on `manifest` if invoked by an incompatible core.
