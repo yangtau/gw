@@ -115,16 +115,14 @@ fn apply_target(target: &Target<'_>, removing: bool) -> Result<Outcome> {
                     parents.push(tokens);
                 }
             }
-            let keep: Vec<&JsonValue> = if removing {
-                Vec::new()
-            } else {
-                target
-                    .patches
-                    .iter()
-                    .filter(|patch| patch.mode == PatchMode::Ensure)
-                    .map(|patch| &patch.value)
-                    .collect()
-            };
+            let mut keep: Vec<(Vec<String>, &JsonValue)> = Vec::new();
+            if !removing {
+                for patch in &target.patches {
+                    if patch.mode == PatchMode::Ensure {
+                        keep.push((pointer_tokens(&patch.pointer)?, &patch.value));
+                    }
+                }
+            }
             for parent in &parents {
                 changed |= prune_gw_entries(&mut document, parent, &target.markers, &keep);
             }
@@ -376,14 +374,16 @@ fn apply_toml_patch(
 }
 
 /// In every array directly under the object at `parent`, remove elements
-/// that mention a gw ownership marker but are not among `keep`. Elements not
-/// mentioning a marker are the user's; kept elements are ours verbatim —
-/// neither is descended into. Arrays emptied by pruning lose their key.
+/// that mention a gw ownership marker but are not the value `keep` ensures
+/// at that exact pointer — the same value ensured under a sibling key does
+/// not shield an orphan. Elements not mentioning a marker are the user's;
+/// kept elements are ours verbatim — neither is descended into. Arrays
+/// emptied by pruning lose their key.
 fn prune_gw_entries(
     document: &mut JsonValue,
     parent: &[String],
     markers: &[String],
-    keep: &[&JsonValue],
+    keep: &[(Vec<String>, &JsonValue)],
 ) -> bool {
     let Some(container) = json_lookup_mut(document, parent) else {
         return false;
@@ -397,9 +397,18 @@ fn prune_gw_entries(
         let Some(array) = child.as_array_mut() else {
             continue;
         };
+        let kept: Vec<&JsonValue> = keep
+            .iter()
+            .filter(|(tokens, _)| {
+                tokens.len() == parent.len() + 1
+                    && tokens.starts_with(parent)
+                    && tokens[parent.len()] == **key
+            })
+            .map(|(_, value)| *value)
+            .collect();
         let previous_len = array.len();
         array.retain(|item| {
-            keep.contains(&item) || {
+            kept.contains(&item) || {
                 let text = item.to_string();
                 !markers.iter().any(|marker| text.contains(marker.as_str()))
             }
@@ -860,7 +869,12 @@ mod tests {
         let manifest = manifest(
             &path,
             FileFormat::Json,
-            vec![ensure("/hooks/Notification", current.clone())],
+            vec![
+                ensure("/hooks/Notification", current.clone()),
+                // Same shape as the stale Notification entry: ensured under a
+                // sibling key, it must not shield the orphan next door.
+                ensure("/hooks/SessionStart", old_style.clone()),
+            ],
         );
 
         assert_eq!(
@@ -869,6 +883,7 @@ mod tests {
         );
         let document: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(document["hooks"]["Notification"], json!([user, current]));
+        assert_eq!(document["hooks"]["SessionStart"], json!([old_style]));
         assert!(document["hooks"].get("Stop").is_none());
         assert_eq!(document["hooks"]["PreToolUse"], json!([user]));
 
