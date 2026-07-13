@@ -67,9 +67,9 @@ impl Store {
         }
 
         let (log_path, meta_path) = self.paths(provider, &event.session);
-        let throttled = matches!(event.kind, EventKind::Heartbeat)
+        let throttled = matches!(event.kind, EventKind::Heartbeat { .. })
             && last_complete_event(&log_path)?.is_some_and(|last| {
-                matches!(last.kind, EventKind::Heartbeat)
+                matches!(last.kind, EventKind::Heartbeat { .. })
                     && last.ts.is_some_and(|ts| ts > now - Duration::seconds(30))
             });
 
@@ -230,21 +230,20 @@ fn last_complete_event(path: &Path) -> Result<Option<Event>> {
         return Ok(None);
     }
     let bytes = fs::read(path)?;
-    for line in complete_lines(&bytes).rev() {
-        if !line.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Some(serde_json::from_slice(line)?));
-        }
-    }
-    Ok(None)
+    let last = complete_lines(&bytes)
+        .rev()
+        .find_map(|line| serde_json::from_slice(line).ok());
+    Ok(last)
 }
 
+// Unparseable lines are skipped, not fatal: the event vocabulary evolves and
+// logs written by other versions must still replay.
 fn read_record(meta_path: &Path, log_path: &Path) -> Result<SessionRecord> {
     let meta = serde_json::from_slice(&fs::read(meta_path)?)?;
     let bytes = fs::read(log_path)?;
     let events = complete_lines(&bytes)
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .map(serde_json::from_slice)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect();
     Ok(SessionRecord { meta, events })
 }
 
@@ -281,7 +280,7 @@ mod tests {
     fn append_read_roundtrip_and_stamp_timestamp() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
-        let input = event("session-1", EventKind::TurnStart);
+        let input = event("session-1", EventKind::TurnStart { summary: None });
 
         store.append("test", &input, None).unwrap();
 
@@ -298,7 +297,7 @@ mod tests {
     fn throttles_consecutive_heartbeats_and_refreshes_meta() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
-        let heartbeat = event("session-1", EventKind::Heartbeat);
+        let heartbeat = event("session-1", EventKind::Heartbeat { activity: None });
         store.append("test", &heartbeat, None).unwrap();
         let before = store.sessions().unwrap().remove(0).meta.updated_at;
         thread::sleep(StdDuration::from_millis(2));
@@ -322,13 +321,17 @@ mod tests {
         store
             .append(
                 "test",
-                &event("session-1", EventKind::TurnStart),
+                &event("session-1", EventKind::TurnStart { summary: None }),
                 Some(&first),
             )
             .unwrap();
 
         store
-            .append("test", &event("session-1", EventKind::TurnEnd), None)
+            .append(
+                "test",
+                &event("session-1", EventKind::TurnEnd { summary: None }),
+                None,
+            )
             .unwrap();
 
         let meta = store.sessions().unwrap().remove(0).meta;
@@ -342,10 +345,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
         store
-            .append("test", &event("old", EventKind::TurnEnd), None)
+            .append(
+                "test",
+                &event("old", EventKind::TurnEnd { summary: None }),
+                None,
+            )
             .unwrap();
         store
-            .append("test", &event("new", EventKind::TurnEnd), None)
+            .append(
+                "test",
+                &event("new", EventKind::TurnEnd { summary: None }),
+                None,
+            )
             .unwrap();
         let (_, old_meta_path) = store.paths("test", "old");
         let mut old_meta: SessionMeta =
@@ -362,33 +373,34 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_partial_tail_but_skips_complete_corrupt_lines() {
+    fn skips_lines_it_cannot_parse_and_keeps_the_rest() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
         store
-            .append("test", &event("partial", EventKind::TurnStart), None)
+            .append(
+                "mixed",
+                &event("s", EventKind::TurnStart { summary: None }),
+                None,
+            )
             .unwrap();
-        let (partial_log, _) = store.paths("test", "partial");
+        let (log, _) = store.paths("mixed", "s");
+        // A partial tail, garbage, and a line from a retired vocabulary
+        // (attention kind `notification`) must not take the session down.
         OpenOptions::new()
             .append(true)
-            .open(partial_log)
+            .open(log)
             .unwrap()
-            .write_all(br#"{"v":1"#)
-            .unwrap();
-        store
-            .append("test", &event("corrupt", EventKind::TurnStart), None)
-            .unwrap();
-        let (corrupt_log, _) = store.paths("test", "corrupt");
-        OpenOptions::new()
-            .append(true)
-            .open(corrupt_log)
-            .unwrap()
-            .write_all(b"not json\n")
+            .write_all(
+                b"not json\n{\"v\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"session\":\"s\",\"kind\":\"attention\",\"attention\":\"notification\"}\n{\"v\":1",
+            )
             .unwrap();
 
         let records = store.sessions().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].meta.session, "partial");
         assert_eq!(records[0].events.len(), 1);
+        assert_eq!(
+            records[0].events[0].kind,
+            EventKind::TurnStart { summary: None }
+        );
     }
 }

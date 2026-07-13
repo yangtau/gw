@@ -121,18 +121,18 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
         .is_some()
     {
         match payload.get("fullyIdle").and_then(Value::as_bool) {
-            Some(true) => EventKind::TurnEnd,
-            Some(false) => EventKind::Heartbeat,
+            Some(true) => EventKind::TurnEnd { summary: None },
+            Some(false) => EventKind::Heartbeat { activity: None },
             None => return Vec::new(),
         }
     } else if payload.get("stepIdx").and_then(Value::as_u64).is_some() {
-        EventKind::Heartbeat
+        EventKind::Heartbeat { activity: None }
     } else if payload
         .get("invocationNum")
         .and_then(Value::as_u64)
         .is_some()
     {
-        EventKind::TurnStart
+        EventKind::TurnStart { summary: None }
     } else {
         return Vec::new();
     };
@@ -207,15 +207,15 @@ mod tests {
         let cases = [
             (
                 r#"{"conversationId":"s1","invocationNum":1,"initialNumSteps":0}"#,
-                EventKind::TurnStart,
+                EventKind::TurnStart { summary: None },
             ),
             (
                 r#"{"conversationId":"s1","stepIdx":5,"error":""}"#,
-                EventKind::Heartbeat,
+                EventKind::Heartbeat { activity: None },
             ),
             (
                 r#"{"conversationId":"s1","executionNum":1,"terminationReason":"model_stop","fullyIdle":true}"#,
-                EventKind::TurnEnd,
+                EventKind::TurnEnd { summary: None },
             ),
         ];
 
@@ -233,7 +233,7 @@ mod tests {
             r#"{"conversationId":"s1","executionNum":1,"terminationReason":"model_stop","fullyIdle":false}"#,
         );
 
-        assert_eq!(event.kind, EventKind::Heartbeat);
+        assert_eq!(event.kind, EventKind::Heartbeat { activity: None });
     }
 
     #[test]

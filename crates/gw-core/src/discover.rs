@@ -16,12 +16,15 @@ use crate::store::{SessionRecord, Store};
 use crate::tmux;
 use crate::tmux::Pane;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Variant order is priority order: the panel sorts by it, most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AgentStatus {
     Attention(AttentionKind),
-    Working,
-    Idle,
+    Error,
     Stale,
+    Working,
+    Done,
+    Idle,
     /// Agent process discovered but no hook events attributable to it.
     Unknown,
 }
@@ -37,6 +40,8 @@ pub struct Agent {
     pub status: AgentStatus,
     /// When the current status was established; None for Unknown.
     pub since: Option<DateTime<Utc>>,
+    /// One-line context for the status (task, activity, result, reason).
+    pub detail: Option<String>,
 }
 
 /// An ended but resumable session (log has a session id, pane is gone).
@@ -121,18 +126,21 @@ fn join(
     let mut agents = Vec::new();
     for candidate in &live {
         let session_index = match_session(candidate, sessions, &derived, &matched);
-        let (session_id, agent_status, since) = match session_index {
+        let (session_id, agent_status, since, detail) = match session_index {
             Some(index) => {
                 matched.insert(index);
                 let session = &sessions[index];
-                let derived = derived[index].expect("session logs contain events");
+                let derived = derived[index]
+                    .as_ref()
+                    .expect("session logs contain events");
                 (
                     Some(session.meta.session.clone()),
                     map_status(derived.status),
                     Some(derived.since),
+                    derived.detail.clone(),
                 )
             }
-            None => (None, AgentStatus::Unknown, None),
+            None => (None, AgentStatus::Unknown, None, None),
         };
         agents.push(Agent {
             provider: candidate.provider.clone(),
@@ -142,6 +150,7 @@ fn join(
             session_id,
             status: agent_status,
             since,
+            detail,
         });
     }
 
@@ -151,7 +160,7 @@ fn join(
             continue;
         }
         let explicitly_ended = matches!(
-            derived[index].map(|value| value.status),
+            derived[index].as_ref().map(|value| value.status),
             Some(SessionStatus::Ended)
         );
         let still_live = live.iter().any(|candidate| {
@@ -186,14 +195,7 @@ fn join(
         .map(|manifest| manifest.id.clone())
         .collect();
 
-    agents.sort_by_key(|agent| {
-        let priority = if matches!(agent.status, AgentStatus::Attention(_)) {
-            0
-        } else {
-            1
-        };
-        (priority, agent.pane.window_index)
-    });
+    agents.sort_by_key(|agent| (agent.status, agent.pane.window_index));
     ended.sort_by_key(|session| std::cmp::Reverse(session.ended_at));
 
     Snapshot {
@@ -231,7 +233,7 @@ fn match_session(
             !matched.contains(index)
                 && session.meta.provider == candidate.provider
                 && session.meta.cwd.as_ref() == Some(&candidate.cwd)
-                && matches!(derived[*index].map(|value| value.status), Some(status) if status != SessionStatus::Ended)
+                && matches!(derived[*index].as_ref().map(|value| value.status), Some(status) if status != SessionStatus::Ended)
         })
         .map(|(index, _)| index);
     let first = cwd_matches.next()?;
@@ -254,9 +256,11 @@ fn latest_match(
 fn map_status(status: SessionStatus) -> AgentStatus {
     match status {
         SessionStatus::Attention(kind) => AgentStatus::Attention(kind),
-        SessionStatus::Working => AgentStatus::Working,
-        SessionStatus::Idle | SessionStatus::Ended => AgentStatus::Idle,
+        SessionStatus::Error => AgentStatus::Error,
         SessionStatus::Stale => AgentStatus::Stale,
+        SessionStatus::Working => AgentStatus::Working,
+        SessionStatus::Done => AgentStatus::Done,
+        SessionStatus::Idle | SessionStatus::Ended => AgentStatus::Idle,
     }
 }
 
@@ -358,14 +362,14 @@ mod tests {
             proc_(200, 1, "zsh"),
             proc_(201, 200, "codex"),
             proc_(300, 1, "zsh"),
-            proc_(301, 300, "traex"),
+            proc_(301, 300, "agy"),
             proc_(400, 1, "zsh"),
             proc_(401, 400, "other"),
         ];
         let manifests = [
             manifest("claude", true),
             manifest("codex", true),
-            manifest("traex", true),
+            manifest("agy", true),
             manifest("other", true),
         ];
         let sessions = [
@@ -378,7 +382,7 @@ mod tests {
                 10,
                 EventKind::Attention {
                     attention: AttentionKind::Approval,
-                    summary: None,
+                    summary: Some("Bash: rm -rf build".into()),
                 },
             ),
             session(
@@ -388,16 +392,16 @@ mod tests {
                 Some(201),
                 None,
                 20,
-                EventKind::TurnStart,
+                EventKind::TurnStart { summary: None },
             ),
             session(
-                "traex",
-                "traex-live",
+                "agy",
+                "agy-live",
                 None,
                 None,
                 Some("/shared"),
                 30,
-                EventKind::TurnEnd,
+                EventKind::TurnEnd { summary: None },
             ),
             session(
                 "codex",
@@ -406,7 +410,7 @@ mod tests {
                 Some(999),
                 Some("/old"),
                 40,
-                EventKind::TurnStart,
+                EventKind::TurnStart { summary: None },
             ),
             session(
                 "claude",
@@ -435,17 +439,22 @@ mod tests {
                 .iter()
                 .map(|agent| agent.provider.as_str())
                 .collect::<Vec<_>>(),
-            ["claude", "other", "codex", "traex",]
+            ["claude", "codex", "agy", "other",]
         );
         assert!(matches!(
             snapshot.agents[0].status,
             AgentStatus::Attention(AttentionKind::Approval)
         ));
         assert_eq!(snapshot.agents[0].cwd, PathBuf::from("/real-claude"));
-        assert_eq!(snapshot.agents[1].status, AgentStatus::Unknown);
-        assert_eq!(snapshot.agents[2].status, AgentStatus::Working);
-        assert_eq!(snapshot.agents[2].cwd, PathBuf::from("/pane-codex"));
-        assert_eq!(snapshot.agents[3].session_id.as_deref(), Some("traex-live"));
+        assert_eq!(
+            snapshot.agents[0].detail.as_deref(),
+            Some("Bash: rm -rf build")
+        );
+        assert_eq!(snapshot.agents[1].status, AgentStatus::Working);
+        assert_eq!(snapshot.agents[1].cwd, PathBuf::from("/pane-codex"));
+        assert_eq!(snapshot.agents[2].status, AgentStatus::Done);
+        assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("agy-live"));
+        assert_eq!(snapshot.agents[3].status, AgentStatus::Unknown);
         assert_eq!(
             snapshot
                 .ended

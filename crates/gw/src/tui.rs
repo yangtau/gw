@@ -11,6 +11,7 @@ use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyMo
 use futures::StreamExt;
 use gw_core::discover::{self, Agent, AgentStatus, Snapshot};
 use gw_core::plugins::{self, Plugin};
+use gw_core::protocol::AttentionKind;
 use gw_core::store::Store;
 use gw_core::tmux;
 use notify::Watcher;
@@ -25,7 +26,9 @@ const RETENTION_DAYS: i64 = 7;
 const PREVIEW_LINES: u32 = 50;
 
 pub fn run() -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async {
         let mut app = App::new()?;
         let mut terminal = ratatui::init();
@@ -63,7 +66,11 @@ impl App {
         let mut app = Self {
             store,
             plugins: plugins::discover()?,
-            snapshot: Snapshot { agents: vec![], ended: vec![], uninstrumented: vec![] },
+            snapshot: Snapshot {
+                agents: vec![],
+                ended: vec![],
+                uninstrumented: vec![],
+            },
             view: View::Agents,
             selected: 0,
             picker: None,
@@ -106,7 +113,12 @@ impl App {
 
     fn refresh(&mut self) {
         let now = Utc::now();
-        match discover::snapshot(&self.store, &self.plugins, now, Duration::minutes(STALE_AFTER_MINUTES)) {
+        match discover::snapshot(
+            &self.store,
+            &self.plugins,
+            now,
+            Duration::minutes(STALE_AFTER_MINUTES),
+        ) {
             Ok(snapshot) => self.snapshot = snapshot,
             Err(err) => eprintln!("snapshot failed: {err:#}"),
         }
@@ -170,13 +182,18 @@ impl App {
                 self.picker = Some((picked + 1) % self.plugins.len().max(1));
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.picker = Some(picked.checked_sub(1).unwrap_or(self.plugins.len().saturating_sub(1)));
+                self.picker = Some(
+                    picked
+                        .checked_sub(1)
+                        .unwrap_or(self.plugins.len().saturating_sub(1)),
+                );
             }
             KeyCode::Enter => {
                 self.picker = None;
                 if let Some(plugin) = self.plugins.get(picked) {
                     let cwd = std::env::current_dir()?;
-                    let pane = tmux::new_window(&plugin.manifest.id, &cwd, &plugin.manifest.launch.argv)?;
+                    let pane =
+                        tmux::new_window(&plugin.manifest.id, &cwd, &plugin.manifest.launch.argv)?;
                     return self.jump(&pane);
                 }
             }
@@ -224,11 +241,17 @@ impl App {
                 let Some(session) = self.snapshot.ended.get(self.selected) else {
                     return Ok(Flow::Continue);
                 };
-                let Some(resume) = self.plugin(&session.provider).and_then(|p| p.manifest.resume.clone()) else {
+                let Some(resume) = self
+                    .plugin(&session.provider)
+                    .and_then(|p| p.manifest.resume.clone())
+                else {
                     return Ok(Flow::Continue);
                 };
-                let argv: Vec<String> =
-                    resume.argv.iter().map(|a| a.replace("{session_id}", &session.session_id)).collect();
+                let argv: Vec<String> = resume
+                    .argv
+                    .iter()
+                    .map(|a| a.replace("{session_id}", &session.session_id))
+                    .collect();
                 let cwd = session.cwd.clone().unwrap_or(std::env::current_dir()?);
                 let pane = tmux::new_window(&session.provider, &cwd, &argv)?;
                 self.jump(&pane)
@@ -246,7 +269,11 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame) {
-        let banner_height = if self.snapshot.uninstrumented.is_empty() { 0 } else { 1 };
+        let banner_height = if self.snapshot.uninstrumented.is_empty() {
+            0
+        } else {
+            1
+        };
         let [banner, main, preview, footer] = Layout::vertical([
             Constraint::Length(banner_height),
             Constraint::Min(5),
@@ -260,7 +287,10 @@ impl App {
                 " hooks not installed for {} — run `gw setup`",
                 self.snapshot.uninstrumented.join(", ")
             );
-            frame.render_widget(Paragraph::new(msg).style(Style::new().fg(Color::Black).bg(Color::Yellow)), banner);
+            frame.render_widget(
+                Paragraph::new(msg).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
+                banner,
+            );
         }
 
         match self.view {
@@ -282,13 +312,27 @@ impl App {
                 .plugin(&agent.provider)
                 .map(|p| p.manifest.label.clone())
                 .unwrap_or_else(|| agent.provider.clone());
-            let provider_color =
-                self.plugin(&agent.provider).and_then(|p| p.manifest.color.as_deref()).and_then(hex_color);
+            let provider_color = self
+                .plugin(&agent.provider)
+                .and_then(|p| p.manifest.color.as_deref())
+                .and_then(hex_color);
             let row = Row::new(vec![
                 Span::styled(format!("{dot} {word}"), Style::new().fg(color)).into(),
-                Span::styled(label, Style::new().fg(provider_color.unwrap_or(Color::Reset))).into(),
-                Line::from(format!("{}:{}", agent.pane.window_index, agent.pane.window_name)),
-                Line::from(shorten(&agent.cwd, 32)),
+                Span::styled(
+                    label,
+                    Style::new().fg(provider_color.unwrap_or(Color::Reset)),
+                )
+                .into(),
+                Line::from(format!(
+                    "{}:{}",
+                    agent.pane.window_index, agent.pane.window_name
+                )),
+                Span::styled(
+                    agent.detail.clone().unwrap_or_default(),
+                    Style::new().fg(color),
+                )
+                .into(),
+                Line::from(shorten(&agent.cwd, 28)),
                 Line::from(git_branch(&agent.cwd).unwrap_or_default()),
                 Line::from(agent.since.map(|t| ago(t, now)).unwrap_or_default()),
             ]);
@@ -301,15 +345,21 @@ impl App {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Min(12),
-                Constraint::Length(32),
-                Constraint::Length(20),
+                Constraint::Length(11),
                 Constraint::Length(8),
+                Constraint::Length(14),
+                Constraint::Min(20),
+                Constraint::Length(28),
+                Constraint::Length(14),
+                Constraint::Length(6),
             ],
         )
-        .header(Row::new(["status", "agent", "window", "cwd", "branch", "for"]).style(Style::new().dim()))
+        .header(
+            Row::new([
+                "status", "agent", "window", "detail", "cwd", "branch", "for",
+            ])
+            .style(Style::new().dim()),
+        )
         .block(Block::new().borders(Borders::ALL).title(" agents "));
         frame.render_widget(table, area);
     }
@@ -331,19 +381,34 @@ impl App {
         });
         let table = Table::new(
             rows,
-            [Constraint::Length(10), Constraint::Length(14), Constraint::Min(20), Constraint::Length(8)],
+            [
+                Constraint::Length(10),
+                Constraint::Length(14),
+                Constraint::Min(20),
+                Constraint::Length(8),
+            ],
         )
         .header(Row::new(["agent", "session", "cwd", "ended"]).style(Style::new().dim()))
-        .block(Block::new().borders(Borders::ALL).title(" recently ended — enter resumes "));
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" recently ended — enter resumes "),
+        );
         frame.render_widget(table, area);
     }
 
     fn render_preview(&self, frame: &mut Frame, area: Rect) {
-        let title = self.selected_agent().map(|a| format!(" {} ", a.pane.window_name)).unwrap_or_default();
+        let title = self
+            .selected_agent()
+            .map(|a| format!(" {} ", a.pane.window_name))
+            .unwrap_or_default();
         let visible = area.height.saturating_sub(2) as usize;
         let lines: Vec<&str> = self.preview.lines().collect();
-        let tail: Vec<Line> =
-            lines[lines.len().saturating_sub(visible)..].iter().copied().map(Line::from).collect();
+        let tail: Vec<Line> = lines[lines.len().saturating_sub(visible)..]
+            .iter()
+            .copied()
+            .map(Line::from)
+            .collect();
         frame.render_widget(
             Paragraph::new(tail).block(Block::new().borders(Borders::ALL).title(title).dim()),
             area,
@@ -381,10 +446,13 @@ impl App {
 
 fn status_cell(status: AgentStatus) -> (&'static str, &'static str, Color) {
     match status {
-        AgentStatus::Attention(_) => ("●", "attention", Color::Red),
-        AgentStatus::Working => ("●", "working", Color::Green),
-        AgentStatus::Idle => ("○", "idle", Color::Blue),
+        AgentStatus::Attention(AttentionKind::Approval) => ("●", "approval", Color::Red),
+        AgentStatus::Attention(AttentionKind::Question) => ("●", "question", Color::Red),
+        AgentStatus::Error => ("✗", "error", Color::Magenta),
         AgentStatus::Stale => ("!", "stale", Color::Yellow),
+        AgentStatus::Working => ("●", "working", Color::Green),
+        AgentStatus::Done => ("●", "done", Color::Cyan),
+        AgentStatus::Idle => ("○", "idle", Color::Blue),
         AgentStatus::Unknown => ("?", "unknown", Color::DarkGray),
     }
 }
@@ -416,7 +484,10 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 fn git_branch(cwd: &std::path::Path) -> Option<String> {
-    let head = cwd.ancestors().map(|dir| dir.join(".git/HEAD")).find(|p| p.exists())?;
+    let head = cwd
+        .ancestors()
+        .map(|dir| dir.join(".git/HEAD"))
+        .find(|p| p.exists())?;
     let head = std::fs::read_to_string(head).ok()?;
     match head.trim().strip_prefix("ref: refs/heads/") {
         Some(branch) => Some(branch.to_string()),

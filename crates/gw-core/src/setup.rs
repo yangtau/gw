@@ -36,11 +36,15 @@ struct Target<'a> {
     path: PathBuf,
     format: FileFormat,
     patches: Vec<&'a Patch>,
+    /// Ownership signatures (`gw hook <id>`) of the manifests touching this
+    /// file: any array element mentioning one is a gw-managed entry.
+    markers: Vec<String>,
 }
 
 fn apply(manifests: &[Manifest], removing: bool) -> Result<Vec<(PathBuf, Outcome)>> {
     let mut targets: Vec<Target<'_>> = Vec::new();
     for manifest in manifests {
+        let marker = format!("gw hook {}", manifest.id);
         for hook in &manifest.hooks {
             let path = expand_path(&hook.path)?;
             if let Some(target) = targets.iter_mut().find(|target| target.path == path) {
@@ -48,11 +52,15 @@ fn apply(manifests: &[Manifest], removing: bool) -> Result<Vec<(PathBuf, Outcome
                     bail!("conflicting formats for {}", path.display());
                 }
                 target.patches.extend(&hook.patches);
+                if !target.markers.contains(&marker) {
+                    target.markers.push(marker.clone());
+                }
             } else {
                 targets.push(Target {
                     path,
                     format: hook.format,
                     patches: hook.patches.iter().collect(),
+                    markers: vec![marker.clone()],
                 });
             }
         }
@@ -89,6 +97,36 @@ fn apply_target(target: &Target<'_>, removing: bool) -> Result<Outcome> {
             let mut changed = false;
             for patch in &target.patches {
                 changed |= apply_json_patch(&mut document, patch, removing)?;
+            }
+            // Prune orphans: gw-managed entries surviving from an older
+            // manifest (install keeps only the current patch values,
+            // uninstall keeps none). Scoped to the parent containers of the
+            // current ensure pointers — orphans sit under sibling keys of
+            // subscribed events. TOML targets carry only `set` flags, so
+            // pruning is JSON-only.
+            let mut parents: Vec<Vec<String>> = Vec::new();
+            for patch in &target.patches {
+                if patch.mode != PatchMode::Ensure {
+                    continue;
+                }
+                let mut tokens = pointer_tokens(&patch.pointer)?;
+                tokens.pop();
+                if !parents.contains(&tokens) {
+                    parents.push(tokens);
+                }
+            }
+            let keep: Vec<&JsonValue> = if removing {
+                Vec::new()
+            } else {
+                target
+                    .patches
+                    .iter()
+                    .filter(|patch| patch.mode == PatchMode::Ensure)
+                    .map(|patch| &patch.value)
+                    .collect()
+            };
+            for parent in &parents {
+                changed |= prune_gw_entries(&mut document, parent, &target.markers, &keep);
             }
             if !changed {
                 return Ok(Outcome::AlreadyApplied);
@@ -335,6 +373,62 @@ fn apply_toml_patch(
         }
         (PatchMode::Set, true) => Ok(false),
     }
+}
+
+/// In every array directly under the object at `parent`, remove elements
+/// that mention a gw ownership marker but are not among `keep`. Elements not
+/// mentioning a marker are the user's; kept elements are ours verbatim —
+/// neither is descended into. Arrays emptied by pruning lose their key.
+fn prune_gw_entries(
+    document: &mut JsonValue,
+    parent: &[String],
+    markers: &[String],
+    keep: &[&JsonValue],
+) -> bool {
+    let Some(container) = json_lookup_mut(document, parent) else {
+        return false;
+    };
+    let Some(object) = container.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let mut emptied = Vec::new();
+    for (key, child) in object.iter_mut() {
+        let Some(array) = child.as_array_mut() else {
+            continue;
+        };
+        let previous_len = array.len();
+        array.retain(|item| {
+            keep.contains(&item) || {
+                let text = item.to_string();
+                !markers.iter().any(|marker| text.contains(marker.as_str()))
+            }
+        });
+        if array.len() != previous_len {
+            changed = true;
+            if array.is_empty() {
+                emptied.push(key.clone());
+            }
+        }
+    }
+    for key in emptied {
+        object.remove(&key);
+    }
+    changed
+}
+
+fn json_lookup_mut<'a>(
+    mut current: &'a mut JsonValue,
+    tokens: &[String],
+) -> Option<&'a mut JsonValue> {
+    for token in tokens {
+        current = match current {
+            JsonValue::Object(object) => object.get_mut(token)?,
+            JsonValue::Array(array) => array.get_mut(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
 }
 
 fn pointer_tokens(pointer: &str) -> Result<Vec<String>> {
@@ -741,6 +835,76 @@ mod tests {
         assert_eq!(document["features"]["gw"].as_bool(), Some(true));
         assert_eq!(remove(&[manifest]).unwrap()[0].1, Outcome::AlreadyApplied);
         assert_eq!(fs::read_to_string(&path).unwrap(), removed);
+    }
+
+    #[test]
+    fn install_prunes_stale_gw_entries_and_keeps_user_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let old_style = json!({"hooks": [{"type": "command", "command": "gw hook fixture"}]});
+        let user = json!({"matcher": "Bash", "hooks": [{"command": "my-own-thing"}]});
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"hooks": {
+                // Same event, superseded shape (no matcher) + a user entry.
+                "Notification": [old_style.clone(), user.clone()],
+                // Event gw no longer subscribes: entry goes, key follows.
+                "Stop": [old_style.clone()],
+                // User-only arrays are never touched.
+                "PreToolUse": [user.clone()],
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let current = json!({"matcher": "elicitation_dialog", "hooks": [{"type": "command", "command": "gw hook fixture"}]});
+        let manifest = manifest(
+            &path,
+            FileFormat::Json,
+            vec![ensure("/hooks/Notification", current.clone())],
+        );
+
+        assert_eq!(
+            install(std::slice::from_ref(&manifest)).unwrap()[0].1,
+            Outcome::Changed
+        );
+        let document: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(document["hooks"]["Notification"], json!([user, current]));
+        assert!(document["hooks"].get("Stop").is_none());
+        assert_eq!(document["hooks"]["PreToolUse"], json!([user]));
+
+        assert_eq!(
+            install(std::slice::from_ref(&manifest)).unwrap()[0].1,
+            Outcome::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn remove_prunes_orphaned_gw_entries_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let orphan = json!({"hooks": [{"type": "command", "command": "gw hook fixture"}]});
+        let user = json!({"command": "keep"});
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"hooks": {"Stop": [orphan, user.clone()]}})).unwrap(),
+        )
+        .unwrap();
+        let manifest = manifest(
+            &path,
+            FileFormat::Json,
+            vec![ensure(
+                "/hooks/PermissionRequest",
+                json!({"command": "gw hook fixture"}),
+            )],
+        );
+
+        assert_eq!(
+            remove(std::slice::from_ref(&manifest)).unwrap()[0].1,
+            Outcome::Changed
+        );
+        let document: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(document["hooks"]["Stop"], json!([user]));
+        assert!(document["hooks"].get("PermissionRequest").is_none());
     }
 
     #[test]

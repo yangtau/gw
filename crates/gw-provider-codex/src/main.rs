@@ -51,12 +51,15 @@ fn print_events() {
     }
 }
 
+// codex has no failure or question events; errors surface only as staleness.
 fn manifest() -> Manifest {
     let hook_patches = [
         "SessionStart",
         "UserPromptSubmit",
         "PermissionRequest",
         "PostToolUse",
+        "PreCompact",
+        "PostCompact",
         "Stop",
     ]
     .into_iter()
@@ -124,8 +127,12 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
     };
 
     let kind = match event_name {
-        "SessionStart" => EventKind::SessionStart,
-        "UserPromptSubmit" => EventKind::TurnStart,
+        "SessionStart" => EventKind::SessionStart {
+            model: text(payload, "model"),
+        },
+        "UserPromptSubmit" => EventKind::TurnStart {
+            summary: excerpt(payload, "prompt"),
+        },
         "PermissionRequest" => {
             let Some(summary) = approval_summary(payload) else {
                 return Vec::new();
@@ -135,8 +142,15 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
                 summary: Some(summary),
             }
         }
-        "PostToolUse" => EventKind::Heartbeat,
-        "Stop" => EventKind::TurnEnd,
+        "PostToolUse" => EventKind::Heartbeat {
+            activity: text(payload, "tool_name"),
+        },
+        "PreCompact" | "PostCompact" => EventKind::Heartbeat {
+            activity: Some("compact".into()),
+        },
+        "Stop" => EventKind::TurnEnd {
+            summary: excerpt(payload, "last_assistant_message"),
+        },
         _ => return Vec::new(),
     };
 
@@ -152,24 +166,45 @@ fn approval_summary(payload: &Map<String, Value>) -> Option<String> {
     let tool_name = payload.get("tool_name")?.as_str()?;
     let tool_input = payload.get("tool_input")?.as_object()?;
 
-    match tool_input.get("command") {
-        Some(Value::Array(command)) => Some(
-            command
-                .iter()
-                .map(|value| match value {
-                    Value::String(value) => value.clone(),
-                    value => value.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        Some(Value::String(command)) => Some(command.clone()),
-        _ => {
-            let compact = Value::Object(tool_input.clone()).to_string();
-            let compact = compact.chars().take(200).collect::<String>();
-            Some(format!("{tool_name} {compact}"))
-        }
+    let raw = match tool_input.get("command") {
+        Some(Value::Array(command)) => command
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => value.clone(),
+                value => value.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(Value::String(command)) => command.clone(),
+        _ => format!("{tool_name} {}", Value::Object(tool_input.clone())),
+    };
+    one_liner(&raw)
+}
+
+fn text(payload: &Map<String, Value>, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn excerpt(payload: &Map<String, Value>, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(one_liner)
+}
+
+/// Collapse whitespace and cap at ~120 chars for panel display.
+fn one_liner(value: &str) -> Option<String> {
+    let mut line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
     }
+    if line.chars().count() > 120 {
+        line = line.chars().take(119).collect::<String>() + "…";
+    }
+    Some(line)
 }
 
 #[cfg(test)]
@@ -184,20 +219,34 @@ mod tests {
     fn maps_hook_payloads() {
         let cases = [
             (
-                r#"{"session_id":"s1","hook_event_name":"SessionStart"}"#,
-                EventKind::SessionStart,
+                r#"{"session_id":"s1","hook_event_name":"SessionStart","model":"gpt-5.6-sol"}"#,
+                EventKind::SessionStart {
+                    model: Some("gpt-5.6-sol".into()),
+                },
             ),
             (
-                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit"}"#,
-                EventKind::TurnStart,
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"ship it"}"#,
+                EventKind::TurnStart {
+                    summary: Some("ship it".into()),
+                },
             ),
             (
-                r#"{"session_id":"s1","hook_event_name":"PostToolUse"}"#,
-                EventKind::Heartbeat,
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"shell"}"#,
+                EventKind::Heartbeat {
+                    activity: Some("shell".into()),
+                },
             ),
             (
-                r#"{"session_id":"s1","hook_event_name":"Stop"}"#,
-                EventKind::TurnEnd,
+                r#"{"session_id":"s1","hook_event_name":"PreCompact","trigger":"auto"}"#,
+                EventKind::Heartbeat {
+                    activity: Some("compact".into()),
+                },
+            ),
+            (
+                r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+                EventKind::TurnEnd {
+                    summary: Some("done".into()),
+                },
             ),
         ];
 
@@ -263,7 +312,9 @@ mod tests {
         else {
             panic!("expected an attention event");
         };
-        assert_eq!(summary.strip_prefix("Write ").unwrap().chars().count(), 200);
+        assert_eq!(summary.chars().count(), 120);
+        assert!(summary.starts_with("Write "));
+        assert!(summary.ends_with('…'));
     }
 
     #[test]

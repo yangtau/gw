@@ -57,14 +57,17 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 - `ts` — RFC 3339 timestamp; optional, the core stamps arrival time when absent.
 - `kind` — one of:
 
-| kind | meaning |
-|---|---|
-| `session_start` | a native session began |
-| `turn_start` | the agent started working on a turn |
-| `turn_end` | the turn finished; agent is idle |
-| `attention` | the agent needs the user; `attention` is `approval` \| `question` \| `notification`, `summary` is an optional one-liner |
-| `heartbeat` | still working (e.g. after each tool use); emit sparingly |
-| `session_end` | the native session ended |
+| kind | extra fields | meaning |
+|---|---|---|
+| `session_start` | `model?` | a native session began |
+| `turn_start` | `summary?` (prompt excerpt) | the agent started working on a turn |
+| `heartbeat` | `activity?` (e.g. tool name) | still working (e.g. after each tool use); emit sparingly |
+| `attention` | `attention`: `approval` \| `question`, `summary?` | blocked mid-turn on the user: a permission dialog (`approval`) or an explicit question (`question`) |
+| `turn_end` | `summary?` (final message excerpt) | the turn finished normally |
+| `turn_error` | `reason` (e.g. provider error type), `summary?` | the turn aborted with a provider-reported failure |
+| `session_end` | | the native session ended |
+
+Excerpt fields (`summary`, `activity`) are display one-liners; plugins truncate them (~120 chars) — the core stores what it is given. Every field beyond `session` and `kind` is optional: emit what the provider knows, omit what it doesn't.
 
 Unknown payloads must produce zero events and exit 0 — never fail the provider's hook.
 
@@ -75,4 +78,4 @@ Unknown payloads must produce zero events and exit 0 — never fail the provider
 
 ## Versioning
 
-Bump `protocol` only on breaking changes. The core supports the current version; plugins should print a clear error on `manifest` if invoked by an incompatible core.
+Bump `protocol` only on breaking changes. Adding event kinds or optional fields is **not** breaking: when replaying a log, the core skips lines it cannot parse, so vocabulary can evolve without migrating stored events. The core supports the current version; plugins should print a clear error on `manifest` if invoked by an incompatible core.

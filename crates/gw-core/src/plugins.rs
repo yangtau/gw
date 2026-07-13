@@ -231,7 +231,10 @@ esac
         let events = normalize(&plugins[0], br#"{"raw":true}"#).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session, "fixture-session");
-        assert!(matches!(events[0].kind, EventKind::TurnStart));
+        assert!(matches!(
+            events[0].kind,
+            EventKind::TurnStart { summary: None }
+        ));
     }
 
     #[test]

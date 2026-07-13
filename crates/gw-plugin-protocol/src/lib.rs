@@ -80,25 +80,54 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// Every field beyond the tag is optional: plugins emit what the provider
+/// knows and omit the rest. `summary` and `activity` are display one-liners,
+/// truncated by the plugin. The core skips log lines it cannot parse, so
+/// adding kinds or fields is not a breaking change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
-    SessionStart,
-    TurnStart,
-    TurnEnd,
+    SessionStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    /// `summary`: prompt excerpt — what the agent was asked to do.
+    TurnStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    /// `summary`: final-message excerpt — what the agent concluded.
+    TurnEnd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    /// The turn aborted with a provider-reported failure.
+    /// `reason` is the provider's error type (e.g. `rate_limit`).
+    TurnError {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    /// Blocked mid-turn on the user.
     Attention {
         attention: AttentionKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
-    Heartbeat,
+    /// `activity`: what is running right now (e.g. a tool name).
+    Heartbeat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
+    },
     SessionEnd,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Variant order is priority order (approvals are quicker to act on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
+    /// A permission dialog is open.
     Approval,
+    /// The agent explicitly asked the user something.
     Question,
-    Notification,
 }

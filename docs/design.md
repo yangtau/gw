@@ -7,7 +7,7 @@ A tmux-native TUI panel that shows every coding agent running in the current tmu
 - **Discovery-based identity** — an Agent is any pane in the current session whose process tree matches a provider's process rules. No registry; panes are the source of truth. ([CONTEXT.md](../CONTEXT.md))
 - **Hook-only status, no daemon** — plugins normalize provider hook payloads into unified events; the core appends them to per-session JSONL logs; the TUI derives status by pure replay + fs watch. (ADR 0001)
 - **Providers as external executables** — `gw-provider-<id>` binaries speaking a pure-translator protocol (`manifest` / `normalize`); the core owns all I/O. (ADR 0002)
-- **Statuses**: Attention (sorts first) / Working / Idle / Stale / Unknown.
+- **Statuses** (sort order = priority): Attention (approval > question) / Error / Stale / Working / Done / Idle / Unknown. Done means the turn ended; it never decays. ([CONTEXT.md](../CONTEXT.md))
 - **Session vs Agent**: an ended Session (pane gone, native session id in the log) is resumable from a secondary view.
 
 ## Event ↔ pane correlation
@@ -17,7 +17,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 ## UX
 
 - **Panel** runs identically in a persistent pane (dashboard) or `tmux display-popup` (primary posture); after a jump the popup instance exits. Scope: current session only.
-- **List columns**: provider, status (+ duration in that status), window/pane, cwd (abbreviated), git branch.
+- **List columns**: provider, status (+ duration in that status), window/pane, detail (one-line status context: current activity · task, awaited approval, turn summary, failure reason), cwd (abbreviated), git branch.
 - **Preview**: read-only `capture-pane` tail of the selected agent (display only, never used for status).
 - **Keys (v1)**: `j/k` move, `Enter` jump, `n` launch (pick provider → new window in the panel's cwd → jump), `r` resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` jump to next Attention agent, `q` quit.
 - **Notifications**: `gw hook` itself fires a desktop notification (macOS `osascript`) + terminal bell when writing an attention event — global notifications without a daemon.
@@ -27,7 +27,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 
 - Discovery: `gw-provider-*` on PATH and in `~/.config/gw/providers/bin/`.
 - `manifest` → JSON: protocol version, provider id, display label/color, process match rules (argv basename patterns), launch command, resume command template (`{session_id}`, `{cwd}`), hook install spec (target files, entries to merge).
-- `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_start`, `turn_start`, `turn_end`, `attention` (kind: approval | question | notification), `heartbeat`, `session_end` — each with native session id and timestamp.
+- `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields.
 - Official plugins: `gw-provider-claude`, `gw-provider-codex` (same workspace, same protocol, no fast path).
 
 ## Storage
