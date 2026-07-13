@@ -59,9 +59,11 @@ pub fn matches_provider(proc_: &Proc, manifest: &Manifest) -> bool {
     })
 }
 
-/// Walk the ppid chain from `from_pid` (a hook process) to the nearest
-/// ancestor matching any manifest; resolve its tty to a pane and its cwd.
-/// Returns the matched provider id with the location.
+/// Walk the ppid chain from `from_pid` inclusive (the hook's parent — which
+/// IS the agent when the provider spawns hooks directly, or a shell below it)
+/// to the nearest process matching any manifest; resolve its tty to a pane
+/// and its cwd. Pane resolution failure degrades to None so pid/cwd
+/// correlation still works outside tmux.
 pub fn locate_agent(
     from_pid: i32,
     manifests: &[Manifest],
@@ -70,10 +72,10 @@ pub fn locate_agent(
     let Some((provider, proc_)) = provider_ancestor(from_pid, &procs, manifests) else {
         return Ok(None);
     };
-    let pane_id = match proc_.tty.as_deref() {
-        Some(tty) => tmux::pane_for_tty(tty)?,
-        None => None,
-    };
+    let pane_id = proc_
+        .tty
+        .as_deref()
+        .and_then(|tty| tmux::pane_for_tty(tty).ok().flatten());
     Ok(Some((
         provider,
         AgentLocation {
@@ -162,7 +164,7 @@ fn provider_ancestor(
     manifests: &[Manifest],
 ) -> Option<(String, Proc)> {
     let by_pid: HashMap<_, _> = procs.iter().map(|proc_| (proc_.pid, proc_)).collect();
-    let mut pid = by_pid.get(&from_pid)?.ppid;
+    let mut pid = from_pid;
     while let Some(proc_) = by_pid.get(&pid) {
         if let Some(manifest) = manifests
             .iter()
@@ -260,6 +262,17 @@ mod tests {
         let (provider, proc_) = provider_ancestor(30, &procs, &manifests).unwrap();
         assert_eq!(provider, "inner");
         assert_eq!(proc_.pid, 20);
+    }
+
+    #[test]
+    fn matches_the_starting_pid_itself_when_hooks_are_spawned_directly() {
+        let manifests = [manifest("claude", &["claude"])];
+        let procs = [proc_(10, 1, &["claude"]), proc_(30, 10, &["gw", "hook"])];
+
+        // `gw hook`'s parent is the agent itself: from_pid IS the agent.
+        let (provider, proc_) = provider_ancestor(10, &procs, &manifests).unwrap();
+        assert_eq!(provider, "claude");
+        assert_eq!(proc_.pid, 10);
     }
 
     #[test]
