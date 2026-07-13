@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 
 use gw_plugin_protocol::{
-    AttentionKind, Command, Event, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
-    ProcessMatch, PROTOCOL_VERSION,
+    Command, Event, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode, ProcessMatch,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -52,17 +52,35 @@ fn print_events() {
 }
 
 fn manifest() -> Manifest {
-    let patches = [
-        "SessionStart",
-        "UserPromptSubmit",
-        "Notification",
-        "PostToolUse",
-        "Stop",
-        "SessionEnd",
-    ]
-    .into_iter()
-    .map(hook_patch)
-    .collect();
+    let patches = vec![
+        Patch {
+            pointer: "/gw/PreInvocation".into(),
+            mode: PatchMode::Ensure,
+            value: json!({
+                "type": "command",
+                "command": "gw hook agy; printf '{}'"
+            }),
+        },
+        Patch {
+            pointer: "/gw/PostToolUse".into(),
+            mode: PatchMode::Ensure,
+            value: json!({
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "gw hook agy; printf '{}'"
+                }]
+            }),
+        },
+        Patch {
+            pointer: "/gw/Stop".into(),
+            mode: PatchMode::Ensure,
+            value: json!({
+                "type": "command",
+                "command": "gw hook agy; printf '{\"decision\":\"\"}'"
+            }),
+        },
+    ];
 
     Manifest {
         protocol: PROTOCOL_VERSION,
@@ -76,26 +94,13 @@ fn manifest() -> Manifest {
             argv: vec!["agy".into()],
         },
         resume: Some(Command {
-            argv: vec!["agy".into(), "--resume".into(), "{session_id}".into()],
+            argv: vec!["agy".into(), "--conversation".into(), "{session_id}".into()],
         }),
         hooks: vec![HookFile {
-            path: "~/.gemini/antigravity-cli/settings.json".into(),
+            path: "~/.gemini/config/hooks.json".into(),
             format: FileFormat::Json,
             patches,
         }],
-    }
-}
-
-fn hook_patch(event: &str) -> Patch {
-    Patch {
-        pointer: format!("/hooks/{}", event),
-        mode: PatchMode::Ensure,
-        value: json!({
-            "hooks": [{
-                "type": "command",
-                "command": "gw hook agy"
-            }]
-        }),
     }
 }
 
@@ -106,29 +111,30 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
     let Some(payload) = payload.as_object() else {
         return Vec::new();
     };
-    let Some(session) = payload.get("session_id").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let Some(event_name) = payload.get("hook_event_name").and_then(Value::as_str) else {
+    let Some(session) = payload.get("conversationId").and_then(Value::as_str) else {
         return Vec::new();
     };
 
-    let kind = match event_name {
-        "SessionStart" => EventKind::SessionStart,
-        "UserPromptSubmit" => EventKind::TurnStart,
-        "Notification" => {
-            let Some(message) = payload.get("message").and_then(Value::as_str) else {
-                return Vec::new();
-            };
-            EventKind::Attention {
-                attention: AttentionKind::Notification,
-                summary: Some(message.into()),
-            }
+    let kind = if payload
+        .get("executionNum")
+        .and_then(Value::as_u64)
+        .is_some()
+    {
+        match payload.get("fullyIdle").and_then(Value::as_bool) {
+            Some(true) => EventKind::TurnEnd,
+            Some(false) => EventKind::Heartbeat,
+            None => return Vec::new(),
         }
-        "PostToolUse" => EventKind::Heartbeat,
-        "Stop" => EventKind::TurnEnd,
-        "SessionEnd" => EventKind::SessionEnd,
-        _ => return Vec::new(),
+    } else if payload.get("stepIdx").and_then(Value::as_u64).is_some() {
+        EventKind::Heartbeat
+    } else if payload
+        .get("invocationNum")
+        .and_then(Value::as_u64)
+        .is_some()
+    {
+        EventKind::TurnStart
+    } else {
+        return Vec::new();
     };
 
     vec![Event {
@@ -137,4 +143,103 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
         session: session.into(),
         kind,
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(payload: &str) -> Event {
+        normalize_payload(payload.as_bytes()).pop().unwrap()
+    }
+
+    #[test]
+    fn manifest_uses_agy_cli_and_hook_contracts() {
+        assert_eq!(
+            serde_json::to_value(manifest()).unwrap(),
+            json!({
+                "protocol": PROTOCOL_VERSION,
+                "id": "agy",
+                "label": "Antigravity",
+                "color": "#4285F4",
+                "process": { "argv0": ["agy"] },
+                "launch": { "argv": ["agy"] },
+                "resume": { "argv": ["agy", "--conversation", "{session_id}"] },
+                "hooks": [{
+                    "path": "~/.gemini/config/hooks.json",
+                    "format": "json",
+                    "patches": [
+                        {
+                            "pointer": "/gw/PreInvocation",
+                            "mode": "ensure",
+                            "value": {
+                                "type": "command",
+                                "command": "gw hook agy; printf '{}'"
+                            }
+                        },
+                        {
+                            "pointer": "/gw/PostToolUse",
+                            "mode": "ensure",
+                            "value": {
+                                "matcher": "*",
+                                "hooks": [{
+                                    "type": "command",
+                                    "command": "gw hook agy; printf '{}'"
+                                }]
+                            }
+                        },
+                        {
+                            "pointer": "/gw/Stop",
+                            "mode": "ensure",
+                            "value": {
+                                "type": "command",
+                                "command": "gw hook agy; printf '{\"decision\":\"\"}'"
+                            }
+                        }
+                    ]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn maps_agy_hook_payloads() {
+        let cases = [
+            (
+                r#"{"conversationId":"s1","invocationNum":1,"initialNumSteps":0}"#,
+                EventKind::TurnStart,
+            ),
+            (
+                r#"{"conversationId":"s1","stepIdx":5,"error":""}"#,
+                EventKind::Heartbeat,
+            ),
+            (
+                r#"{"conversationId":"s1","executionNum":1,"terminationReason":"model_stop","fullyIdle":true}"#,
+                EventKind::TurnEnd,
+            ),
+        ];
+
+        for (payload, expected_kind) in cases {
+            let event = event(payload);
+            assert_eq!(event.session, "s1");
+            assert_eq!(event.kind, expected_kind);
+            assert_eq!(event.ts, None);
+        }
+    }
+
+    #[test]
+    fn keeps_working_while_stop_reports_background_tasks() {
+        let event = event(
+            r#"{"conversationId":"s1","executionNum":1,"terminationReason":"model_stop","fullyIdle":false}"#,
+        );
+
+        assert_eq!(event.kind, EventKind::Heartbeat);
+    }
+
+    #[test]
+    fn ignores_invalid_and_unrecognized_payloads() {
+        assert!(normalize_payload(b"not json").is_empty());
+        assert!(normalize_payload(br#"{"conversationId":"s1"}"#).is_empty());
+        assert!(normalize_payload(br#"{"invocationNum":1}"#).is_empty());
+    }
 }
