@@ -134,7 +134,9 @@ fn read_manifest(bin: &Path) -> Result<Manifest> {
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("start {} manifest", bin.display()))?;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Generous: a hung-plugin guard, not a perf contract — process spawn can
+    // take seconds on a loaded machine (nix sandbox builds hit this at 2s).
+    let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
