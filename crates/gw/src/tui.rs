@@ -2,6 +2,12 @@
 //! input, a periodic tick, and event-log filesystem changes; every wakeup
 //! re-derives the snapshot (panes + processes + logs are re-read each time,
 //! there is no incremental state to get stale).
+//!
+//! Rendering is a borderless list of composed lines, not a table. Each row
+//! has a fixed left cluster (marker, agent, status, detail) and a dim right
+//! cluster (cwd · branch · window · time). `plan_right` picks which right
+//! fields fit the terminal width, degrading in a fixed order; the detail
+//! text absorbs whatever space is left.
 
 use std::path::PathBuf;
 
@@ -16,14 +22,21 @@ use gw_core::store::Store;
 use gw_core::tmux;
 use notify::Watcher;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const STALE_AFTER_MINUTES: i64 = 30;
 const RETENTION_DAYS: i64 = 7;
 const PREVIEW_LINES: u32 = 50;
+const MIN_PREVIEW_TERM_HEIGHT: u16 = 16;
+const MARKER_W: usize = 3;
+const COL_GAP: usize = 2;
+const MIN_DETAIL: usize = 16;
+const SEP: &str = " · ";
+const CWD_MAX: usize = 32;
 
 pub fn run() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -123,10 +136,7 @@ impl App {
             Err(err) => eprintln!("snapshot failed: {err:#}"),
         }
         self.selected = self.selected.min(self.row_count().saturating_sub(1));
-        self.preview = match self.selected_agent() {
-            Some(agent) => tmux::capture(&agent.pane.id, PREVIEW_LINES).unwrap_or_default(),
-            None => String::new(),
-        };
+        self.refresh_preview();
     }
 
     fn row_count(&self) -> usize {
@@ -274,10 +284,15 @@ impl App {
         } else {
             1
         };
+        let preview_height = if frame.area().height < MIN_PREVIEW_TERM_HEIGHT {
+            Constraint::Length(0)
+        } else {
+            Constraint::Percentage(40)
+        };
         let [banner, main, preview, footer] = Layout::vertical([
             Constraint::Length(banner_height),
             Constraint::Min(5),
-            Constraint::Percentage(40),
+            preview_height,
             Constraint::Length(1),
         ])
         .areas(frame.area());
@@ -304,115 +319,143 @@ impl App {
         }
     }
 
-    fn render_agents(&self, frame: &mut Frame, area: Rect) {
-        let now = Utc::now();
-        let rows = self.snapshot.agents.iter().enumerate().map(|(i, agent)| {
-            let (dot, word, color) = status_cell(agent.status);
-            let label = self
-                .plugin(&agent.provider)
-                .map(|p| p.manifest.label.clone())
-                .unwrap_or_else(|| agent.provider.clone());
-            let provider_color = self
-                .plugin(&agent.provider)
-                .and_then(|p| p.manifest.color.as_deref())
-                .and_then(hex_color);
-            let row = Row::new(vec![
-                Span::styled(format!("{dot} {word}"), Style::new().fg(color)).into(),
-                Span::styled(
+    fn agent_cells(&self, now: DateTime<Utc>) -> Vec<AgentCells> {
+        self.snapshot
+            .agents
+            .iter()
+            .map(|agent| {
+                let (dot, word, color) = status_cell(agent.status);
+                let plugin = self.plugin(&agent.provider);
+                let label = plugin
+                    .map(|p| p.manifest.label.clone())
+                    .unwrap_or_else(|| agent.provider.clone());
+                let label_color = plugin
+                    .and_then(|p| p.manifest.color.as_deref())
+                    .and_then(hex_color)
+                    .unwrap_or(Color::Reset);
+                AgentCells {
                     label,
-                    Style::new().fg(provider_color.unwrap_or(Color::Reset)),
-                )
-                .into(),
-                Line::from(format!(
-                    "{}:{}",
-                    agent.pane.window_index, agent.pane.window_name
-                )),
-                Span::styled(
-                    agent.detail.clone().unwrap_or_default(),
-                    Style::new().fg(color),
-                )
-                .into(),
-                Line::from(shorten(&agent.cwd, 28)),
-                Line::from(git_branch(&agent.cwd).unwrap_or_default()),
-                Line::from(agent.since.map(|t| ago(t, now)).unwrap_or_default()),
-            ]);
-            if i == self.selected {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
-            } else {
-                row
-            }
-        });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(11),
-                Constraint::Length(8),
-                Constraint::Length(14),
-                Constraint::Min(20),
-                Constraint::Length(28),
-                Constraint::Length(14),
-                Constraint::Length(6),
-            ],
-        )
-        .header(
-            Row::new([
-                "status", "agent", "window", "detail", "cwd", "branch", "for",
-            ])
-            .style(Style::new().dim()),
-        )
-        .block(Block::new().borders(Borders::ALL).title(" agents "));
-        frame.render_widget(table, area);
+                    label_color,
+                    dot,
+                    word,
+                    color,
+                    urgent: matches!(
+                        agent.status,
+                        AgentStatus::Attention(_) | AgentStatus::Error | AgentStatus::Stale
+                    ),
+                    detail: agent.detail.clone().unwrap_or_default(),
+                    cwd_full: shorten(&agent.cwd, CWD_MAX),
+                    cwd_short: basename(&agent.cwd),
+                    branch: git_branch(&agent.cwd).unwrap_or_default(),
+                    window: format!("{}:{}", agent.pane.window_index, agent.pane.window_name),
+                    time: agent.since.map(|t| ago(t, now)).unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    fn render_agents(&self, frame: &mut Frame, area: Rect) {
+        let cells = self.agent_cells(Utc::now());
+        let mut lines = vec![Line::default()];
+        if cells.is_empty() {
+            lines.push(Line::styled(
+                "   no agents in this session — n launches one",
+                Style::new().dim(),
+            ));
+        } else {
+            let width = area.width as usize;
+            let agent_w = cells.iter().map(|c| c.label.width()).max().unwrap_or(0);
+            let status_w = cells
+                .iter()
+                .map(|c| c.dot.width() + 1 + c.word.width())
+                .max()
+                .unwrap_or(0);
+            let plan = plan_right(&cells, width, agent_w, status_w);
+            lines.extend(
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| agent_line(c, i == self.selected, agent_w, status_w, &plan, width)),
+            );
+        }
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_ended(&self, frame: &mut Frame, area: Rect) {
         let now = Utc::now();
-        let rows = self.snapshot.ended.iter().enumerate().map(|(i, s)| {
-            let row = Row::new(vec![
-                Line::from(s.provider.clone()),
-                Line::from(s.session_id.chars().take(12).collect::<String>()),
-                Line::from(s.cwd.as_deref().map(|c| shorten(c, 40)).unwrap_or_default()),
-                Line::from(ago(s.ended_at, now)),
-            ]);
-            if i == self.selected {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
-            } else {
-                row
-            }
-        });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(10),
-                Constraint::Length(14),
-                Constraint::Min(20),
-                Constraint::Length(8),
-            ],
-        )
-        .header(Row::new(["agent", "session", "cwd", "ended"]).style(Style::new().dim()))
-        .block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" recently ended — enter resumes "),
-        );
-        frame.render_widget(table, area);
+        let width = area.width as usize;
+        let mut lines = vec![
+            Line::default(),
+            Line::styled("   recently ended — enter resumes", Style::new().dim()),
+            Line::default(),
+        ];
+        if self.snapshot.ended.is_empty() {
+            lines.push(Line::styled("   nothing ended recently", Style::new().dim()));
+            frame.render_widget(Paragraph::new(lines), area);
+            return;
+        }
+        let cells: Vec<(String, Color, String, String, String)> = self
+            .snapshot
+            .ended
+            .iter()
+            .map(|s| {
+                let plugin = self.plugin(&s.provider);
+                let label = plugin
+                    .map(|p| p.manifest.label.clone())
+                    .unwrap_or_else(|| s.provider.clone());
+                let color = plugin
+                    .and_then(|p| p.manifest.color.as_deref())
+                    .and_then(hex_color)
+                    .unwrap_or(Color::Reset);
+                let session: String = s.session_id.chars().take(12).collect();
+                let cwd = s.cwd.as_deref().map(|c| shorten(c, 40)).unwrap_or_default();
+                (label, color, session, cwd, ago(s.ended_at, now))
+            })
+            .collect();
+        let label_w = cells.iter().map(|c| c.0.width()).max().unwrap_or(0);
+        let session_w = cells.iter().map(|c| c.2.width()).max().unwrap_or(0);
+        let cwd_w = cells.iter().map(|c| c.3.width()).max().unwrap_or(0);
+        let time_w = cells.iter().map(|c| c.4.width()).max().unwrap_or(0);
+        let dim = Style::new().dim();
+        lines.extend(cells.iter().enumerate().map(|(i, (label, color, session, cwd, time))| {
+            let marker = if i == self.selected { " ❯ " } else { "   " };
+            let prefix = MARKER_W + label_w + COL_GAP + session_w + COL_GAP;
+            let mut right = pad(cwd, cwd_w);
+            right.push_str(SEP);
+            right.push_str(&pad_left(time, time_w));
+            let fill = width.saturating_sub(1 + prefix + right.width());
+            Line::from(vec![
+                Span::styled(marker, Style::new().bold()),
+                Span::styled(pad(label, label_w + COL_GAP), Style::new().fg(*color)),
+                Span::styled(pad(session, session_w + COL_GAP), dim),
+                Span::raw(" ".repeat(fill)),
+                Span::styled(right, dim),
+            ])
+        }));
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_preview(&self, frame: &mut Frame, area: Rect) {
-        let title = self
-            .selected_agent()
-            .map(|a| format!(" {} ", a.pane.window_name))
-            .unwrap_or_default();
-        let visible = area.height.saturating_sub(2) as usize;
-        let lines: Vec<&str> = self.preview.lines().collect();
-        let tail: Vec<Line> = lines[lines.len().saturating_sub(visible)..]
-            .iter()
-            .copied()
-            .map(Line::from)
-            .collect();
-        frame.render_widget(
-            Paragraph::new(tail).block(Block::new().borders(Borders::ALL).title(title).dim()),
-            area,
+        if area.height == 0 {
+            return;
+        }
+        let width = area.width as usize;
+        let rule = match self.selected_agent() {
+            Some(a) => {
+                let head = format!("─── {}:{} ", a.pane.window_index, a.pane.window_name);
+                format!("{head}{}", "─".repeat(width.saturating_sub(head.width())))
+            }
+            None => "─".repeat(width),
+        };
+        let visible = area.height.saturating_sub(1) as usize;
+        let all: Vec<&str> = self.preview.lines().collect();
+        let mut lines = vec![Line::styled(rule, Style::new().dim())];
+        lines.extend(
+            all[all.len().saturating_sub(visible)..]
+                .iter()
+                .map(|l| Line::styled(*l, Style::new().dim())),
         );
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -429,9 +472,10 @@ impl App {
         let height = self.plugins.len() as u16 + 2;
         let area = center(frame.area(), width, height);
         let items = self.plugins.iter().enumerate().map(|(i, p)| {
-            let item = ListItem::new(format!(" {} ", p.manifest.label));
+            let marker = if i == picked { "❯" } else { " " };
+            let item = ListItem::new(format!(" {marker} {}", p.manifest.label));
             if i == picked {
-                item.style(Style::new().add_modifier(Modifier::REVERSED))
+                item.style(Style::new().bold())
             } else {
                 item
             }
@@ -442,6 +486,147 @@ impl App {
             area,
         );
     }
+}
+
+struct AgentCells {
+    label: String,
+    label_color: Color,
+    dot: &'static str,
+    word: &'static str,
+    color: Color,
+    urgent: bool,
+    detail: String,
+    cwd_full: String,
+    cwd_short: String,
+    branch: String,
+    window: String,
+    time: String,
+}
+
+/// Column widths for the right cluster; 0 means the field is dropped.
+struct RightPlan {
+    cwd: usize,
+    cwd_full: bool,
+    branch: usize,
+    window: usize,
+    time: usize,
+}
+
+impl RightPlan {
+    fn total(&self) -> usize {
+        self.time
+            + [self.cwd, self.branch, self.window]
+                .iter()
+                .filter(|&&w| w > 0)
+                .map(|w| w + SEP.width())
+                .sum::<usize>()
+    }
+}
+
+/// Pick which right-cluster fields fit. Degradation order: drop window,
+/// drop branch, shrink cwd to its basename, drop cwd. Time always stays;
+/// detail keeps at least MIN_DETAIL columns before fields start dropping.
+fn plan_right(cells: &[AgentCells], width: usize, agent_w: usize, status_w: usize) -> RightPlan {
+    let maxw = |f: fn(&AgentCells) -> &String| cells.iter().map(|c| f(c).width()).max().unwrap_or(0);
+    let time = maxw(|c| &c.time);
+    let cwd_full = maxw(|c| &c.cwd_full);
+    let cwd_short = maxw(|c| &c.cwd_short);
+    let branch = maxw(|c| &c.branch);
+    let window = maxw(|c| &c.window);
+    let min_detail = if cells.iter().any(|c| !c.detail.is_empty()) {
+        MIN_DETAIL
+    } else {
+        0
+    };
+    let prefix = MARKER_W + agent_w + COL_GAP + status_w + COL_GAP;
+    let avail = width.saturating_sub(1 + prefix + min_detail + COL_GAP);
+    let candidates = [
+        (cwd_full, true, branch, window),
+        (cwd_full, true, branch, 0),
+        (cwd_full, true, 0, 0),
+        (cwd_short, false, 0, 0),
+        (0, false, 0, 0),
+    ];
+    for (cwd, full, branch, window) in candidates {
+        let plan = RightPlan {
+            cwd,
+            cwd_full: full,
+            branch,
+            window,
+            time,
+        };
+        if plan.total() <= avail {
+            return plan;
+        }
+    }
+    RightPlan {
+        cwd: 0,
+        cwd_full: false,
+        branch: 0,
+        window: 0,
+        time,
+    }
+}
+
+fn agent_line(
+    c: &AgentCells,
+    selected: bool,
+    agent_w: usize,
+    status_w: usize,
+    plan: &RightPlan,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { " ❯ " } else { "   " };
+    let mut spans = vec![
+        Span::styled(marker, Style::new().fg(c.color).bold()),
+        Span::styled(pad(&c.label, agent_w + COL_GAP), Style::new().fg(c.label_color)),
+        Span::styled(
+            pad(&format!("{} {}", c.dot, c.word), status_w + COL_GAP),
+            Style::new().fg(c.color),
+        ),
+    ];
+    let prefix = MARKER_W + agent_w + COL_GAP + status_w + COL_GAP;
+    let right_total = plan.total();
+    let detail_avail = width.saturating_sub(1 + prefix + right_total + COL_GAP);
+    let detail = truncate(&c.detail, detail_avail);
+    spans.push(Span::styled(
+        detail.clone(),
+        if c.urgent {
+            Style::new().fg(c.color)
+        } else {
+            Style::new()
+        },
+    ));
+    let fill = width.saturating_sub(1 + prefix + detail.width() + right_total);
+    spans.push(Span::raw(" ".repeat(fill)));
+
+    let dim = Style::new().dim();
+    let cwd = if plan.cwd_full { &c.cwd_full } else { &c.cwd_short };
+    let fields = [
+        (cwd.as_str(), plan.cwd, false),
+        (c.branch.as_str(), plan.branch, false),
+        (c.window.as_str(), plan.window, false),
+        (c.time.as_str(), plan.time, true),
+    ];
+    let mut first = true;
+    for (value, col, right_align) in fields {
+        if col == 0 {
+            continue;
+        }
+        if !first {
+            let sep = if value.is_empty() { "   " } else { SEP };
+            spans.push(Span::styled(sep, dim));
+        }
+        first = false;
+        let text = truncate(value, col);
+        let text = if right_align {
+            pad_left(&text, col)
+        } else {
+            pad(&text, col)
+        };
+        spans.push(Span::styled(text, dim));
+    }
+    Line::from(spans)
 }
 
 fn status_cell(status: AgentStatus) -> (&'static str, &'static str, Color) {
@@ -466,17 +651,69 @@ fn hex_color(hex: &str) -> Option<Color> {
     Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
+fn pad(s: &str, w: usize) -> String {
+    format!("{s}{}", " ".repeat(w.saturating_sub(s.width())))
+}
+
+fn pad_left(s: &str, w: usize) -> String {
+    format!("{}{s}", " ".repeat(w.saturating_sub(s.width())))
+}
+
+/// Truncate to `max` display columns, ending with … when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out
+}
+
+/// Keep the tail of `s` within `max` display columns, prefixing … when cut.
+fn tail_truncate(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut tail = String::new();
+    let mut w = 0;
+    for ch in s.chars().rev() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        tail.insert(0, ch);
+        w += cw;
+    }
+    if max > 0 {
+        tail.insert(0, '…');
+    }
+    tail
+}
+
 fn shorten(path: &std::path::Path, max: usize) -> String {
     let home = dirs_home();
     let s = match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     };
-    if s.len() <= max {
-        s
-    } else {
-        format!("…{}", &s[s.len() - max + 1..])
-    }
+    tail_truncate(&s, max)
+}
+
+fn basename(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -519,4 +756,87 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
     ])
     .areas(mid);
     mid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(detail: &str, cwd: &str, branch: &str, window: &str, time: &str) -> AgentCells {
+        AgentCells {
+            label: "Claude".into(),
+            label_color: Color::Reset,
+            dot: "●",
+            word: "working",
+            color: Color::Green,
+            urgent: false,
+            detail: detail.into(),
+            cwd_full: cwd.into(),
+            cwd_short: cwd.rsplit('/').next().unwrap_or(cwd).into(),
+            branch: branch.into(),
+            window: window.into(),
+            time: time.into(),
+        }
+    }
+
+    fn sample() -> Vec<AgentCells> {
+        vec![
+            cell("Bash · $mattpocock-select", "~/Workspaces/gw2", "main", "2:gw", "3m"),
+            cell("", "~/Workspaces/gw2", "main", "1:.claude-wrap", "12m"),
+        ]
+    }
+
+    #[test]
+    fn truncate_respects_display_width() {
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello!", 5), "hell…");
+        assert_eq!(truncate("中文路径", 5), "中文…");
+        assert_eq!(truncate("abc", 0), "");
+    }
+
+    #[test]
+    fn tail_truncate_keeps_tail() {
+        assert_eq!(tail_truncate("~/Workspaces/gw2", 8), "…ces/gw2");
+        assert_eq!(tail_truncate("short", 8), "short");
+    }
+
+    #[test]
+    fn plan_degrades_in_order() {
+        let cells = sample();
+        let (agent_w, status_w) = (6, 9);
+        let all = plan_right(&cells, 120, agent_w, status_w);
+        assert!(all.cwd_full && all.branch > 0 && all.window > 0);
+        let no_window = plan_right(&cells, 80, agent_w, status_w);
+        assert!(no_window.cwd_full && no_window.branch > 0 && no_window.window == 0);
+        let no_branch = plan_right(&cells, 66, agent_w, status_w);
+        assert!(no_branch.cwd_full && no_branch.branch == 0);
+        let short_cwd = plan_right(&cells, 55, agent_w, status_w);
+        assert!(!short_cwd.cwd_full && short_cwd.cwd > 0 && short_cwd.branch == 0);
+        let time_only = plan_right(&cells, 42, agent_w, status_w);
+        assert!(time_only.cwd == 0 && time_only.time > 0);
+    }
+
+    #[test]
+    fn lines_never_overflow() {
+        let cells = sample();
+        let agent_w = cells.iter().map(|c| c.label.width()).max().unwrap();
+        let status_w = cells
+            .iter()
+            .map(|c| c.dot.width() + 1 + c.word.width())
+            .max()
+            .unwrap();
+        // Below ~26 columns the fixed prefix itself no longer fits and
+        // Paragraph clipping takes over; assert the invariant above that.
+        for width in 26..140 {
+            let plan = plan_right(&cells, width, agent_w, status_w);
+            for (i, c) in cells.iter().enumerate() {
+                let line = agent_line(c, i == 0, agent_w, status_w, &plan, width);
+                assert!(
+                    line.width() <= width,
+                    "line overflows at width {width}: {} > {width}",
+                    line.width()
+                );
+            }
+        }
+    }
 }
