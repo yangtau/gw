@@ -17,7 +17,9 @@ nix profile install .        # or reference this repo as a flake input
 Or with cargo:
 
 ```sh
-cargo install --path crates/gw --path crates/gw-provider-claude --path crates/gw-provider-codex
+cargo install --path crates/gw
+cargo install --path crates/providers/claude
+cargo install --path crates/providers/codex
 ```
 
 Then install the provider hooks (backed up, surgical, reversible):
@@ -50,6 +52,6 @@ Attention events also fire a desktop notification, panel open or not.
 - `crates/gw` — the binary: panel TUI, `gw hook` ingest, `gw setup`.
 - `crates/gw-core` — domain: discovery, correlation, status derivation, event store, tmux/ps wrappers.
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust plugin authors.
-- `crates/gw-provider-claude`, `crates/gw-provider-codex` — official provider plugins.
+- `crates/providers/claude`, `crates/providers/codex` — official provider plugins.
 
 Design notes live in [docs/design.md](docs/design.md); vocabulary in [CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).

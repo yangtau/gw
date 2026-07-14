@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = [
+    "crates/gw",
+    "crates/gw-core",
+    "crates/gw-plugin-protocol",
+    "crates/providers/*",
+]
 
 [workspace.package]
 edition = "2021"
