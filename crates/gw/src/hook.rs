@@ -29,8 +29,19 @@ fn ingest(provider: &str, payload: &[u8]) -> Result<()> {
     } else {
         None
     };
+    let location = match gw_core::procs::locate_agent(
+        std::os::unix::process::parent_id() as i32,
+        std::slice::from_ref(&plugin.manifest),
+    ) {
+        Ok(Some((_, location))) => Some(location),
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("gw hook {provider}: could not locate agent: {error:#}");
+            None
+        }
+    };
     if let Some(store) = &store {
-        if let Err(error) = store.append_debug(provider, payload, &result) {
+        if let Err(error) = store.append_debug(provider, payload, &result, location.as_ref()) {
             eprintln!("gw hook {provider}: could not append debug payload: {error:#}");
         }
     }
@@ -41,17 +52,6 @@ fn ingest(provider: &str, payload: &[u8]) -> Result<()> {
     };
 
     for event in events {
-        let location = match gw_core::procs::locate_agent(
-            std::os::unix::process::parent_id() as i32,
-            std::slice::from_ref(&plugin.manifest),
-        ) {
-            Ok(Some((_, location))) => Some(location),
-            Ok(None) => None,
-            Err(error) => {
-                eprintln!("gw hook {provider}: could not locate agent: {error:#}");
-                None
-            }
-        };
         if let Err(error) = store.append(provider, &event, location.as_ref()) {
             eprintln!("gw hook {provider}: could not append event: {error:#}");
         }

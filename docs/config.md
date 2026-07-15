@@ -30,10 +30,11 @@ no rotation or size cap.
 
 **Where records land** (under the store dir, `~/.local/state/gw/sessions/`):
 
-- Payloads that normalize to at least one event → `<sid>.debug.jsonl`, where
-  `<sid> = sha256("<provider>:<session>")[..16]` — the same hash as the session's
-  `.jsonl` / `.meta.json`, so the three files sit side by side. This file is swept
-  together with its session once the session ages out.
+- Payloads that normalize to at least one event → `<stem>.debug.jsonl`, where
+  `<stem> = <date>-<cmd>-<provider>-<sid>` (`<cmd>` is the innermost directory
+  of the agent's cwd, `<sid> = sha256("<provider>:<session>")[..16]`) — the same
+  stem as the session's `.jsonl` / `.meta.json`, so the three files sit side by
+  side. This file is swept together with its session once the session ages out.
 - Payloads that normalize to **zero** events, or where the provider plugin itself
   errored (no session to attribute) → `_unmapped.debug.jsonl`. Never swept.
 

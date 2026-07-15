@@ -1,6 +1,7 @@
 //! Event-log storage: one append-only JSONL file per session plus a sidecar
-//! meta JSON, under `~/.local/state/gw/sessions/`. The store is the only
-//! writer; plugins never touch the filesystem.
+//! meta JSON, under `~/.local/state/gw/sessions/`. Files share a
+//! human-readable stem, `<date>-<cmd>-<provider>-<sid>`. The store is the
+//! only writer; plugins never touch the filesystem.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -8,7 +9,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -80,7 +81,7 @@ impl Store {
             event.ts = Some(now);
         }
 
-        let (log_path, meta_path) = self.paths(provider, &event.session);
+        let (log_path, meta_path) = self.paths(provider, &event.session, loc);
         // Only an identical heartbeat is throttled: a changed activity is new
         // information the panel should show.
         let throttled = matches!(event.kind, EventKind::Heartbeat { .. })
@@ -136,6 +137,7 @@ impl Store {
         provider: &str,
         payload: &[u8],
         result: &anyhow::Result<Vec<Event>>,
+        loc: Option<&AgentLocation>,
     ) -> Result<()> {
         let (events, error) = match result {
             Ok(events) => (Some(events.as_slice()), None),
@@ -156,7 +158,7 @@ impl Store {
         let path = match result {
             Ok(events) if !events.is_empty() => self.sessions_dir().join(format!(
                 "{}.debug.jsonl",
-                session_id(provider, &events[0].session)
+                self.stem(provider, &events[0].session, loc)
             )),
             _ => self.sessions_dir().join("_unmapped.debug.jsonl"),
         };
@@ -188,10 +190,10 @@ impl Store {
                 }
             };
             let path = entry.path();
-            let Some(sid) = meta_sid(&path) else {
+            let Some(stem) = meta_stem(&path) else {
                 continue;
             };
-            let log_path = self.sessions_dir().join(format!("{sid}.jsonl"));
+            let log_path = self.sessions_dir().join(format!("{stem}.jsonl"));
             match read_record(&path, &log_path) {
                 Ok(record) => sessions.push(record),
                 Err(error) => eprintln!(
@@ -217,7 +219,7 @@ impl Store {
                 }
             };
             let path = entry.path();
-            let Some(sid) = meta_sid(&path) else {
+            let Some(stem) = meta_stem(&path) else {
                 continue;
             };
             match fs::read(&path)
@@ -226,7 +228,7 @@ impl Store {
                     serde_json::from_slice::<SessionMeta>(&bytes)
                         .with_context(|| format!("parse {}", path.display()))
                 }) {
-                Ok(meta) if meta.updated_at < cutoff => stale.push(sid),
+                Ok(meta) if meta.updated_at < cutoff => stale.push(stem),
                 Ok(_) => {}
                 Err(error) => eprintln!(
                     "warning: skipping corrupt session meta {}: {error:#}",
@@ -235,13 +237,13 @@ impl Store {
             }
         }
 
-        for sid in stale {
+        for stem in stale {
             for entry in fs::read_dir(self.sessions_dir())? {
                 let entry = entry?;
                 if entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(&format!("{sid}."))
+                    .starts_with(&format!("{stem}."))
                 {
                     fs::remove_file(entry.path())?;
                 }
@@ -258,19 +260,68 @@ impl Store {
         self.root.join("sessions")
     }
 
-    fn paths(&self, provider: &str, session: &str) -> (PathBuf, PathBuf) {
-        let sid = session_id(provider, session);
+    fn paths(
+        &self,
+        provider: &str,
+        session: &str,
+        loc: Option<&AgentLocation>,
+    ) -> (PathBuf, PathBuf) {
+        let stem = self.stem(provider, session, loc);
         let dir = self.sessions_dir();
         (
-            dir.join(format!("{sid}.jsonl")),
-            dir.join(format!("{sid}.meta.json")),
+            dir.join(format!("{stem}.jsonl")),
+            dir.join(format!("{stem}.meta.json")),
         )
+    }
+
+    /// Human-readable file stem, `<date>-<cmd>-<provider>-<sid>`, fixed at
+    /// session file creation: later appends reuse whatever stem already ends
+    /// with the session's hash (including pre-rename bare-`<sid>` files).
+    fn stem(&self, provider: &str, session: &str, loc: Option<&AgentLocation>) -> String {
+        let sid = session_id(provider, session);
+        if let Some(stem) = self.find_stem(&sid) {
+            return stem;
+        }
+        let cmd = loc
+            .and_then(|loc| loc.cwd.as_deref())
+            .and_then(Path::file_name)
+            .map(|name| sanitize(&name.to_string_lossy()))
+            .unwrap_or_default();
+        let cmd = if cmd.is_empty() {
+            "unknown".to_owned()
+        } else {
+            cmd
+        };
+        format!("{}-{cmd}-{provider}-{sid}", Local::now().format("%Y-%m-%d"))
+    }
+
+    fn find_stem(&self, sid: &str) -> Option<String> {
+        let entries = fs::read_dir(self.sessions_dir()).ok()?;
+        entries.flatten().find_map(|entry| {
+            let name = entry.file_name();
+            let stem = [".meta.json", ".debug.jsonl", ".jsonl"]
+                .iter()
+                .find_map(|suffix| name.to_str()?.strip_suffix(suffix))?;
+            (stem == sid || stem.ends_with(&format!("-{sid}"))).then(|| stem.to_owned())
+        })
     }
 }
 
 fn session_id(provider: &str, session: &str) -> String {
     let digest = Sha256::digest(format!("{provider}:{session}").as_bytes());
     format!("{digest:x}")[..16].to_owned()
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
@@ -315,7 +366,7 @@ fn complete_lines(bytes: &[u8]) -> impl DoubleEndedIterator<Item = &[u8]> {
         .map(|line| &line[..line.len() - 1])
 }
 
-fn meta_sid(path: &Path) -> Option<String> {
+fn meta_stem(path: &Path) -> Option<String> {
     path.file_name()?
         .to_str()?
         .strip_suffix(".meta.json")
@@ -362,12 +413,12 @@ mod tests {
         let result = Ok(events.clone());
 
         store
-            .append_debug("test", br#"{"raw":true}"#, &result)
+            .append_debug("test", br#"{"raw":true}"#, &result, None)
             .unwrap();
 
-        let sid = session_id("test", "session-1");
+        let stem = store.find_stem(&session_id("test", "session-1")).unwrap();
         let record: serde_json::Value = serde_json::from_slice(
-            &fs::read(store.sessions_dir().join(format!("{sid}.debug.jsonl"))).unwrap(),
+            &fs::read(store.sessions_dir().join(format!("{stem}.debug.jsonl"))).unwrap(),
         )
         .unwrap();
         assert_eq!(record["provider"], "test");
@@ -377,11 +428,77 @@ mod tests {
     }
 
     #[test]
+    fn names_session_files_with_date_cmd_and_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let loc = AgentLocation {
+            pid: 1,
+            pane_id: None,
+            cwd: Some(PathBuf::from("/tmp/My Project")),
+        };
+        store
+            .append(
+                "claude",
+                &event("s1", EventKind::TurnStart { summary: None }),
+                Some(&loc),
+            )
+            .unwrap();
+
+        let sid = session_id("claude", "s1");
+        let stem = store.find_stem(&sid).unwrap();
+        assert_eq!(
+            stem,
+            format!(
+                "{}-My-Project-claude-{sid}",
+                Local::now().format("%Y-%m-%d")
+            )
+        );
+
+        // A later append without a location reuses the stem.
+        store
+            .append(
+                "claude",
+                &event("s1", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.sessions().unwrap()[0].events.len(), 2);
+    }
+
+    #[test]
+    fn keeps_appending_to_pre_rename_bare_sid_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let sid = session_id("test", "s1");
+        write_private(
+            &store.sessions_dir().join(format!("{sid}.jsonl")),
+            b"{\"v\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"session\":\"s1\",\"kind\":\"turn_start\"}\n",
+        )
+        .unwrap();
+
+        store
+            .append(
+                "test",
+                &event("s1", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(store.find_stem(&sid).unwrap(), sid);
+        assert!(store
+            .sessions_dir()
+            .join(format!("{sid}.meta.json"))
+            .exists());
+    }
+
+    #[test]
     fn append_debug_maps_empty_events_to_fallback_file() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
 
-        store.append_debug("test", b"{}", &Ok(Vec::new())).unwrap();
+        store
+            .append_debug("test", b"{}", &Ok(Vec::new()), None)
+            .unwrap();
 
         let record: serde_json::Value = serde_json::from_slice(
             &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
@@ -397,7 +514,7 @@ mod tests {
         let store = Store::open(temp.path().join("state")).unwrap();
         let result = Err(anyhow::anyhow!("normalize failed"));
 
-        store.append_debug("test", b"{}", &result).unwrap();
+        store.append_debug("test", b"{}", &result, None).unwrap();
 
         let record: serde_json::Value = serde_json::from_slice(
             &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
@@ -413,7 +530,7 @@ mod tests {
         let store = Store::open(temp.path().join("state")).unwrap();
 
         store
-            .append_debug("test", b"not json", &Ok(Vec::new()))
+            .append_debug("test", b"not json", &Ok(Vec::new()), None)
             .unwrap();
 
         let record: serde_json::Value = serde_json::from_slice(
@@ -430,7 +547,7 @@ mod tests {
         let store = Store::open(temp.path().join("state")).unwrap();
 
         store
-            .append_debug("test", br#"{"raw":true}"#, &Ok(Vec::new()))
+            .append_debug("test", br#"{"raw":true}"#, &Ok(Vec::new()), None)
             .unwrap();
 
         let record: serde_json::Value = serde_json::from_slice(
@@ -516,7 +633,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let (_, old_meta_path) = store.paths("test", "old");
+        let (_, old_meta_path) = store.paths("test", "old", None);
         let mut old_meta: SessionMeta =
             serde_json::from_slice(&fs::read(&old_meta_path).unwrap()).unwrap();
         old_meta.updated_at = Utc::now() - Duration::days(2);
@@ -541,7 +658,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let (log, _) = store.paths("mixed", "s");
+        let (log, _) = store.paths("mixed", "s", None);
         // A partial tail, garbage, and a line from a retired vocabulary
         // (attention kind `notification`) must not take the session down.
         OpenOptions::new()
