@@ -54,7 +54,7 @@ fn print_events() {
 // PermissionRequest is the approval signal; Notification(permission_prompt)
 // fires for the same dialog and must not also be subscribed. idle_prompt is
 // the 60s nag — turn_end already means done.
-const SUBSCRIPTIONS: [(&str, Option<&str>); 11] = [
+const SUBSCRIPTIONS: [(&str, Option<&str>); 13] = [
     ("SessionStart", None),
     ("UserPromptSubmit", None),
     ("PreToolUse", Some("AskUserQuestion|ExitPlanMode")),
@@ -63,6 +63,8 @@ const SUBSCRIPTIONS: [(&str, Option<&str>); 11] = [
     ("PostToolUse", None),
     ("PreCompact", None),
     ("PostCompact", None),
+    ("SubagentStart", None),
+    ("SubagentStop", None),
     ("Stop", None),
     ("StopFailure", None),
     ("SessionEnd", None),
@@ -166,6 +168,21 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
         },
         "PreCompact" | "PostCompact" => EventKind::Heartbeat {
             activity: Some("compact".into()),
+        },
+        // Both fire with the parent's session_id; agent_id names the subagent.
+        // The payload carries only agent_id/agent_type — no model or task.
+        "SubagentStart" => match text(payload, "agent_id") {
+            Some(agent) => EventKind::SubagentStart {
+                agent,
+                agent_type: text(payload, "agent_type"),
+                model: None,
+                summary: None,
+            },
+            None => return Vec::new(),
+        },
+        "SubagentStop" => match text(payload, "agent_id") {
+            Some(agent) => EventKind::SubagentEnd { agent },
+            None => return Vec::new(),
         },
         "Stop" => EventKind::TurnEnd {
             summary: excerpt(payload, "last_assistant_message"),
@@ -389,6 +406,32 @@ mod tests {
     }
 
     #[test]
+    fn maps_subagent_lifecycle() {
+        // Real 2.1.210 payloads: SubagentStart carries only agent_id and
+        // agent_type beyond the common fields — no model, no task text.
+        let start = event(
+            r#"{"session_id":"s1","transcript_path":"/tmp/t.jsonl","cwd":"/work","prompt_id":"p1","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#,
+        );
+        assert_eq!(
+            start.kind,
+            EventKind::SubagentStart {
+                agent: "a1".into(),
+                agent_type: Some("Explore".into()),
+                model: None,
+                summary: None,
+            }
+        );
+
+        let stop = event(
+            r#"{"session_id":"s1","transcript_path":"/tmp/t.jsonl","cwd":"/work","prompt_id":"p1","hook_event_name":"SubagentStop","stop_hook_active":false,"agent_id":"a1","agent_transcript_path":"/tmp/a1.jsonl","agent_type":"Explore","last_assistant_message":"done"}"#,
+        );
+        assert_eq!(stop.kind, EventKind::SubagentEnd { agent: "a1".into() });
+
+        // Without an agent id there is nothing to correlate start/stop.
+        assert!(events(r#"{"session_id":"s1","hook_event_name":"SubagentStart"}"#).is_empty());
+    }
+
+    #[test]
     fn truncates_long_summaries() {
         let long = "x".repeat(200);
         let payload = format!(
@@ -436,5 +479,7 @@ mod tests {
             .get("matcher")
             .is_none());
         pointer("/hooks/StopFailure");
+        pointer("/hooks/SubagentStart");
+        pointer("/hooks/SubagentStop");
     }
 }

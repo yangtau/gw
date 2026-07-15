@@ -60,6 +60,8 @@ fn manifest() -> Manifest {
         "PostToolUse",
         "PreCompact",
         "PostCompact",
+        "SubagentStart",
+        "SubagentStop",
         "Stop",
     ]
     .into_iter()
@@ -147,6 +149,20 @@ fn normalize_payload(raw: &[u8]) -> Vec<Event> {
         },
         "PreCompact" | "PostCompact" => EventKind::Heartbeat {
             activity: Some("compact".into()),
+        },
+        // Both fire with the parent's session_id; codex carries no task text.
+        "SubagentStart" => match text(payload, "agent_id") {
+            Some(agent) => EventKind::SubagentStart {
+                agent,
+                agent_type: text(payload, "agent_type"),
+                model: text(payload, "model"),
+                summary: None,
+            },
+            None => return Vec::new(),
+        },
+        "SubagentStop" => match text(payload, "agent_id") {
+            Some(agent) => EventKind::SubagentEnd { agent },
+            None => return Vec::new(),
         },
         "Stop" => EventKind::TurnEnd {
             summary: excerpt(payload, "last_assistant_message"),
@@ -315,6 +331,32 @@ mod tests {
         assert_eq!(summary.chars().count(), 120);
         assert!(summary.starts_with("Write "));
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn maps_subagent_lifecycle() {
+        let start = event(
+            r#"{"session_id":"s1","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"reviewer","model":"gpt-5.6-sol"}"#,
+        );
+        assert_eq!(
+            start.kind,
+            EventKind::SubagentStart {
+                agent: "a1".into(),
+                agent_type: Some("reviewer".into()),
+                model: Some("gpt-5.6-sol".into()),
+                summary: None,
+            }
+        );
+
+        let stop = event(
+            r#"{"session_id":"s1","hook_event_name":"SubagentStop","agent_id":"a1","agent_type":"reviewer","stop_hook_active":false}"#,
+        );
+        assert_eq!(stop.kind, EventKind::SubagentEnd { agent: "a1".into() });
+
+        assert!(
+            normalize_payload(br#"{"session_id":"s1","hook_event_name":"SubagentStart"}"#)
+                .is_empty()
+        );
     }
 
     #[test]

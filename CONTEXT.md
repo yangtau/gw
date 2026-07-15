@@ -33,6 +33,9 @@ Table order is sort order (most urgent first):
 
 Statuses a provider can reach depend on which hook events it emits; the model is sized to the richest provider and degrades per-provider. Existence is not a Status: when the pane/process disappears, the Agent leaves the panel (hence no "exited" state — Done is about the turn, not the process).
 
+### Subagent
+A child agent running inside a Session, reported by the provider's subagent hooks (`subagent_start`/`subagent_end` events on the parent's session id). Subagents are display-only context — the panel lists them under their Agent's row (type, model, task) — and are **status-neutral**: they never clear Attention, revive Done, or affect staleness. The running set is replayed from start/end pairs and cleared at session boundaries.
+
 ### Panel
 The TUI itself. Runs equally in a persistent pane (dashboard mode) or a tmux `display-popup` (switcher mode — the primary posture: summon, pick, jump, gone). The only behavioral difference is whether the panel exits after a jump. Scope is always the current tmux session.
 

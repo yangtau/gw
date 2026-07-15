@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::plugins::Plugin;
 use crate::procs::{self, Proc};
 use crate::protocol::{AttentionKind, Manifest};
-use crate::status::{self, Derived, SessionStatus};
+use crate::status::{self, Derived, SessionStatus, Subagent};
 use crate::store::{SessionRecord, Store};
 use crate::tmux;
 use crate::tmux::Pane;
@@ -42,6 +42,8 @@ pub struct Agent {
     pub since: Option<DateTime<Utc>>,
     /// One-line context for the status (task, activity, result, reason).
     pub detail: Option<String>,
+    /// Subagents currently running inside this session, in start order.
+    pub subagents: Vec<Subagent>,
 }
 
 /// An ended but resumable session (log has a session id, pane is gone).
@@ -126,7 +128,7 @@ fn join(
     let mut agents = Vec::new();
     for candidate in &live {
         let session_index = match_session(candidate, sessions, &derived, &matched);
-        let (session_id, agent_status, since, detail) = match session_index {
+        let (session_id, agent_status, since, detail, subagents) = match session_index {
             // A matched session can still derive nothing: a log whose every
             // line is retired vocabulary reads back empty.
             Some(index) => {
@@ -140,9 +142,16 @@ fn join(
                     ),
                     None => (AgentStatus::Unknown, None, None),
                 };
-                (Some(session.meta.session.clone()), status, since, detail)
+                let subagents = status::subagents(&session.events);
+                (
+                    Some(session.meta.session.clone()),
+                    status,
+                    since,
+                    detail,
+                    subagents,
+                )
             }
-            None => (None, AgentStatus::Unknown, None, None),
+            None => (None, AgentStatus::Unknown, None, None, Vec::new()),
         };
         agents.push(Agent {
             provider: candidate.provider.clone(),
@@ -153,6 +162,7 @@ fn join(
             status: agent_status,
             since,
             detail,
+            subagents,
         });
     }
 

@@ -120,6 +120,20 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<String>,
     },
+    /// A subagent spawned inside this session started running.
+    /// `agent` is the provider-native subagent id; `summary` is a task excerpt.
+    SubagentStart {
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    SubagentEnd {
+        agent: String,
+    },
     SessionEnd,
 }
 

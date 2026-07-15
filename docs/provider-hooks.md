@@ -213,8 +213,8 @@ does not need.)
 | `Notification`       | `notification_type`, `message`*                                                                     | see type table below                                                                                                                             |
 | `Stop`               | `last_assistant_message`, `stop_hook_active`                                                        |                                                                                                                                                  |
 | `StopFailure`        | `error_type`, `error_message`                                                                       | turn aborted by API error                                                                                                                        |
-| `SubagentStart`      | `agent_type`, `agent_id`, `task`                                                                    |                                                                                                                                                  |
-| `SubagentStop`       | `agent_type`, `agent_id`, `last_assistant_message`                                                  |                                                                                                                                                  |
+| `SubagentStart`      | `agent_id`, `agent_type`                                                                            | fires with the parent's `session_id`; **no** model or task text (verified against the 2.1.210 binary — `task_description` belongs to `TaskCreated`) |
+| `SubagentStop`       | `agent_id`, `agent_type`, `agent_transcript_path`, `last_assistant_message`, `stop_hook_active`     | fires with the parent's `session_id`                                                                                                            |
 | `SessionEnd`         | `end_reason` (clear/resume/logout/prompt_input_exit/bypass_permissions_disabled/other), `exit_code` |                                                                                                                                                  |
 
 \* `message` is not listed in the documented payload schema but is present in
@@ -298,6 +298,8 @@ What the shipped plugins subscribe and how they map to unified events
 | claude   | `Notification` (`elicitation_dialog\|agent_needs_input`) | `attention` question {message}           |
 | claude   | `PostToolUse`                                        | `heartbeat` {tool_name}                       |
 | claude   | `PreCompact` / `PostCompact`                         | `heartbeat` {"compact"}                       |
+| claude   | `SubagentStart`                                      | `subagent_start` {agent_id, agent_type}       |
+| claude   | `SubagentStop`                                       | `subagent_end` {agent_id}                     |
 | claude   | `Stop`                                               | `turn_end` {last_assistant_message}           |
 | claude   | `StopFailure`                                        | `turn_error` {error_type, error_message}      |
 | claude   | `SessionEnd`                                         | `session_end`                                 |
@@ -306,9 +308,11 @@ What the shipped plugins subscribe and how they map to unified events
 | codex    | `PermissionRequest`                                  | `attention` approval {command}                |
 | codex    | `PostToolUse`                                        | `heartbeat` {tool_name}                       |
 | codex    | `PreCompact` / `PostCompact`                         | `heartbeat` {"compact"}                       |
+| codex    | `SubagentStart`                                      | `subagent_start` {agent_id, agent_type, model} |
+| codex    | `SubagentStop`                                       | `subagent_end` {agent_id}                     |
 | codex    | `Stop`                                               | `turn_end` {last_assistant_message}           |
 
 Deliberately unsubscribed on claude: `Notification` types `permission_prompt`
 (duplicate of `PermissionRequest`), `idle_prompt` (Done already expresses it),
-`auth_success` and elicitation lifecycle types (noise); subagent/task events
-(subagent tool activity already heartbeats through the parent's `PostToolUse`).
+`auth_success` and elicitation lifecycle types (noise); task events (subagent
+tool activity already heartbeats through the parent's `PostToolUse`).

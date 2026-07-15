@@ -65,9 +65,13 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 | `attention` | `attention`: `approval` \| `question`, `summary?` | blocked mid-turn on the user: a permission dialog (`approval`) or an explicit question (`question`) |
 | `turn_end` | `summary?` (final message excerpt) | the turn finished normally |
 | `turn_error` | `reason?` (e.g. provider error type), `summary?` | the turn aborted with a provider-reported failure |
+| `subagent_start` | `agent` (provider-native subagent id), `agent_type?`, `model?`, `summary?` (task excerpt) | a subagent spawned inside this session started running |
+| `subagent_end` | `agent` | that subagent finished |
 | `session_end` | | the native session ended |
 
-Excerpt fields (`summary`, `activity`) are display one-liners; plugins truncate them (~120 chars) — the core stores what it is given. Every field beyond `session` and `kind` is optional: emit what the provider knows, omit what it doesn't.
+Excerpt fields (`summary`, `activity`) are display one-liners; plugins truncate them (~120 chars) — the core stores what it is given. Every field beyond `session` and `kind` is optional (exception: `subagent_start`/`subagent_end` require `agent` — without an id there is nothing to correlate): emit what the provider knows, omit what it doesn't.
+
+Subagent events use the **parent's** native session id and are status-neutral: they never clear Attention, revive Done, or affect staleness. The panel replays start/end pairs into the running-subagent list shown under the agent's row; a `session_start`/`session_end` clears the list.
 
 Unknown payloads must produce zero events and exit 0 — never fail the provider's hook.
 

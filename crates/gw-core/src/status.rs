@@ -27,13 +27,26 @@ pub struct Derived {
     pub detail: Option<String>,
 }
 
+/// A subagent running inside a session, replayed from start/end events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subagent {
+    pub agent_type: Option<String>,
+    pub model: Option<String>,
+    pub summary: Option<String>,
+    pub since: DateTime<Utc>,
+}
+
 /// Events must be in log order with timestamps stamped by the store.
 /// Attention is eventually consistent: any later event clears it, so status
 /// is a function of the last event (plus `now` for staleness). An idle agent
 /// never goes stale; only an apparently-working one does.
+///
+/// Subagent events are status-neutral and skipped entirely: a subagent
+/// finishing must not clear the parent's Attention or revive a Done session.
 pub fn derive(events: &[Event], now: DateTime<Utc>, stale_after: Duration) -> Option<Derived> {
+    let events: Vec<&Event> = events.iter().filter(|e| !is_subagent(e)).collect();
     let ts = |e: &Event| e.ts.expect("stored events carry ts");
-    let last = events.last()?;
+    let last = *events.last()?;
     let derived = |status, detail| {
         Some(Derived {
             status,
@@ -71,21 +84,63 @@ pub fn derive(events: &[Event], now: DateTime<Utc>, stale_after: Duration) -> Op
                     )
                 })
                 .last()
-                .map(ts)
+                .map(|e| ts(e))
                 .unwrap();
             Some(Derived {
                 status,
                 since,
-                detail: working_detail(events),
+                detail: working_detail(&events),
             })
         }
+        EventKind::SubagentStart { .. } | EventKind::SubagentEnd { .. } => {
+            unreachable!("subagent events are filtered above")
+        }
     }
+}
+
+fn is_subagent(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::SubagentStart { .. } | EventKind::SubagentEnd { .. }
+    )
+}
+
+/// Replay subagent start/end pairs into the currently running set, in start
+/// order. A session boundary clears the set: subagents cannot outlive their
+/// session, and this bounds ghosts from a missed end event.
+pub fn subagents(events: &[Event]) -> Vec<Subagent> {
+    let mut running: Vec<(&str, Subagent)> = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::SubagentStart {
+                agent,
+                agent_type,
+                model,
+                summary,
+            } => {
+                running.retain(|(id, _)| id != agent);
+                running.push((
+                    agent,
+                    Subagent {
+                        agent_type: agent_type.clone(),
+                        model: model.clone(),
+                        summary: summary.clone(),
+                        since: event.ts.expect("stored events carry ts"),
+                    },
+                ));
+            }
+            EventKind::SubagentEnd { agent } => running.retain(|(id, _)| id != agent),
+            EventKind::SessionStart { .. } | EventKind::SessionEnd => running.clear(),
+            _ => {}
+        }
+    }
+    running.into_iter().map(|(_, subagent)| subagent).collect()
 }
 
 /// "activity · task": the latest heartbeat's activity plus the current
 /// turn's prompt excerpt. The turn's start is searched past interruptions
 /// (attention events sit inside a turn), stopping at any turn boundary.
-fn working_detail(events: &[Event]) -> Option<String> {
+fn working_detail(events: &[&Event]) -> Option<String> {
     let activity = match &events.last()?.kind {
         EventKind::Heartbeat { activity } => activity.clone(),
         _ => None,
@@ -260,6 +315,90 @@ mod tests {
         )];
         let d = derive(&explained, at(10), STALE).unwrap();
         assert_eq!(d.detail.as_deref(), Some("billing_error: credit exhausted"));
+    }
+
+    fn subagent_start(agent: &str, agent_type: Option<&str>, model: Option<&str>) -> EventKind {
+        EventKind::SubagentStart {
+            agent: agent.into(),
+            agent_type: agent_type.map(str::to_owned),
+            model: model.map(str::to_owned),
+            summary: None,
+        }
+    }
+
+    fn subagent_end(agent: &str) -> EventKind {
+        EventKind::SubagentEnd {
+            agent: agent.into(),
+        }
+    }
+
+    #[test]
+    fn subagent_events_are_status_neutral() {
+        // A subagent finishing must not clear a pending approval.
+        let blocked = [ev(0, attention()), ev(10, subagent_end("a1"))];
+        let d = derive(&blocked, at(20), STALE).unwrap();
+        assert_eq!(d.status, SessionStatus::Attention(AttentionKind::Approval));
+        assert_eq!(d.since, at(0));
+
+        // Nor revive a finished turn.
+        let done = [
+            ev(0, EventKind::TurnEnd { summary: None }),
+            ev(10, subagent_end("a1")),
+        ];
+        assert_eq!(
+            derive(&done, at(20), STALE).unwrap().status,
+            SessionStatus::Done
+        );
+
+        // A log holding only subagent events derives nothing.
+        assert_eq!(derive(&[ev(0, subagent_end("a1"))], at(10), STALE), None);
+
+        // Interleaved subagent events don't break the working-since scan.
+        let working = [
+            ev(0, turn_start(Some("fix the tests"))),
+            ev(10, subagent_start("a1", Some("Explore"), None)),
+            ev(20, heartbeat(Some("Bash"))),
+        ];
+        let d = derive(&working, at(30), STALE).unwrap();
+        assert_eq!(d.status, SessionStatus::Working);
+        assert_eq!(d.since, at(0));
+        assert_eq!(d.detail.as_deref(), Some("Bash · fix the tests"));
+    }
+
+    #[test]
+    fn subagents_replays_starts_and_ends() {
+        let events = [
+            ev(0, subagent_start("a1", Some("Explore"), Some("haiku"))),
+            ev(10, subagent_start("a2", Some("Plan"), None)),
+            ev(20, subagent_end("a1")),
+        ];
+        let running = subagents(&events);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].agent_type.as_deref(), Some("Plan"));
+        assert_eq!(running[0].since, at(10));
+
+        // A restarted id replaces the earlier entry instead of duplicating it.
+        let restarted = [
+            ev(0, subagent_start("a1", Some("Explore"), None)),
+            ev(10, subagent_start("a1", Some("Explore"), Some("opus"))),
+        ];
+        let running = subagents(&restarted);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].model.as_deref(), Some("opus"));
+        assert_eq!(running[0].since, at(10));
+    }
+
+    #[test]
+    fn session_boundaries_clear_subagents() {
+        let events = [
+            ev(0, subagent_start("a1", None, None)),
+            ev(10, EventKind::SessionEnd),
+            ev(20, EventKind::SessionStart { model: None }),
+            ev(30, subagent_start("a2", None, None)),
+        ];
+        let running = subagents(&events);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].since, at(30));
     }
 
     #[test]

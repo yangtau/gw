@@ -349,6 +349,11 @@ impl App {
                     branch: git_branch(&agent.cwd).unwrap_or_default(),
                     window: format!("{}:{}", agent.pane.window_index, agent.pane.window_name),
                     time: agent.since.map(|t| ago(t, now)).unwrap_or_default(),
+                    subagents: agent
+                        .subagents
+                        .iter()
+                        .map(|s| subagent_text(s, now))
+                        .collect(),
                 }
             })
             .collect()
@@ -357,6 +362,9 @@ impl App {
     fn render_agents(&self, frame: &mut Frame, area: Rect) {
         let cells = self.agent_cells(Utc::now());
         let mut lines = vec![Line::default()];
+        // Physical line span [top, bottom) of the selected agent + its
+        // subagent sub-lines; subagent rows can push it past the viewport.
+        let mut selected_span = (0, 0);
         if cells.is_empty() {
             lines.push(Line::styled(
                 "   no agents in this session — n launches one",
@@ -371,14 +379,23 @@ impl App {
                 .max()
                 .unwrap_or(0);
             let plan = plan_right(&cells, width, agent_w, status_w);
-            lines.extend(
-                cells
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| agent_line(c, i == self.selected, agent_w, status_w, &plan, width)),
-            );
+            for (i, c) in cells.iter().enumerate() {
+                if i == self.selected {
+                    selected_span = (lines.len(), lines.len() + 1 + c.subagents.len());
+                }
+                lines.push(agent_line(
+                    c,
+                    i == self.selected,
+                    agent_w,
+                    status_w,
+                    &plan,
+                    width,
+                ));
+                lines.extend(c.subagents.iter().map(|s| subagent_line(s, width)));
+            }
         }
-        frame.render_widget(Paragraph::new(lines), area);
+        let scroll = scroll_offset(selected_span.0, selected_span.1, area.height as usize);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
     }
 
     fn render_ended(&self, frame: &mut Frame, area: Rect) {
@@ -390,7 +407,10 @@ impl App {
             Line::default(),
         ];
         if self.snapshot.ended.is_empty() {
-            lines.push(Line::styled("   nothing ended recently", Style::new().dim()));
+            lines.push(Line::styled(
+                "   nothing ended recently",
+                Style::new().dim(),
+            ));
             frame.render_widget(Paragraph::new(lines), area);
             return;
         }
@@ -417,21 +437,26 @@ impl App {
         let cwd_w = cells.iter().map(|c| c.3.width()).max().unwrap_or(0);
         let time_w = cells.iter().map(|c| c.4.width()).max().unwrap_or(0);
         let dim = Style::new().dim();
-        lines.extend(cells.iter().enumerate().map(|(i, (label, color, session, cwd, time))| {
-            let marker = if i == self.selected { " ❯ " } else { "   " };
-            let prefix = MARKER_W + label_w + COL_GAP + session_w + COL_GAP;
-            let mut right = pad(cwd, cwd_w);
-            right.push_str(SEP);
-            right.push_str(&pad_left(time, time_w));
-            let fill = width.saturating_sub(1 + prefix + right.width());
-            Line::from(vec![
-                Span::styled(marker, Style::new().bold()),
-                Span::styled(pad(label, label_w + COL_GAP), Style::new().fg(*color)),
-                Span::styled(pad(session, session_w + COL_GAP), dim),
-                Span::raw(" ".repeat(fill)),
-                Span::styled(right, dim),
-            ])
-        }));
+        lines.extend(
+            cells
+                .iter()
+                .enumerate()
+                .map(|(i, (label, color, session, cwd, time))| {
+                    let marker = if i == self.selected { " ❯ " } else { "   " };
+                    let prefix = MARKER_W + label_w + COL_GAP + session_w + COL_GAP;
+                    let mut right = pad(cwd, cwd_w);
+                    right.push_str(SEP);
+                    right.push_str(&pad_left(time, time_w));
+                    let fill = width.saturating_sub(1 + prefix + right.width());
+                    Line::from(vec![
+                        Span::styled(marker, Style::new().bold()),
+                        Span::styled(pad(label, label_w + COL_GAP), Style::new().fg(*color)),
+                        Span::styled(pad(session, session_w + COL_GAP), dim),
+                        Span::raw(" ".repeat(fill)),
+                        Span::styled(right, dim),
+                    ])
+                }),
+        );
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -501,6 +526,33 @@ struct AgentCells {
     branch: String,
     window: String,
     time: String,
+    /// Pre-composed one-liners for running subagents, rendered dim below the row.
+    subagents: Vec<String>,
+}
+
+/// "agent_type · model · task · 3m" — omitting what the provider didn't report.
+fn subagent_text(subagent: &gw_core::status::Subagent, now: DateTime<Utc>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let agent_type = subagent.agent_type.as_deref().unwrap_or("subagent");
+    parts.push(agent_type);
+    parts.extend(subagent.model.as_deref());
+    parts.extend(subagent.summary.as_deref());
+    let time = ago(subagent.since, now);
+    parts.push(&time);
+    parts.join(SEP)
+}
+
+/// Scroll offset keeping the selected block [top, bottom) visible: 0 while
+/// it fits the viewport, else just enough to bring its bottom into view; a
+/// block taller than the viewport pins its top line instead.
+fn scroll_offset(top: usize, bottom: usize, height: usize) -> usize {
+    bottom.min(top + height).saturating_sub(height)
+}
+
+fn subagent_line(text: &str, width: usize) -> Line<'static> {
+    let indent = " ".repeat(MARKER_W);
+    let composed = truncate(text, width.saturating_sub(1 + MARKER_W + 2));
+    Line::styled(format!("{indent}↳ {composed}"), Style::new().dim())
 }
 
 /// Column widths for the right cluster; 0 means the field is dropped.
@@ -527,7 +579,8 @@ impl RightPlan {
 /// drop branch, shrink cwd to its basename, drop cwd. Time always stays;
 /// detail keeps at least MIN_DETAIL columns before fields start dropping.
 fn plan_right(cells: &[AgentCells], width: usize, agent_w: usize, status_w: usize) -> RightPlan {
-    let maxw = |f: fn(&AgentCells) -> &String| cells.iter().map(|c| f(c).width()).max().unwrap_or(0);
+    let maxw =
+        |f: fn(&AgentCells) -> &String| cells.iter().map(|c| f(c).width()).max().unwrap_or(0);
     let time = maxw(|c| &c.time);
     let cwd_full = maxw(|c| &c.cwd_full);
     let cwd_short = maxw(|c| &c.cwd_short);
@@ -579,7 +632,10 @@ fn agent_line(
     let marker = if selected { " ❯ " } else { "   " };
     let mut spans = vec![
         Span::styled(marker, Style::new().fg(c.color).bold()),
-        Span::styled(pad(&c.label, agent_w + COL_GAP), Style::new().fg(c.label_color)),
+        Span::styled(
+            pad(&c.label, agent_w + COL_GAP),
+            Style::new().fg(c.label_color),
+        ),
         Span::styled(
             pad(&format!("{} {}", c.dot, c.word), status_w + COL_GAP),
             Style::new().fg(c.color),
@@ -601,7 +657,11 @@ fn agent_line(
     spans.push(Span::raw(" ".repeat(fill)));
 
     let dim = Style::new().dim();
-    let cwd = if plan.cwd_full { &c.cwd_full } else { &c.cwd_short };
+    let cwd = if plan.cwd_full {
+        &c.cwd_full
+    } else {
+        &c.cwd_short
+    };
     let fields = [
         (cwd.as_str(), plan.cwd, false),
         (c.branch.as_str(), plan.branch, false),
@@ -776,14 +836,85 @@ mod tests {
             branch: branch.into(),
             window: window.into(),
             time: time.into(),
+            subagents: vec![],
         }
     }
 
     fn sample() -> Vec<AgentCells> {
         vec![
-            cell("Bash · $mattpocock-select", "~/Workspaces/gw2", "main", "2:gw", "3m"),
+            cell(
+                "Bash · $mattpocock-select",
+                "~/Workspaces/gw2",
+                "main",
+                "2:gw",
+                "3m",
+            ),
             cell("", "~/Workspaces/gw2", "main", "1:.claude-wrap", "12m"),
         ]
+    }
+
+    #[test]
+    fn scroll_keeps_selected_block_visible() {
+        // Fits entirely: no scroll.
+        assert_eq!(scroll_offset(1, 3, 10), 0);
+        // Selected block ends below the viewport: bottom-aligned.
+        assert_eq!(scroll_offset(8, 12, 10), 2);
+        // Block taller than the viewport: pin its top line.
+        assert_eq!(scroll_offset(5, 20, 10), 5);
+        assert_eq!(scroll_offset(0, 1, 0), 0);
+
+        // Regression: subagent sub-lines push later agents past the viewport;
+        // every selectable row must still scroll into view (it was clipped
+        // while j/k/Enter kept operating on it).
+        let subagent_counts = [2usize, 3, 0];
+        let height = 5;
+        for selected in 0..subagent_counts.len() {
+            let mut row = 1; // leading blank line
+            let mut span = (0, 0);
+            for (i, n) in subagent_counts.iter().enumerate() {
+                if i == selected {
+                    span = (row, row + 1 + n);
+                }
+                row += 1 + n;
+            }
+            let scroll = scroll_offset(span.0, span.1, height);
+            assert!(
+                (scroll..scroll + height).contains(&span.0),
+                "selected agent row {} not visible at scroll {scroll}",
+                span.0
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_text_joins_known_fields() {
+        let now = DateTime::from_timestamp(600, 0).unwrap();
+        let full = gw_core::status::Subagent {
+            agent_type: Some("Explore".into()),
+            model: Some("haiku".into()),
+            summary: Some("find hooks".into()),
+            since: DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        assert_eq!(
+            subagent_text(&full, now),
+            "Explore · haiku · find hooks · 10m"
+        );
+
+        let bare = gw_core::status::Subagent {
+            agent_type: None,
+            model: None,
+            summary: None,
+            since: now,
+        };
+        assert_eq!(subagent_text(&bare, now), "subagent · now");
+    }
+
+    #[test]
+    fn subagent_lines_stay_within_width() {
+        for width in 10..80 {
+            let line = subagent_line("Explore · haiku · a very long task description", width);
+            assert!(line.width() <= width, "overflow at width {width}");
+        }
     }
 
     #[test]

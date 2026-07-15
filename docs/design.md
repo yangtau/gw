@@ -17,7 +17,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 ## UX
 
 - **Panel** runs identically in a persistent pane (dashboard) or `tmux display-popup` (primary posture); after a jump the popup instance exits. Scope: current session only.
-- **List columns**: provider, status (+ duration in that status), window/pane, detail (one-line status context: current activity · task, awaited approval, turn summary, failure reason), cwd (abbreviated), git branch.
+- **List columns**: provider, status (+ duration in that status), window/pane, detail (one-line status context: current activity · task, awaited approval, turn summary, failure reason), cwd (abbreviated), git branch. Running subagents render as dim indented sub-lines under their agent's row (`↳ type · model · task · age`).
 - **Preview**: read-only `capture-pane` tail of the selected agent (display only, never used for status).
 - **Keys (v1)**: `j/k` move, `Enter` jump, `n` launch (pick provider → new window in the panel's cwd → jump), `r` resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` jump to next Attention agent, `q` quit.
 - **Notifications**: `gw hook` itself fires a desktop notification (macOS `osascript`) + terminal bell when writing an attention event — global notifications without a daemon.
@@ -27,7 +27,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 
 - Discovery: `gw-provider-*` on PATH and in `~/.config/gw/providers/bin/`.
 - `manifest` → JSON: protocol version, provider id, display label/color, process match rules (argv basename patterns), launch command, resume command template (`{session_id}`, `{cwd}`), hook install spec (target files, entries to merge).
-- `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields.
+- `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `subagent_start`, `subagent_end`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields.
 - Official plugins: `gw-provider-claude`, `gw-provider-codex` (same workspace, same protocol, no fast path).
 
 ## Storage
