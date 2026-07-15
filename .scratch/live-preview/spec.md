@@ -17,7 +17,9 @@ accepted (see ADR).
 Environment facts (verified):
 
 - tmux 3.7b on the dev machine; grouped sessions, `window-size latest` (default),
-  `aggressive-resize`, `attach -r`, `destroy-unattached` all available.
+  `aggressive-resize`, `attach -f read-only`, `destroy-unattached` all available.
+- `attach -r` is an alias for `-f read-only,ignore-size`; the preview uses only
+  `read-only` so its client participates in window sizing.
 - tui-term 0.3.4 (actively maintained) requires ratatui 0.30 + crossterm 0.29;
   gw is currently on ratatui 0.29 + crossterm 0.28 → prerequisite upgrade.
 - Default `window-size latest` without aggressive-resize lets the *user's* client
@@ -59,8 +61,10 @@ and tests clean.
 - Add `window_id` (`#{window_id}`, e.g. `@3`) to the `list-panes` format and the
   `Pane` struct (update the parser test).
 - `preview_session_create(name, group_with)` →
-  `new-session -d -s <name> -t <current session>` then on the new session:
-  `set-option -t <name> destroy-unattached on` and `set-option -t <name> status off`.
+  `new-session -d -s <name> -t <current session>` then
+  `set-option -t <name> status off`. `destroy-unattached` is enabled by the nested
+  client only after it attaches, because enabling it on a never-attached session
+  destroys that session immediately.
 - `preview_select_window(session, window_id)` → `select-window -t <session>:<window_id>`.
 - `set_window_aggressive_resize(window_id, on: bool)` →
   `set-option -w -t <window_id> aggressive-resize on` / `set-option -uw ...`.
@@ -78,7 +82,9 @@ and tests clean.
   coexist).
 - On first use (lazy init): startup sweep of stale `gw-preview-*` sessions, create the
   grouped session, open a PTY via portable-pty sized to the preview Rect
-  (cols × rows), spawn `tmux attach -r -t gw-preview-<pid>` in it with `TMUX`/`TMUX_PANE`
+  (cols × rows), spawn
+  `tmux attach -f read-only -t gw-preview-<pid> ; set-option -t gw-preview-<pid> destroy-unattached on`
+  in it (`;` is a tmux argv element, not shell syntax), with `TMUX`/`TMUX_PANE`
   removed from the env and `TERM=xterm-256color`. Try the same tmux binary fallback
   list as `run_tmux`.
 - Feed PTY output into a `vt100::Parser` behind a mutex from a blocking reader task;
@@ -86,6 +92,8 @@ and tests clean.
 - Expose `resize(cols, rows)` → resize both the PTY master and the vt100 parser.
 - Expose `select(window_id)` → unset aggressive-resize on the previous window, set it
   on the new one, `select-window`. Track the current window to avoid redundant calls.
+- After every successful aggressive-resize unset, best-effort
+  `resize-window -A -t <window_id>` so the released window snaps back immediately.
 - `deselect()` (no agent selected / Ended view): unset aggressive-resize on the last
   window; stop rendering the live widget (client stays attached, harmless).
 - On drop / TUI exit: unset aggressive-resize, `kill_session`. `destroy-unattached on`
@@ -93,7 +101,8 @@ and tests clean.
   client dies, tmux destroys the session). A `kill -9` may leak the per-window
   aggressive-resize flag — accepted.
 - Any error at any stage → mark the client dead and return; callers fall back to
-  snapshots. Do not retry in a loop.
+  snapshots. Do not retry in a loop. Log degradation errors to the append-only
+  `<state dir>/tui.log` without writing to stderr from the raw-mode TUI.
 
 **TUI integration** (`crates/gw/src/tui.rs`):
 

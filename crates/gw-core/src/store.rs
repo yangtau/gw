@@ -54,13 +54,7 @@ struct DebugRecord<'a> {
 impl Store {
     /// `~/.local/state/gw` (override with `GW_STATE_DIR`, for tests).
     pub fn open_default() -> Result<Self> {
-        let root = match std::env::var_os("GW_STATE_DIR") {
-            Some(root) => PathBuf::from(root),
-            None => dirs::home_dir()
-                .context("could not determine home directory")?
-                .join(".local/state/gw"),
-        };
-        Self::open(root)
+        Self::open(default_state_dir()?)
     }
 
     pub fn open(root: PathBuf) -> Result<Self> {
@@ -304,6 +298,15 @@ impl Store {
                 .find_map(|suffix| name.to_str()?.strip_suffix(suffix))?;
             (stem == sid || stem.ends_with(&format!("-{sid}"))).then(|| stem.to_owned())
         })
+    }
+}
+
+pub(crate) fn default_state_dir() -> Result<PathBuf> {
+    match std::env::var_os("GW_STATE_DIR") {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => Ok(dirs::home_dir()
+            .context("could not determine home directory")?
+            .join(".local/state/gw")),
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use gw_core::tmux;
+use gw_core::{tmux, tui_log};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -51,16 +51,21 @@ impl Preview {
             return false;
         }
 
-        let result = (|| {
+        let result: Result<()> = (|| {
             if let Some(previous) = self.selected.clone() {
-                tmux::set_window_aggressive_resize(&previous, false)?;
+                release_window(&previous)
+                    .with_context(|| format!("release previous preview window {previous}"))?;
                 self.selected = None;
             }
-            tmux::set_window_aggressive_resize(window_id, true)?;
+            tmux::set_window_aggressive_resize(window_id, true)
+                .with_context(|| format!("enable preview resize for window {window_id}"))?;
             self.selected = Some(window_id.to_owned());
             tmux::preview_select_window(&self.session, window_id)
+                .with_context(|| format!("select preview window {window_id}"))?;
+            Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = result {
+            tui_log::error(&format!("live preview selection failed: {error:#}"));
             self.fail();
         }
         self.is_live()
@@ -70,13 +75,14 @@ impl Preview {
         let Some(window_id) = self.selected.clone() else {
             return;
         };
-        if matches!(self.state, State::Live(_))
-            && tmux::set_window_aggressive_resize(&window_id, false).is_err()
-        {
-            self.fail();
-        } else {
-            self.selected = None;
+        if matches!(self.state, State::Live(_)) {
+            if let Err(error) = release_window(&window_id) {
+                tui_log::error(&format!("live preview deselect failed: {error:#}"));
+                self.fail();
+                return;
+            }
         }
+        self.selected = None;
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
@@ -96,15 +102,17 @@ impl Preview {
             return true;
         }
         let size = pty_size(cols, rows);
-        let result = live.master.resize(size).and_then(|()| {
+        let result: Result<()> = (|| {
+            live.master.resize(size).context("resize preview PTY")?;
             let mut parser = live
                 .parser
                 .lock()
                 .map_err(|_| anyhow!("preview parser lock was poisoned"))?;
             parser.screen_mut().set_size(rows, cols);
             Ok(())
-        });
-        if result.is_err() {
+        })();
+        if let Err(error) = result {
+            tui_log::error(&format!("live preview resize failed: {error:#}"));
             self.fail();
             return false;
         }
@@ -142,22 +150,28 @@ impl Preview {
     }
 
     fn initialize(&mut self, cols: u16, rows: u16) {
-        let setup = (|| {
+        let setup: Result<()> = (|| {
             for session in tmux::stale_preview_sessions()? {
-                tmux::kill_session(&session)?;
+                tmux::kill_session(&session)
+                    .with_context(|| format!("kill stale preview session {session}"))?;
             }
-            let current = tmux::current_session_name()?;
+            let current = tmux::current_session_name().context("get current tmux session")?;
             tmux::preview_session_create(&self.session, &current)
+                .with_context(|| format!("create preview session {}", self.session))
         })();
-        if setup.is_err() {
+        if let Err(error) = setup {
+            tui_log::error(&format!("live preview session setup failed: {error:#}"));
+            self.selected = None;
             self.state = State::Dead;
             return;
         }
 
         let live = match self.start_client(cols, rows) {
             Ok(live) => live,
-            Err(_) => {
+            Err(error) => {
+                tui_log::error(&format!("live preview client spawn failed: {error:#}"));
                 let _ = tmux::kill_session(&self.session);
+                self.selected = None;
                 self.state = State::Dead;
                 return;
             }
@@ -181,17 +195,15 @@ impl Preview {
         let mut last_error = None;
         let mut child = None;
         for binary in tmux::TMUX_BINARIES {
-            let mut command = CommandBuilder::new(binary);
-            command.args(["attach", "-r", "-t", self.session.as_str()]);
-            command.env_remove("TMUX");
-            command.env_remove("TMUX_PANE");
-            command.env("TERM", "xterm-256color");
+            let command = attach_command(binary, &self.session);
             match pair.slave.spawn_command(command) {
                 Ok(spawned) => {
                     child = Some(spawned);
                     break;
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    last_error = Some(error.context(format!("spawn {binary} preview client")))
+                }
             }
         }
         let child = child.ok_or_else(|| {
@@ -218,21 +230,44 @@ impl Preview {
 
     fn fail(&mut self) {
         if let Some(window_id) = self.selected.take() {
-            let _ = tmux::set_window_aggressive_resize(&window_id, false);
+            let _ = release_window(&window_id);
         }
-        if matches!(self.state, State::Live(_)) {
+        if let State::Live(live) = &self.state {
+            live.alive.store(false, Ordering::Release);
             let _ = tmux::kill_session(&self.session);
         }
         self.state = State::Dead;
     }
 }
 
+fn attach_command(binary: &str, session: &str) -> CommandBuilder {
+    let mut command = CommandBuilder::new(binary);
+    command.args([
+        "attach",
+        "-f",
+        "read-only",
+        "-t",
+        session,
+        ";",
+        "set-option",
+        "-t",
+        session,
+        "destroy-unattached",
+        "on",
+    ]);
+    command.env_remove("TMUX");
+    command.env_remove("TMUX_PANE");
+    command.env("TERM", "xterm-256color");
+    command
+}
+
 impl Drop for Preview {
     fn drop(&mut self) {
-        if let Some(window_id) = self.selected.take() {
-            let _ = tmux::set_window_aggressive_resize(&window_id, false);
-        }
-        if matches!(self.state, State::Live(_)) {
+        if let State::Live(live) = &self.state {
+            if let Some(window_id) = self.selected.take() {
+                let _ = release_window(&window_id);
+            }
+            live.alive.store(false, Ordering::Release);
             let _ = tmux::kill_session(&self.session);
         }
     }
@@ -247,6 +282,12 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+fn release_window(window_id: &str) -> Result<()> {
+    tmux::set_window_aggressive_resize(window_id, false)?;
+    let _ = tmux::resize_window_to_available(window_id);
+    Ok(())
+}
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -255,19 +296,56 @@ fn spawn_reader(
 ) {
     drop(tokio::task::spawn_blocking(move || {
         let mut buffer = [0; 8192];
-        loop {
+        let error = loop {
             let count = match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break anyhow!("preview PTY reached EOF"),
+                Err(error) => break anyhow::Error::new(error).context("read preview PTY"),
                 Ok(count) => count,
             };
-            let Ok(mut parser) = parser.lock() else {
-                break;
+            let mut parser = match parser.lock() {
+                Ok(parser) => parser,
+                Err(_) => break anyhow!("preview parser lock was poisoned"),
             };
             parser.process(&buffer[..count]);
             drop(parser);
             let _ = notifications.send(());
+        };
+        if alive.swap(false, Ordering::AcqRel) {
+            tui_log::error(&format!("live preview reader failed: {error:#}"));
         }
-        alive.store(false, Ordering::Release);
         let _ = notifications.send(());
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_is_read_only_but_participates_in_window_sizing() {
+        let command = attach_command("tmux", "gw-preview-42");
+        let argv = command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            argv,
+            [
+                "tmux",
+                "attach",
+                "-f",
+                "read-only",
+                "-t",
+                "gw-preview-42",
+                ";",
+                "set-option",
+                "-t",
+                "gw-preview-42",
+                "destroy-unattached",
+                "on",
+            ]
+        );
+    }
 }

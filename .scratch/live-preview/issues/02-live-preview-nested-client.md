@@ -10,7 +10,7 @@ Deliverables:
 
 - tmux helpers in `crates/gw-core/src/tmux.rs` (window_id in `Pane`, grouped preview
   session create/select/kill, per-window aggressive-resize toggle, stale-session sweep).
-- `crates/gw/src/preview.rs`: PTY + `tmux attach -r` + vt100 parser + notification
+- `crates/gw/src/preview.rs`: PTY + read-only tmux attach + vt100 parser + notification
   channel, with the lifecycle and error handling exactly as specced.
 - `crates/gw/src/tui.rs` integration: select-loop branch with ~30 fps throttle,
   live widget via tui-term, capture-snapshot fallback preserved.
@@ -21,3 +21,7 @@ Deliverables:
 
 Added the grouped read-only tmux client, PTY/vt100 renderer, redraw notifications,
 window resize lifecycle, stale-session sweep, and snapshot fallback.
+
+Fixed the attach lifecycle after real tmux verification: defer `destroy-unattached`
+until the client is attached, keep the read-only client resize-aware, restore released
+windows immediately, and log preview degradation errors to `tui.log`.

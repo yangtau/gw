@@ -86,35 +86,35 @@ pub fn current_session_name() -> Result<String> {
 }
 
 pub fn preview_session_create(name: &str, group_with: &str) -> Result<()> {
-    run_tmux(&[
-        "new-session".into(),
-        "-d".into(),
-        "-s".into(),
-        name.into(),
-        "-t".into(),
-        group_with.into(),
-    ])?;
-    let configured = (|| {
-        run_tmux(&[
-            "set-option".into(),
-            "-t".into(),
+    let commands = preview_session_create_commands(name, group_with);
+    run_tmux(&commands[0])?;
+    let configured = commands[1..]
+        .iter()
+        .try_for_each(|command| run_tmux(command).map(|_| ()));
+    if configured.is_err() {
+        let _ = kill_session(name);
+    }
+    configured
+}
+
+fn preview_session_create_commands(name: &str, group_with: &str) -> Vec<Vec<OsString>> {
+    vec![
+        vec![
+            "new-session".into(),
+            "-d".into(),
+            "-s".into(),
             name.into(),
-            "destroy-unattached".into(),
-            "on".into(),
-        ])?;
-        run_tmux(&[
+            "-t".into(),
+            group_with.into(),
+        ],
+        vec![
             "set-option".into(),
             "-t".into(),
             name.into(),
             "status".into(),
             "off".into(),
-        ])?;
-        Ok(())
-    })();
-    if configured.is_err() {
-        let _ = kill_session(name);
-    }
-    configured
+        ],
+    ]
 }
 
 pub fn preview_select_window(session: &str, window_id: &str) -> Result<()> {
@@ -145,6 +145,16 @@ pub fn set_window_aggressive_resize(window_id: &str, on: bool) -> Result<()> {
         ]);
     }
     run_tmux(&args)?;
+    Ok(())
+}
+
+pub fn resize_window_to_available(window_id: &str) -> Result<()> {
+    run_tmux(&[
+        "resize-window".into(),
+        "-A".into(),
+        "-t".into(),
+        window_id.into(),
+    ])?;
     Ok(())
 }
 
@@ -288,5 +298,25 @@ mod tests {
         assert_eq!(preview_session_pid("gw-preview-123"), Some(123));
         assert_eq!(preview_session_pid("gw-preview-nope"), None);
         assert_eq!(preview_session_pid("other-123"), None);
+    }
+
+    #[test]
+    fn preview_session_setup_does_not_destroy_before_attach() {
+        let commands = preview_session_create_commands("gw-preview-42", "main");
+        let commands = commands
+            .iter()
+            .map(|command| {
+                command
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[1],
+            ["set-option", "-t", "gw-preview-42", "status", "off"]
+        );
     }
 }

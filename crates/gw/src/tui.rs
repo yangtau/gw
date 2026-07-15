@@ -158,7 +158,7 @@ impl App {
             Duration::minutes(STALE_AFTER_MINUTES),
         ) {
             Ok(snapshot) => self.snapshot = snapshot,
-            Err(err) => eprintln!("snapshot failed: {err:#}"),
+            Err(err) => gw_core::tui_log::error(&format!("snapshot failed: {err:#}")),
         }
         self.selected = self.selected.min(self.row_count().saturating_sub(1));
         self.refresh_preview();
