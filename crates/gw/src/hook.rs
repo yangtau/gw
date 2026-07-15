@@ -21,9 +21,24 @@ pub fn run(provider: &str) -> Result<()> {
 }
 
 fn ingest(provider: &str, payload: &[u8]) -> Result<()> {
+    let cfg = gw_core::config::Config::load();
     let plugin = gw_core::plugins::find(provider)?;
-    let events = gw_core::plugins::normalize(&plugin, payload)?;
-    let store = gw_core::store::Store::open_default()?;
+    let result = gw_core::plugins::normalize(&plugin, payload);
+    let store = if cfg.debug.hooks {
+        Some(gw_core::store::Store::open_default()?)
+    } else {
+        None
+    };
+    if let Some(store) = &store {
+        if let Err(error) = store.append_debug(provider, payload, &result) {
+            eprintln!("gw hook {provider}: could not append debug payload: {error:#}");
+        }
+    }
+    let events = result?;
+    let store = match store {
+        Some(store) => store,
+        None => gw_core::store::Store::open_default()?,
+    };
 
     for event in events {
         let location = match gw_core::procs::locate_agent(

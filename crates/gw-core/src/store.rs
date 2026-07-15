@@ -36,6 +36,20 @@ pub struct SessionRecord {
     pub events: Vec<Event>,
 }
 
+#[derive(Serialize)]
+struct DebugRecord<'a> {
+    ts: DateTime<Utc>,
+    provider: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<&'a [Event]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_raw: Option<String>,
+}
+
 impl Store {
     /// `~/.local/state/gw` (override with `GW_STATE_DIR`, for tests).
     pub fn open_default() -> Result<Self> {
@@ -114,6 +128,51 @@ impl Store {
             updated_at: now,
         };
         write_private(&meta_path, &serde_json::to_vec_pretty(&meta)?)?;
+        Ok(())
+    }
+
+    pub fn append_debug(
+        &self,
+        provider: &str,
+        payload: &[u8],
+        result: &anyhow::Result<Vec<Event>>,
+    ) -> Result<()> {
+        let (events, error) = match result {
+            Ok(events) => (Some(events.as_slice()), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
+        let (payload, payload_raw) = match serde_json::from_slice(payload) {
+            Ok(payload) => (Some(payload), None),
+            Err(_) => (None, Some(String::from_utf8_lossy(payload).into_owned())),
+        };
+        let record = DebugRecord {
+            ts: Utc::now(),
+            provider,
+            events,
+            error,
+            payload,
+            payload_raw,
+        };
+        let path = match result {
+            Ok(events) if !events.is_empty() => self.sessions_dir().join(format!(
+                "{}.debug.jsonl",
+                session_id(provider, &events[0].session)
+            )),
+            _ => self.sessions_dir().join("_unmapped.debug.jsonl"),
+        };
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let written = log.write(&line)?;
+        if written != line.len() {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "partial debug write").into());
+        }
         Ok(())
     }
 
@@ -293,6 +352,93 @@ mod tests {
         assert_eq!(records[0].events.len(), 1);
         assert!(records[0].events[0].ts.is_some());
         assert!(input.ts.is_none());
+    }
+
+    #[test]
+    fn append_debug_maps_non_empty_events_to_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let events = vec![event("session-1", EventKind::TurnStart { summary: None })];
+        let result = Ok(events.clone());
+
+        store
+            .append_debug("test", br#"{"raw":true}"#, &result)
+            .unwrap();
+
+        let sid = session_id("test", "session-1");
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join(format!("{sid}.debug.jsonl"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["provider"], "test");
+        assert_eq!(record["events"], serde_json::to_value(events).unwrap());
+        assert_eq!(record["payload"], serde_json::json!({"raw": true}));
+        assert!(record.get("payload_raw").is_none());
+    }
+
+    #[test]
+    fn append_debug_maps_empty_events_to_fallback_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+
+        store.append_debug("test", b"{}", &Ok(Vec::new())).unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["events"], serde_json::json!([]));
+        assert!(record.get("error").is_none());
+    }
+
+    #[test]
+    fn append_debug_records_errors_without_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let result = Err(anyhow::anyhow!("normalize failed"));
+
+        store.append_debug("test", b"{}", &result).unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["error"], "normalize failed");
+        assert!(record.get("events").is_none());
+    }
+
+    #[test]
+    fn append_debug_preserves_non_json_payload_as_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+
+        store
+            .append_debug("test", b"not json", &Ok(Vec::new()))
+            .unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["payload_raw"], "not json");
+        assert!(record.get("payload").is_none());
+    }
+
+    #[test]
+    fn append_debug_preserves_json_payload_as_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+
+        store
+            .append_debug("test", br#"{"raw":true}"#, &Ok(Vec::new()))
+            .unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["payload"], serde_json::json!({"raw": true}));
+        assert!(record.get("payload_raw").is_none());
     }
 
     #[test]

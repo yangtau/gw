@@ -33,7 +33,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 ## Storage
 
 - Event logs: `~/.local/state/gw/sessions/<sha256(provider:native_session_id)>.jsonl`, append-only, `O_APPEND` single-write per event; retention sweep on panel start (drop logs of dead sessions older than N days).
-- Config (optional, TOML): `~/.config/gw/config.toml` — stale threshold, plugin dir overrides, keybindings later.
+- Config (optional, TOML): `~/.config/gw/config.toml` — currently `[debug] hooks` (see `config.md`); stale threshold, plugin dir overrides, keybindings later.
 
 ## Crate layout
 
@@ -48,6 +48,17 @@ Cargo workspace:
 
 - Kill selected agent from the panel (`x`, with confirm).
 - Last-message summary line per agent (from `turn_end` payload).
+- Reconcile the agy provider with `provider-hooks.md`: the shipped
+  `gw-provider-agy` has drifted from the doc. The doc describes PascalCase
+  `hook_event_name` events (`PreInvocation`/`PostInvocation`/`Stop`…) keyed on
+  `trajectory_id`/`conversation_id` with `tool_call_json`; the implementation
+  instead reads `conversationId` (camelCase) and discriminates purely by which
+  numeric field is present (`invocationNum`→turn_start, `stepIdx`→heartbeat,
+  `executionNum`+`fullyIdle`→turn_end/heartbeat), never touching
+  `hook_event_name`. The doc's "Current gw subscriptions" table also omits agy
+  entirely. Capture real agy payloads via `[debug] hooks` (see `config.md`),
+  then update the agy section and the subscriptions table to match. claude and
+  codex already match the doc 1:1.
 
 ## Transition note
 

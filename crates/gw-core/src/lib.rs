@@ -1,3 +1,4 @@
+pub mod config;
 pub mod discover;
 pub mod plugins;
 pub mod procs;
