@@ -42,5 +42,8 @@ The TUI itself. Runs equally in a persistent pane (dashboard mode) or a tmux `di
 ### Launch
 Creating a new Agent from the panel: pick a provider → a new tmux window opens running that provider's CLI in the panel's current working directory → focus jumps there. No further prompts; anything unusual is started by hand and picked up by discovery.
 
+### Preview
+The Panel's live view of the selected Agent's window: a read-only rendering of the window's real content that updates as the Agent works. The Preview is display-only — it never sends input to the previewed window and never feeds Status (consistent with Status's hook-only sourcing). Full fidelity comes from the source program itself: while previewed, the window really adopts the Preview's size and the program re-renders for it; the Panel never re-interprets content at a size it wasn't drawn for. When a live view cannot be established, the Preview degrades to a static snapshot of recent output — still display-only.
+
 ### Event Log
 One append-only JSONL file per agent session. Plugins write normalized events on hook invocation; the TUI derives Status by replaying the full log and updates incrementally via filesystem watch. There is no daemon: the event log is the only persistent state, and status derivation is a pure function (event sequence → Status).

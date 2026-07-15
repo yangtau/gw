@@ -292,6 +292,7 @@ mod tests {
     fn pane(id: &str, pid: i32, window_index: u32, cwd: &str) -> Pane {
         Pane {
             id: id.into(),
+            window_id: format!("@{window_index}"),
             pid,
             tty: format!("/dev/ttys{pid}"),
             cwd: cwd.into(),

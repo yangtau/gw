@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 #[derive(Debug, Clone)]
 pub struct Pane {
     pub id: String,
+    pub window_id: String,
     /// Root pid of the pane (usually the shell).
     pub pid: i32,
     pub tty: String,
@@ -24,7 +25,7 @@ pub fn list_panes() -> Result<Vec<Pane>> {
         "list-panes".into(),
         "-s".into(),
         "-F".into(),
-        "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}".into(),
+        "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}".into(),
     ])?;
     parse_panes(&stdout)
 }
@@ -74,15 +75,112 @@ pub fn capture(pane_id: &str, lines: u32) -> Result<String> {
     ])
 }
 
+pub fn current_session_name() -> Result<String> {
+    Ok(run_tmux(&[
+        "display-message".into(),
+        "-p".into(),
+        "#{session_name}".into(),
+    ])?
+    .trim()
+    .to_owned())
+}
+
+pub fn preview_session_create(name: &str, group_with: &str) -> Result<()> {
+    run_tmux(&[
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        name.into(),
+        "-t".into(),
+        group_with.into(),
+    ])?;
+    let configured = (|| {
+        run_tmux(&[
+            "set-option".into(),
+            "-t".into(),
+            name.into(),
+            "destroy-unattached".into(),
+            "on".into(),
+        ])?;
+        run_tmux(&[
+            "set-option".into(),
+            "-t".into(),
+            name.into(),
+            "status".into(),
+            "off".into(),
+        ])?;
+        Ok(())
+    })();
+    if configured.is_err() {
+        let _ = kill_session(name);
+    }
+    configured
+}
+
+pub fn preview_select_window(session: &str, window_id: &str) -> Result<()> {
+    run_tmux(&[
+        "select-window".into(),
+        "-t".into(),
+        format!("{session}:{window_id}").into(),
+    ])?;
+    Ok(())
+}
+
+pub fn set_window_aggressive_resize(window_id: &str, on: bool) -> Result<()> {
+    let mut args = vec!["set-option".into()];
+    if on {
+        args.extend([
+            "-w".into(),
+            "-t".into(),
+            window_id.into(),
+            "aggressive-resize".into(),
+            "on".into(),
+        ]);
+    } else {
+        args.extend([
+            "-uw".into(),
+            "-t".into(),
+            window_id.into(),
+            "aggressive-resize".into(),
+        ]);
+    }
+    run_tmux(&args)?;
+    Ok(())
+}
+
+pub fn kill_session(name: &str) -> Result<()> {
+    run_tmux(&["kill-session".into(), "-t".into(), name.into()])?;
+    Ok(())
+}
+
+pub fn stale_preview_sessions() -> Result<Vec<String>> {
+    let stdout = run_tmux(&[
+        "list-sessions".into(),
+        "-F".into(),
+        "#{session_name}".into(),
+    ])?;
+    stdout
+        .lines()
+        .filter_map(|name| preview_session_pid(name).map(|pid| (name, pid)))
+        .filter_map(|(name, pid)| match process_is_alive(pid) {
+            Ok(true) => None,
+            Ok(false) => Some(Ok(name.to_owned())),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
 /// Whether `GW_POPUP=1` marks this process as running in a tmux popup.
 /// The recommended binding is `bind g popup -E 'GW_POPUP=1 gw'`.
 pub fn inside_popup() -> bool {
     matches!(std::env::var("GW_POPUP").as_deref(), Ok("1"))
 }
 
+pub const TMUX_BINARIES: [&str; 3] = ["tmux", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"];
+
 fn run_tmux(args: &[OsString]) -> Result<String> {
     let mut not_found = None;
-    for bin in ["tmux", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"] {
+    for bin in TMUX_BINARIES {
         match Command::new(bin).args(args).output() {
             Ok(output) => {
                 if !output.status.success() {
@@ -106,8 +204,9 @@ fn parse_panes(stdout: &str) -> Result<Vec<Pane>> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let mut fields = line.splitn(6, '\t');
+            let mut fields = line.splitn(7, '\t');
             let id = fields.next().context("missing pane id")?;
+            let window_id = fields.next().context("missing window id")?;
             let pid = fields
                 .next()
                 .context("missing pane pid")?
@@ -123,6 +222,7 @@ fn parse_panes(stdout: &str) -> Result<Vec<Pane>> {
             let window_name = fields.next().context("missing window name")?;
             Ok(Pane {
                 id: id.into(),
+                window_id: window_id.into(),
                 pid,
                 tty: tty.into(),
                 cwd: cwd.into(),
@@ -131,6 +231,19 @@ fn parse_panes(stdout: &str) -> Result<Vec<Pane>> {
             })
         })
         .collect()
+}
+
+fn preview_session_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("gw-preview-")?.parse().ok()
+}
+
+fn process_is_alive(pid: u32) -> Result<bool> {
+    let status = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .context("failed to check preview process")?
+        .status;
+    Ok(status.success())
 }
 
 fn normalize_tty(tty: &str) -> &str {
@@ -148,13 +261,14 @@ mod tests {
     #[test]
     fn parses_list_panes_output() {
         let panes = parse_panes(
-            "%1\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\n\
-             %2\t456\tttys002\t/tmp\t3\tsecond window\n",
+            "%1\t@2\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\n\
+             %2\t@3\t456\tttys002\t/tmp\t3\tsecond window\n",
         )
         .unwrap();
 
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].id, "%1");
+        assert_eq!(panes[0].window_id, "@2");
         assert_eq!(panes[0].pid, 123);
         assert_eq!(panes[0].tty, "/dev/ttys001");
         assert_eq!(panes[0].cwd, PathBuf::from("/Users/me/project one"));
@@ -167,5 +281,12 @@ mod tests {
     fn normalizes_tty_prefix_and_pane_id_output() {
         assert_eq!(normalize_tty("/dev/ttys012"), normalize_tty("ttys012"));
         assert_eq!(parse_pane_id("%7\n"), "%7");
+    }
+
+    #[test]
+    fn parses_preview_session_pid() {
+        assert_eq!(preview_session_pid("gw-preview-123"), Some(123));
+        assert_eq!(preview_session_pid("gw-preview-nope"), None);
+        assert_eq!(preview_session_pid("other-123"), None);
     }
 }

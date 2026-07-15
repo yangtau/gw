@@ -10,6 +10,7 @@
 //! text absorbs whatever space is left.
 
 use std::path::PathBuf;
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -26,11 +27,15 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
+use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::preview::Preview;
 
 const STALE_AFTER_MINUTES: i64 = 30;
 const RETENTION_DAYS: i64 = 7;
 const PREVIEW_LINES: u32 = 50;
+const PREVIEW_FRAME_INTERVAL: StdDuration = StdDuration::from_millis(33);
 const MIN_PREVIEW_TERM_HEIGHT: u16 = 16;
 const MARKER_W: usize = 3;
 const COL_GAP: usize = 2;
@@ -68,7 +73,9 @@ struct App {
     view: View,
     selected: usize,
     picker: Option<usize>,
-    preview: String,
+    snapshot_preview: String,
+    live_preview: Preview,
+    preview_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     exit_after_jump: bool,
 }
 
@@ -76,6 +83,7 @@ impl App {
     fn new() -> Result<Self> {
         let store = Store::open_default()?;
         store.sweep(Duration::days(RETENTION_DAYS))?;
+        let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = Self {
             store,
             plugins: plugins::discover()?,
@@ -87,7 +95,9 @@ impl App {
             view: View::Agents,
             selected: 0,
             picker: None,
-            preview: String::new(),
+            snapshot_preview: String::new(),
+            live_preview: Preview::new(preview_tx),
+            preview_rx,
             exit_after_jump: tmux::inside_popup(),
         };
         app.refresh();
@@ -107,11 +117,26 @@ impl App {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             terminal.draw(|f| self.render(f))?;
+            let last_draw = Instant::now();
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
                 Some(_) = fs_rx.recv() => {
                     while fs_rx.try_recv().is_ok() {}
                     self.refresh();
+                }
+                Some(_) = self.preview_rx.recv() => {
+                    while self.preview_rx.try_recv().is_ok() {}
+                    if self.live_preview.sync_health() {
+                        self.capture_preview();
+                    }
+                    let wait = PREVIEW_FRAME_INTERVAL.saturating_sub(last_draw.elapsed());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                    while self.preview_rx.try_recv().is_ok() {}
+                    if self.live_preview.sync_health() {
+                        self.capture_preview();
+                    }
                 }
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
@@ -232,10 +257,28 @@ impl App {
     }
 
     fn refresh_preview(&mut self) {
-        self.preview = match self.selected_agent() {
-            Some(agent) => tmux::capture(&agent.pane.id, PREVIEW_LINES).unwrap_or_default(),
-            None => String::new(),
-        };
+        let selected = self
+            .selected_agent()
+            .map(|agent| (agent.pane.id.clone(), agent.pane.window_id.clone()));
+        match selected {
+            Some((pane_id, window_id)) => {
+                if !self.live_preview.select(&window_id) {
+                    self.snapshot_preview =
+                        tmux::capture(&pane_id, PREVIEW_LINES).unwrap_or_default();
+                }
+            }
+            None => {
+                self.live_preview.deselect();
+                self.snapshot_preview.clear();
+            }
+        }
+    }
+
+    fn capture_preview(&mut self) {
+        self.snapshot_preview = self
+            .selected_agent()
+            .and_then(|agent| tmux::capture(&agent.pane.id, PREVIEW_LINES).ok())
+            .unwrap_or_default();
     }
 
     fn activate(&mut self) -> Result<Flow> {
@@ -278,17 +321,18 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         let banner_height = if self.snapshot.uninstrumented.is_empty() {
             0
         } else {
             1
         };
-        let preview_height = if frame.area().height < MIN_PREVIEW_TERM_HEIGHT {
-            Constraint::Length(0)
-        } else {
-            Constraint::Percentage(40)
-        };
+        let preview_height =
+            if matches!(self.view, View::Ended) || frame.area().height < MIN_PREVIEW_TERM_HEIGHT {
+                Constraint::Length(0)
+            } else {
+                Constraint::Percentage(40)
+            };
         let [banner, main, preview, footer] = Layout::vertical([
             Constraint::Length(banner_height),
             Constraint::Min(5),
@@ -460,27 +504,59 @@ impl App {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_preview(&self, frame: &mut Frame, area: Rect) {
+    fn render_preview(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
+            self.live_preview.deselect();
             return;
         }
         let width = area.width as usize;
-        let rule = match self.selected_agent() {
-            Some(a) => {
-                let head = format!("─── {}:{} ", a.pane.window_index, a.pane.window_name);
-                format!("{head}{}", "─".repeat(width.saturating_sub(head.width())))
-            }
-            None => "─".repeat(width),
+        let selected = self.selected_agent().map(|agent| {
+            (
+                agent.pane.window_id.clone(),
+                agent.pane.window_index,
+                agent.pane.window_name.clone(),
+            )
+        });
+        let Some((window_id, window_index, window_name)) = selected else {
+            self.live_preview.deselect();
+            return;
         };
-        let visible = area.height.saturating_sub(1) as usize;
-        let all: Vec<&str> = self.preview.lines().collect();
-        let mut lines = vec![Line::styled(rule, Style::new().dim())];
-        lines.extend(
-            all[all.len().saturating_sub(visible)..]
-                .iter()
-                .map(|l| Line::styled(*l, Style::new().dim())),
+        let head = format!("─── {window_index}:{window_name} ");
+        let rule = format!("{head}{}", "─".repeat(width.saturating_sub(head.width())));
+        let header = Rect::new(area.x, area.y, area.width, 1);
+        let terminal = Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
         );
-        frame.render_widget(Paragraph::new(lines), area);
+        frame.render_widget(
+            Paragraph::new(Line::styled(rule, Style::new().dim())),
+            header,
+        );
+
+        if self.live_preview.sync_health() {
+            self.capture_preview();
+        }
+        let was_live = self.live_preview.is_live();
+        let selected_live = self.live_preview.select(&window_id);
+        let resized_live = self.live_preview.resize(terminal.width, terminal.height);
+        if was_live && !(selected_live && resized_live) {
+            self.capture_preview();
+        }
+        if let Some(parser) = self.live_preview.parser() {
+            let parser = parser.lock().unwrap_or_else(|error| error.into_inner());
+            frame.render_widget(PseudoTerminal::new(parser.screen()), terminal);
+            return;
+        }
+
+        let all: Vec<&str> = self.snapshot_preview.lines().collect();
+        let visible = terminal.height as usize;
+        let lines = all[all.len().saturating_sub(visible)..]
+            .iter()
+            .map(|line| Line::styled(*line, Style::new().dim()))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), terminal);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
