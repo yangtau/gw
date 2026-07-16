@@ -1,54 +1,12 @@
-use std::io::{Read, Write};
-
 use gw_plugin_protocol::{
-    AttentionKind, Command, Event, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
+    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
     ProcessMatch, PROTOCOL_VERSION,
 };
+use gw_provider_sdk::{excerpt, one_liner, text};
 use serde_json::{json, Map, Value};
 
 fn main() {
-    let mut args = std::env::args_os().skip(1);
-    let command = args.next();
-
-    if args.next().is_some() {
-        usage();
-    }
-
-    match command.as_deref().and_then(|value| value.to_str()) {
-        Some("manifest") => print_manifest(),
-        Some("normalize") => print_events(),
-        _ => usage(),
-    }
-}
-
-fn usage() -> ! {
-    eprintln!("usage: gw-provider-claude <manifest|normalize>");
-    std::process::exit(2);
-}
-
-fn print_manifest() {
-    let Ok(json) = serde_json::to_string(&manifest()) else {
-        return;
-    };
-    let _ = writeln!(std::io::stdout().lock(), "{json}");
-}
-
-fn print_events() {
-    let mut payload = Vec::new();
-    if std::io::stdin().read_to_end(&mut payload).is_err() {
-        return;
-    }
-
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    for event in normalize_payload(&payload) {
-        let Ok(json) = serde_json::to_string(&event) else {
-            return;
-        };
-        if writeln!(stdout, "{json}").is_err() {
-            return;
-        }
-    }
+    gw_provider_sdk::run(manifest(), "session_id", map_kind);
 }
 
 // PermissionRequest is the approval signal; Notification(permission_prompt)
@@ -114,119 +72,69 @@ fn hook_patch(event: &str, matcher: Option<&str>) -> Patch {
     }
 }
 
-fn normalize_payload(raw: &[u8]) -> Vec<Event> {
-    let Ok(payload) = serde_json::from_slice::<Value>(raw) else {
-        return Vec::new();
-    };
-    let Some(payload) = payload.as_object() else {
-        return Vec::new();
-    };
-    let Some(session) = payload.get("session_id").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let Some(event_name) = payload.get("hook_event_name").and_then(Value::as_str) else {
-        return Vec::new();
-    };
+fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
+    let event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
 
-    let kind = match event_name {
-        "SessionStart" => EventKind::SessionStart {
+    match event_name {
+        "SessionStart" => Some(EventKind::SessionStart {
             model: text(payload, "model"),
-        },
-        "UserPromptSubmit" => EventKind::TurnStart {
+        }),
+        "UserPromptSubmit" => Some(EventKind::TurnStart {
             summary: excerpt(payload, "prompt"),
-        },
+        }),
         "PreToolUse" => match payload.get("tool_name").and_then(Value::as_str) {
-            Some("AskUserQuestion") => EventKind::Attention {
+            Some("AskUserQuestion") => Some(EventKind::Attention {
                 attention: AttentionKind::Question,
                 summary: first_question(payload).or_else(|| Some("question".into())),
-            },
-            Some("ExitPlanMode") => EventKind::Attention {
+            }),
+            Some("ExitPlanMode") => Some(EventKind::Attention {
                 attention: AttentionKind::Question,
                 summary: Some("plan ready for review".into()),
-            },
+            }),
             // Only reachable if the installed matcher was widened by hand.
-            Some(tool) => EventKind::Heartbeat {
+            Some(tool) => Some(EventKind::Heartbeat {
                 activity: Some(tool.into()),
-            },
-            None => return Vec::new(),
+            }),
+            None => None,
         },
-        "PermissionRequest" => EventKind::Attention {
+        "PermissionRequest" => Some(EventKind::Attention {
             attention: AttentionKind::Approval,
             summary: tool_summary(payload),
-        },
+        }),
         // Re-checked despite the installed matcher: a pre-matcher hook entry
         // delivers every type until `gw setup` is re-run.
         "Notification" => match payload.get("notification_type").and_then(Value::as_str) {
-            Some("elicitation_dialog") | Some("agent_needs_input") => EventKind::Attention {
+            Some("elicitation_dialog") | Some("agent_needs_input") => Some(EventKind::Attention {
                 attention: AttentionKind::Question,
                 summary: excerpt(payload, "message").or_else(|| text(payload, "notification_type")),
-            },
-            _ => return Vec::new(),
+            }),
+            _ => None,
         },
-        "PostToolUse" => EventKind::Heartbeat {
+        "PostToolUse" => Some(EventKind::Heartbeat {
             activity: text(payload, "tool_name"),
-        },
-        "PreCompact" | "PostCompact" => EventKind::Heartbeat {
+        }),
+        "PreCompact" | "PostCompact" => Some(EventKind::Heartbeat {
             activity: Some("compact".into()),
-        },
+        }),
         // Both fire with the parent's session_id; agent_id names the subagent.
         // The payload carries only agent_id/agent_type — no model or task.
-        "SubagentStart" => match text(payload, "agent_id") {
-            Some(agent) => EventKind::SubagentStart {
-                agent,
-                agent_type: text(payload, "agent_type"),
-                model: None,
-                summary: None,
-            },
-            None => return Vec::new(),
-        },
-        "SubagentStop" => match text(payload, "agent_id") {
-            Some(agent) => EventKind::SubagentEnd { agent },
-            None => return Vec::new(),
-        },
-        "Stop" => EventKind::TurnEnd {
+        "SubagentStart" => text(payload, "agent_id").map(|agent| EventKind::SubagentStart {
+            agent,
+            agent_type: text(payload, "agent_type"),
+            model: None,
+            summary: None,
+        }),
+        "SubagentStop" => text(payload, "agent_id").map(|agent| EventKind::SubagentEnd { agent }),
+        "Stop" => Some(EventKind::TurnEnd {
             summary: excerpt(payload, "last_assistant_message"),
-        },
-        "StopFailure" => EventKind::TurnError {
+        }),
+        "StopFailure" => Some(EventKind::TurnError {
             reason: text(payload, "error_type"),
             summary: excerpt(payload, "error_message"),
-        },
-        "SessionEnd" => EventKind::SessionEnd,
-        _ => return Vec::new(),
-    };
-
-    vec![Event {
-        v: PROTOCOL_VERSION,
-        ts: None,
-        session: session.into(),
-        kind,
-    }]
-}
-
-fn text(payload: &Map<String, Value>, field: &str) -> Option<String> {
-    payload
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn excerpt(payload: &Map<String, Value>, field: &str) -> Option<String> {
-    payload
-        .get(field)
-        .and_then(Value::as_str)
-        .and_then(one_liner)
-}
-
-/// Collapse whitespace and cap at ~120 chars for panel display.
-fn one_liner(value: &str) -> Option<String> {
-    let mut line = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.is_empty() {
-        return None;
+        }),
+        "SessionEnd" => Some(EventKind::SessionEnd),
+        _ => None,
     }
-    if line.chars().count() > 120 {
-        line = line.chars().take(119).collect::<String>() + "…";
-    }
-    Some(line)
 }
 
 /// "Bash: rm -rf build" — tool name plus its most telling argument.
@@ -259,6 +167,11 @@ fn first_question(payload: &Map<String, Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gw_plugin_protocol::Event;
+
+    fn normalize_payload(raw: &[u8]) -> Vec<Event> {
+        gw_provider_sdk::normalize("session_id", map_kind, raw)
+    }
 
     fn events(payload: &str) -> Vec<Event> {
         normalize_payload(payload.as_bytes())

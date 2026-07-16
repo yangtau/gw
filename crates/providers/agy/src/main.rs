@@ -1,54 +1,11 @@
-use std::io::{Read, Write};
-
 use gw_plugin_protocol::{
-    Command, Event, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode, ProcessMatch,
+    Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode, ProcessMatch,
     PROTOCOL_VERSION,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 fn main() {
-    let mut args = std::env::args_os().skip(1);
-    let command = args.next();
-
-    if args.next().is_some() {
-        usage();
-    }
-
-    match command.as_deref().and_then(|value| value.to_str()) {
-        Some("manifest") => print_manifest(),
-        Some("normalize") => print_events(),
-        _ => usage(),
-    }
-}
-
-fn usage() -> ! {
-    eprintln!("usage: gw-provider-agy <manifest|normalize>");
-    std::process::exit(2);
-}
-
-fn print_manifest() {
-    let Ok(json) = serde_json::to_string(&manifest()) else {
-        return;
-    };
-    let _ = writeln!(std::io::stdout().lock(), "{json}");
-}
-
-fn print_events() {
-    let mut payload = Vec::new();
-    if std::io::stdin().read_to_end(&mut payload).is_err() {
-        return;
-    }
-
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    for event in normalize_payload(&payload) {
-        let Ok(json) = serde_json::to_string(&event) else {
-            return;
-        };
-        if writeln!(stdout, "{json}").is_err() {
-            return;
-        }
-    }
+    gw_provider_sdk::run(manifest(), "conversationId", map_kind);
 }
 
 fn manifest() -> Manifest {
@@ -104,50 +61,38 @@ fn manifest() -> Manifest {
     }
 }
 
-fn normalize_payload(raw: &[u8]) -> Vec<Event> {
-    let Ok(payload) = serde_json::from_slice::<Value>(raw) else {
-        return Vec::new();
-    };
-    let Some(payload) = payload.as_object() else {
-        return Vec::new();
-    };
-    let Some(session) = payload.get("conversationId").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-
-    let kind = if payload
+fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
+    if payload
         .get("executionNum")
         .and_then(Value::as_u64)
         .is_some()
     {
         match payload.get("fullyIdle").and_then(Value::as_bool) {
-            Some(true) => EventKind::TurnEnd { summary: None },
-            Some(false) => EventKind::Heartbeat { activity: None },
-            None => return Vec::new(),
+            Some(true) => Some(EventKind::TurnEnd { summary: None }),
+            Some(false) => Some(EventKind::Heartbeat { activity: None }),
+            None => None,
         }
     } else if payload.get("stepIdx").and_then(Value::as_u64).is_some() {
-        EventKind::Heartbeat { activity: None }
+        Some(EventKind::Heartbeat { activity: None })
     } else if payload
         .get("invocationNum")
         .and_then(Value::as_u64)
         .is_some()
     {
-        EventKind::TurnStart { summary: None }
+        Some(EventKind::TurnStart { summary: None })
     } else {
-        return Vec::new();
-    };
-
-    vec![Event {
-        v: PROTOCOL_VERSION,
-        ts: None,
-        session: session.into(),
-        kind,
-    }]
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gw_plugin_protocol::Event;
+
+    fn normalize_payload(raw: &[u8]) -> Vec<Event> {
+        gw_provider_sdk::normalize("conversationId", map_kind, raw)
+    }
 
     fn event(payload: &str) -> Event {
         normalize_payload(payload.as_bytes()).pop().unwrap()

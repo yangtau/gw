@@ -791,6 +791,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gw-plugin-protocol",
+ "gw-provider-sdk",
  "serde_json",
 ]
 
@@ -800,6 +801,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gw-plugin-protocol",
+ "gw-provider-sdk",
  "serde_json",
 ]
 
@@ -808,6 +810,15 @@ name = "gw-provider-codex"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gw-plugin-protocol",
+ "gw-provider-sdk",
+ "serde_json",
+]
+
+[[package]]
+name = "gw-provider-sdk"
+version = "0.1.0"
+dependencies = [
  "gw-plugin-protocol",
  "serde_json",
 ]

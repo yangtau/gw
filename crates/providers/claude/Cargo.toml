@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 gw-plugin-protocol.workspace = true
+gw-provider-sdk.workspace = true
 serde_json.workspace = true

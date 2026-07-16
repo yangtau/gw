@@ -31,3 +31,4 @@ vt100 = "0.16.2"
 
 gw-core = { path = "crates/gw-core" }
 gw-plugin-protocol = { path = "crates/gw-plugin-protocol" }
+gw-provider-sdk = { path = "crates/providers/sdk" }

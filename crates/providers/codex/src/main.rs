@@ -1,54 +1,12 @@
-use std::io::{Read, Write};
-
 use gw_plugin_protocol::{
-    AttentionKind, Command, Event, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
+    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
     ProcessMatch, PROTOCOL_VERSION,
 };
+use gw_provider_sdk::{excerpt, one_liner, text};
 use serde_json::{json, Map, Value};
 
 fn main() {
-    let mut args = std::env::args_os().skip(1);
-    let command = args.next();
-
-    if args.next().is_some() {
-        usage();
-    }
-
-    match command.as_deref().and_then(|value| value.to_str()) {
-        Some("manifest") => print_manifest(),
-        Some("normalize") => print_events(),
-        _ => usage(),
-    }
-}
-
-fn usage() -> ! {
-    eprintln!("usage: gw-provider-codex <manifest|normalize>");
-    std::process::exit(2);
-}
-
-fn print_manifest() {
-    let Ok(json) = serde_json::to_string(&manifest()) else {
-        return;
-    };
-    let _ = writeln!(std::io::stdout().lock(), "{json}");
-}
-
-fn print_events() {
-    let mut payload = Vec::new();
-    if std::io::stdin().read_to_end(&mut payload).is_err() {
-        return;
-    }
-
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    for event in normalize_payload(&payload) {
-        let Ok(json) = serde_json::to_string(&event) else {
-            return;
-        };
-        if writeln!(stdout, "{json}").is_err() {
-            return;
-        }
-    }
+    gw_provider_sdk::run(manifest(), "session_id", map_kind);
 }
 
 // codex has no failure or question events; errors surface only as staleness.
@@ -114,68 +72,42 @@ fn hook_patch(event: &str) -> Patch {
     }
 }
 
-fn normalize_payload(raw: &[u8]) -> Vec<Event> {
-    let Ok(payload) = serde_json::from_slice::<Value>(raw) else {
-        return Vec::new();
-    };
-    let Some(payload) = payload.as_object() else {
-        return Vec::new();
-    };
-    let Some(session) = payload.get("session_id").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let Some(event_name) = payload.get("hook_event_name").and_then(Value::as_str) else {
-        return Vec::new();
-    };
+fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
+    let event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
 
-    let kind = match event_name {
-        "SessionStart" => EventKind::SessionStart {
+    match event_name {
+        "SessionStart" => Some(EventKind::SessionStart {
             model: text(payload, "model"),
-        },
-        "UserPromptSubmit" => EventKind::TurnStart {
+        }),
+        "UserPromptSubmit" => Some(EventKind::TurnStart {
             summary: excerpt(payload, "prompt"),
-        },
+        }),
         "PermissionRequest" => {
-            let Some(summary) = approval_summary(payload) else {
-                return Vec::new();
-            };
-            EventKind::Attention {
+            let summary = approval_summary(payload)?;
+            Some(EventKind::Attention {
                 attention: AttentionKind::Approval,
                 summary: Some(summary),
-            }
+            })
         }
-        "PostToolUse" => EventKind::Heartbeat {
+        "PostToolUse" => Some(EventKind::Heartbeat {
             activity: text(payload, "tool_name"),
-        },
-        "PreCompact" | "PostCompact" => EventKind::Heartbeat {
+        }),
+        "PreCompact" | "PostCompact" => Some(EventKind::Heartbeat {
             activity: Some("compact".into()),
-        },
+        }),
         // Both fire with the parent's session_id; codex carries no task text.
-        "SubagentStart" => match text(payload, "agent_id") {
-            Some(agent) => EventKind::SubagentStart {
-                agent,
-                agent_type: text(payload, "agent_type"),
-                model: text(payload, "model"),
-                summary: None,
-            },
-            None => return Vec::new(),
-        },
-        "SubagentStop" => match text(payload, "agent_id") {
-            Some(agent) => EventKind::SubagentEnd { agent },
-            None => return Vec::new(),
-        },
-        "Stop" => EventKind::TurnEnd {
+        "SubagentStart" => text(payload, "agent_id").map(|agent| EventKind::SubagentStart {
+            agent,
+            agent_type: text(payload, "agent_type"),
+            model: text(payload, "model"),
+            summary: None,
+        }),
+        "SubagentStop" => text(payload, "agent_id").map(|agent| EventKind::SubagentEnd { agent }),
+        "Stop" => Some(EventKind::TurnEnd {
             summary: excerpt(payload, "last_assistant_message"),
-        },
-        _ => return Vec::new(),
-    };
-
-    vec![Event {
-        v: PROTOCOL_VERSION,
-        ts: None,
-        session: session.into(),
-        kind,
-    }]
+        }),
+        _ => None,
+    }
 }
 
 fn approval_summary(payload: &Map<String, Value>) -> Option<String> {
@@ -197,35 +129,14 @@ fn approval_summary(payload: &Map<String, Value>) -> Option<String> {
     one_liner(&raw)
 }
 
-fn text(payload: &Map<String, Value>, field: &str) -> Option<String> {
-    payload
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn excerpt(payload: &Map<String, Value>, field: &str) -> Option<String> {
-    payload
-        .get(field)
-        .and_then(Value::as_str)
-        .and_then(one_liner)
-}
-
-/// Collapse whitespace and cap at ~120 chars for panel display.
-fn one_liner(value: &str) -> Option<String> {
-    let mut line = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.is_empty() {
-        return None;
-    }
-    if line.chars().count() > 120 {
-        line = line.chars().take(119).collect::<String>() + "…";
-    }
-    Some(line)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gw_plugin_protocol::Event;
+
+    fn normalize_payload(raw: &[u8]) -> Vec<Event> {
+        gw_provider_sdk::normalize("session_id", map_kind, raw)
+    }
 
     fn event(payload: &str) -> Event {
         normalize_payload(payload.as_bytes()).pop().unwrap()
