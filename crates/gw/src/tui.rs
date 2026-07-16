@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
@@ -68,11 +68,20 @@ enum Flow {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 enum PreviewVisibility {
     Always,
     Polled {
         session_id: String,
         window_id: String,
+        pane_id: String,
         visible: bool,
     },
 }
@@ -83,6 +92,7 @@ impl PreviewVisibility {
             (false, Some(identity)) => Self::Polled {
                 session_id: identity.session_id,
                 window_id: identity.window_id,
+                pane_id: identity.pane_id,
                 visible: false,
             },
             _ => Self::Always,
@@ -105,6 +115,20 @@ impl PreviewVisibility {
                 ..
             } => Some((session_id, window_id)),
         }
+    }
+
+    fn panel_location(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Always => None,
+            Self::Polled {
+                window_id, pane_id, ..
+            } => Some((window_id, pane_id)),
+        }
+    }
+
+    fn is_colocated(&self, window_id: &str) -> bool {
+        self.panel_location()
+            .is_some_and(|(panel_window_id, _)| panel_window_id == window_id)
     }
 
     fn should_poll(&self, has_selection: bool) -> bool {
@@ -132,6 +156,8 @@ struct App {
     selected: usize,
     picker: Option<usize>,
     snapshot_preview: String,
+    preview_direction: Option<Direction>,
+    epoch: Instant,
     live_preview: Preview,
     preview_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     preview_visibility: PreviewVisibility,
@@ -173,6 +199,8 @@ impl App {
             selected: 0,
             picker: None,
             snapshot_preview: String::new(),
+            preview_direction: None,
+            epoch: Instant::now(),
             live_preview: Preview::new(preview_tx, preview_visible),
             preview_rx,
             preview_visibility,
@@ -195,11 +223,14 @@ impl App {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut visibility_tick = tokio::time::interval(std::time::Duration::from_millis(500));
         visibility_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut pulse_tick = tokio::time::interval(PULSE_TICK);
+        pulse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             terminal.draw(|f| self.render(f))?;
             let last_draw = Instant::now();
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
+                _ = pulse_tick.tick(), if self.preview_direction.is_some() => {}
                 _ = visibility_tick.tick(), if self.preview_visibility.should_poll(self.live_preview.has_selection()) => {
                     self.poll_preview_visibility();
                 }
@@ -346,6 +377,33 @@ impl App {
             .map(|agent| (agent.pane.id.clone(), agent.pane.window_id.clone()));
         match selected {
             Some((pane_id, window_id)) => {
+                let panel = self
+                    .preview_visibility
+                    .panel_location()
+                    .map(|(window_id, pane_id)| (window_id.to_owned(), pane_id.to_owned()));
+                if let Some((_, panel_pane_id)) =
+                    panel.filter(|(panel_window_id, _)| panel_window_id == &window_id)
+                {
+                    self.live_preview.deselect();
+                    self.snapshot_preview.clear();
+                    self.preview_direction = match (|| -> Result<Direction> {
+                        let panel = tmux::pane_geometry(&panel_pane_id)
+                            .context("query panel pane geometry")?;
+                        let agent =
+                            tmux::pane_geometry(&pane_id).context("query agent pane geometry")?;
+                        Ok(pane_direction(panel, agent))
+                    })() {
+                        Ok(direction) => Some(direction),
+                        Err(error) => {
+                            gw_core::tui_log::error(&format!(
+                                "preview direction query failed: {error:#}"
+                            ));
+                            None
+                        }
+                    };
+                    return;
+                }
+                self.preview_direction = None;
                 if !self.live_preview.select(&window_id, &pane_id) {
                     self.snapshot_preview =
                         tmux::capture(&pane_id, PREVIEW_LINES).unwrap_or_default();
@@ -354,6 +412,7 @@ impl App {
             None => {
                 self.live_preview.deselect();
                 self.snapshot_preview.clear();
+                self.preview_direction = None;
             }
         }
     }
@@ -388,7 +447,10 @@ impl App {
         if !self.preview_visibility.set_visible(visible) {
             return;
         }
-        if !self.live_preview.set_visible(visible) {
+        let colocated = self
+            .selected_agent()
+            .is_some_and(|agent| self.preview_visibility.is_colocated(&agent.pane.window_id));
+        if !self.live_preview.set_visible(visible) && !colocated {
             self.capture_preview();
         }
     }
@@ -651,6 +713,35 @@ impl App {
             .title(format!(" {window_index}:{window_name} "));
         let terminal = block.inner(viewport);
         frame.render_widget(block, viewport);
+
+        if self.preview_visibility.is_colocated(&window_id) {
+            if let Some(direction) = self.preview_direction {
+                let accent = self
+                    .selected_agent()
+                    .and_then(|agent| self.plugin(&agent.provider))
+                    .and_then(|plugin| plugin.manifest.color.as_deref())
+                    .and_then(hex_color)
+                    .and_then(rgb_of)
+                    .unwrap_or(NEUTRAL_ACCENT);
+                let phase = (self.epoch.elapsed().as_millis() / PULSE_TICK.as_millis()) as u64;
+                let lines = chevron_rail(direction, accent, phase, terminal);
+                let width = lines.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
+                let height = lines.len() as u16;
+                let area = center(terminal, width, height);
+                frame.render_widget(
+                    Paragraph::new(lines).alignment(Alignment::Center),
+                    area,
+                );
+                if let Some((bar_area, bar_lines)) = edge_bar(direction, viewport) {
+                    frame.render_widget(
+                        Paragraph::new(bar_lines)
+                            .style(Style::new().fg(Color::Rgb(accent.0, accent.1, accent.2))),
+                        bar_area,
+                    );
+                }
+            }
+            return;
+        }
 
         if self.live_preview.sync_health() {
             self.capture_preview();
@@ -1014,21 +1105,175 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
     mid
 }
 
+fn pane_direction(panel: tmux::PaneGeometry, agent: tmux::PaneGeometry) -> Direction {
+    let center = |pane: tmux::PaneGeometry| {
+        (
+            pane.left as i64 * 2 + pane.cols as i64,
+            pane.top as i64 * 2 + pane.rows as i64,
+        )
+    };
+    let (panel_x, panel_y) = center(panel);
+    let (agent_x, agent_y) = center(agent);
+    let dx = agent_x - panel_x;
+    let dy = agent_y - panel_y;
+    if dx.abs() >= dy.abs() * 2 {
+        if dx < 0 {
+            Direction::Left
+        } else {
+            Direction::Right
+        }
+    } else if dy < 0 {
+        Direction::Up
+    } else {
+        Direction::Down
+    }
+}
+
+const PULSE_TICK: StdDuration = StdDuration::from_millis(90);
+const PULSE_TAIL: u64 = 3;
+const RAIL_MAX: usize = 5;
+const RAIL_BASE: (u8, u8, u8) = (92, 92, 92);
+const NEUTRAL_ACCENT: (u8, u8, u8) = (200, 200, 200);
+const EDGE_BAR_SIDE: u16 = 3;
+const EDGE_BAR_FLAT: u16 = 6;
+
+fn rgb_of(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+fn lerp_rgb(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+fn rail_len(direction: Direction, area: Rect) -> usize {
+    let available = match direction {
+        Direction::Left | Direction::Right => area.width / 2,
+        Direction::Up | Direction::Down => area.height,
+    };
+    (available as usize).clamp(1, RAIL_MAX)
+}
+
+/// Comet brightness for the chevron `tip_distance` steps from the rail's tail.
+/// The head sweeps tail -> tip, so the pulse always travels toward the agent.
+fn pulse_intensity(tip_distance: usize, phase: u64, len: usize) -> f32 {
+    let period = len as u64 + PULSE_TAIL;
+    let head = (phase % period) as i64;
+    let behind = head - tip_distance as i64;
+    if (0..=PULSE_TAIL as i64).contains(&behind) {
+        1.0 - behind as f32 / (PULSE_TAIL as f32 + 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn pulse_style(accent: (u8, u8, u8), intensity: f32) -> Style {
+    let style = Style::new().fg(lerp_rgb(RAIL_BASE, accent, intensity));
+    if intensity >= 0.99 {
+        style.bold()
+    } else {
+        style
+    }
+}
+
+fn chevron_rail(
+    direction: Direction,
+    accent: (u8, u8, u8),
+    phase: u64,
+    area: Rect,
+) -> Vec<Line<'static>> {
+    let len = rail_len(direction, area);
+    let chevron = |slot: usize| {
+        let tip_distance = match direction {
+            Direction::Right | Direction::Down => slot,
+            Direction::Left | Direction::Up => len - 1 - slot,
+        };
+        pulse_style(accent, pulse_intensity(tip_distance, phase, len))
+    };
+    match direction {
+        Direction::Left | Direction::Right => {
+            let glyph = if direction == Direction::Left {
+                "❮"
+            } else {
+                "❯"
+            };
+            let mut spans = Vec::new();
+            for slot in 0..len {
+                if slot > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(glyph, chevron(slot)));
+            }
+            vec![Line::from(spans)]
+        }
+        Direction::Up | Direction::Down => {
+            let glyph = if direction == Direction::Up { "▲" } else { "▼" };
+            (0..len)
+                .map(|slot| Line::from(Span::styled(glyph, chevron(slot))))
+                .collect()
+        }
+    }
+}
+
+/// Steady accent bar on the card border edge facing the agent pane.
+fn edge_bar(direction: Direction, viewport: Rect) -> Option<(Rect, Vec<Line<'static>>)> {
+    if viewport.width < 2 || viewport.height < 2 {
+        return None;
+    }
+    let (area, glyph) = match direction {
+        Direction::Left | Direction::Right => {
+            let height = EDGE_BAR_SIDE.min(viewport.height);
+            let y = viewport.y + (viewport.height - height) / 2;
+            let x = if direction == Direction::Left {
+                viewport.x
+            } else {
+                viewport.right() - 1
+            };
+            let glyph = if direction == Direction::Left {
+                "▌"
+            } else {
+                "▐"
+            };
+            (Rect::new(x, y, 1, height), glyph)
+        }
+        Direction::Up | Direction::Down => {
+            let width = EDGE_BAR_FLAT.min(viewport.width);
+            let x = viewport.x + (viewport.width - width) / 2;
+            let (y, glyph) = if direction == Direction::Up {
+                (viewport.y, "▄")
+            } else {
+                (viewport.bottom() - 1, "▀")
+            };
+            (Rect::new(x, y, width, 1), glyph)
+        }
+    };
+    let lines = (0..area.height)
+        .map(|_| Line::from(glyph.repeat(area.width as usize)))
+        .collect();
+    Some((area, lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     #[test]
     fn gates_dashboard_preview_by_visibility() {
         let identity = || tmux::PanelIdentity {
             session_id: "$1".into(),
             window_id: "@7".into(),
+            pane_id: "%1".into(),
         };
         let mut popup = PreviewVisibility::new(true, Some(identity()));
         assert!(popup.is_visible());
         assert!(!popup.should_poll(true));
         assert!(!popup.set_visible(false));
         assert!(popup.is_visible());
+        assert!(!popup.is_colocated("@7"));
 
         let no_pane = PreviewVisibility::new(false, None);
         assert!(no_pane.is_visible());
@@ -1039,11 +1284,81 @@ mod tests {
         assert!(!dashboard.should_poll(false));
         assert!(dashboard.should_poll(true));
         assert_eq!(dashboard.identity(), Some(("$1", "@7")));
+        assert!(dashboard.is_colocated("@7"));
+        assert!(!dashboard.is_colocated("@8"));
         assert!(dashboard.set_visible(true));
         assert!(dashboard.is_visible());
         assert!(!dashboard.set_visible(true));
         assert!(dashboard.set_visible(false));
         assert!(!dashboard.is_visible());
+    }
+
+    #[test]
+    fn points_from_panel_center_toward_agent_center() {
+        let geometry = |left, top| tmux::PaneGeometry {
+            left,
+            top,
+            cols: 10,
+            rows: 10,
+        };
+        let panel = geometry(20, 20);
+
+        assert_eq!(pane_direction(panel, geometry(40, 20)), Direction::Right);
+        assert_eq!(pane_direction(panel, geometry(0, 20)), Direction::Left);
+        assert_eq!(pane_direction(panel, geometry(20, 0)), Direction::Up);
+        assert_eq!(pane_direction(panel, geometry(20, 40)), Direction::Down);
+        assert_eq!(pane_direction(panel, geometry(24, 22)), Direction::Right);
+        assert_eq!(pane_direction(panel, panel), Direction::Right);
+    }
+
+    #[test]
+    fn pulse_comet_travels_toward_the_tip_and_fades_behind() {
+        assert_eq!(pulse_intensity(0, 0, 5), 1.0);
+        assert_eq!(pulse_intensity(4, 4, 5), 1.0);
+        assert_eq!(pulse_intensity(2, 4, 5), 0.5);
+        assert_eq!(pulse_intensity(0, 4, 5), 0.0);
+        assert_eq!(pulse_intensity(4, 0, 5), 0.0);
+        assert_eq!(pulse_intensity(0, 8, 5), 1.0);
+    }
+
+    #[test]
+    fn chevron_rail_points_at_the_agent() {
+        let area = Rect::new(0, 0, 40, 12);
+        let phase = 4; // head sits on the tip
+
+        let left = chevron_rail(Direction::Left, NEUTRAL_ACCENT, phase, area);
+        assert_eq!(left.len(), 1);
+        let glyphs: Vec<_> = left[0]
+            .spans
+            .iter()
+            .filter(|span| span.content != " ")
+            .map(|span| span.content.clone())
+            .collect();
+        assert_eq!(glyphs, vec!["❮"; 5]);
+        assert!(left[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let down = chevron_rail(Direction::Down, NEUTRAL_ACCENT, phase, area);
+        assert_eq!(down.len(), 5);
+        assert!(down.iter().all(|line| line.spans[0].content == "▼"));
+        assert!(down[4].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!down[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let narrow = chevron_rail(Direction::Right, NEUTRAL_ACCENT, 0, Rect::new(0, 0, 4, 12));
+        assert_eq!(narrow[0].spans.len(), 3); // 2 chevrons + separator
+    }
+
+    #[test]
+    fn edge_bar_hugs_the_facing_border() {
+        let viewport = Rect::new(10, 5, 30, 10);
+        let (left, _) = edge_bar(Direction::Left, viewport).unwrap();
+        assert_eq!((left.x, left.width, left.height), (10, 1, EDGE_BAR_SIDE));
+        let (right, _) = edge_bar(Direction::Right, viewport).unwrap();
+        assert_eq!(right.x, viewport.right() - 1);
+        let (up, _) = edge_bar(Direction::Up, viewport).unwrap();
+        assert_eq!((up.y, up.height, up.width), (5, 1, EDGE_BAR_FLAT));
+        let (down, _) = edge_bar(Direction::Down, viewport).unwrap();
+        assert_eq!(down.y, viewport.bottom() - 1);
+        assert!(edge_bar(Direction::Left, Rect::new(0, 0, 1, 1)).is_none());
     }
 
     fn cell(detail: &str, cwd: &str, branch: &str, window: &str, time: &str) -> AgentCells {

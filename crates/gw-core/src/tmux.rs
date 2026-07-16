@@ -29,6 +29,15 @@ pub struct PreviewWindowState {
 pub struct PanelIdentity {
     pub session_id: String,
     pub window_id: String,
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneGeometry {
+    pub left: u32,
+    pub top: u32,
+    pub cols: u32,
+    pub rows: u32,
 }
 
 /// Panes of the current session (`list-panes -s`).
@@ -225,6 +234,21 @@ fn session_current_window_command(session_id: &str) -> Vec<OsString> {
     ]
 }
 
+pub fn pane_geometry(pane_id: &str) -> Result<PaneGeometry> {
+    let args = pane_geometry_command(pane_id);
+    parse_pane_geometry(&run_tmux(&args)?)
+}
+
+fn pane_geometry_command(pane_id: &str) -> Vec<OsString> {
+    vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        pane_id.into(),
+        "#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}".into(),
+    ]
+}
+
 fn preview_window_state_command(window_id: &str) -> Vec<OsString> {
     vec![
         "display-message".into(),
@@ -368,10 +392,28 @@ fn parse_panel_identity(stdout: &str, pane_id: &str) -> Result<PanelIdentity> {
             return Ok(PanelIdentity {
                 session_id: session_id.to_owned(),
                 window_id: window_id.to_owned(),
+                pane_id: row_pane_id.to_owned(),
             });
         }
     }
     bail!("panel pane {pane_id} was not found outside preview sessions")
+}
+
+fn parse_pane_geometry(stdout: &str) -> Result<PaneGeometry> {
+    let mut fields = stdout.trim().splitn(4, '\t');
+    let mut next = |name| -> Result<u32> {
+        fields
+            .next()
+            .with_context(|| format!("missing pane {name}"))?
+            .parse()
+            .with_context(|| format!("invalid pane {name}"))
+    };
+    Ok(PaneGeometry {
+        left: next("left")?,
+        top: next("top")?,
+        cols: next("width")?,
+        rows: next("height")?,
+    })
 }
 
 fn parse_flag(stdout: &str, name: &str) -> Result<bool> {
@@ -560,8 +602,38 @@ mod tests {
             PanelIdentity {
                 session_id: "$1".into(),
                 window_id: "@7".into(),
+                pane_id: "%3".into(),
             }
         );
         assert!(parse_panel_identity("gw-preview-42\t$2\t@8\t%3\n", "%3").is_err());
+    }
+
+    #[test]
+    fn constructs_and_parses_pane_geometry() {
+        let command = pane_geometry_command("%3")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            command,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "%3",
+                "#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}",
+            ]
+        );
+        assert_eq!(
+            parse_pane_geometry("12\t4\t80\t24\n").unwrap(),
+            PaneGeometry {
+                left: 12,
+                top: 4,
+                cols: 80,
+                rows: 24,
+            }
+        );
+        assert!(parse_pane_geometry("12\t4\t80\n").is_err());
     }
 }
