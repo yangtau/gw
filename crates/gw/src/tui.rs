@@ -22,12 +22,14 @@ use gw_core::protocol::AttentionKind;
 use gw_core::store::Store;
 use gw_core::tmux;
 use notify::Watcher;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Paragraph, TitlePosition,
+};
 use ratatui::Frame;
-use tui_term::widget::PseudoTerminal;
+use tui_term::widget::{Cursor, PseudoTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::preview::Preview;
@@ -510,7 +512,6 @@ impl App {
             self.live_preview.deselect();
             return;
         }
-        let width = area.width as usize;
         let selected = self.selected_agent().map(|agent| {
             (
                 agent.pane.id.clone(),
@@ -523,19 +524,23 @@ impl App {
             self.live_preview.deselect();
             return;
         };
-        let head = format!("─── {window_index}:{window_name} ");
-        let rule = format!("{head}{}", "─".repeat(width.saturating_sub(head.width())));
-        let header = Rect::new(area.x, area.y, area.width, 1);
-        let terminal = Rect::new(
-            area.x,
-            area.y.saturating_add(1),
-            area.width,
-            area.height.saturating_sub(1),
+        let viewport = Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(2),
+            area.height,
         );
-        frame.render_widget(
-            Paragraph::new(Line::styled(rule, Style::new().dim())),
-            header,
-        );
+        let frame_style = Style::new().fg(Color::DarkGray).dim();
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(frame_style)
+            .title_style(frame_style)
+            .title_alignment(Alignment::Left)
+            .title_position(TitlePosition::Top)
+            .title(format!(" {window_index}:{window_name} "));
+        let terminal = block.inner(viewport);
+        frame.render_widget(block, viewport);
 
         if self.live_preview.sync_health() {
             self.capture_preview();
@@ -548,7 +553,10 @@ impl App {
         }
         if let Some(parser) = self.live_preview.parser() {
             let parser = parser.lock().unwrap_or_else(|error| error.into_inner());
-            frame.render_widget(PseudoTerminal::new(parser.screen()), terminal);
+            frame.render_widget(
+                PseudoTerminal::new(parser.screen()).cursor(Cursor::default().visibility(false)),
+                terminal,
+            );
             return;
         }
 
