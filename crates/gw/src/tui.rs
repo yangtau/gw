@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
@@ -65,6 +65,7 @@ enum View {
 
 enum Flow {
     Continue,
+    Refreshed,
     Quit,
 }
 
@@ -78,74 +79,151 @@ enum Direction {
 
 enum PreviewVisibility {
     Always,
-    Polled {
-        session_id: String,
-        window_id: String,
-        pane_id: String,
-        visible: bool,
-    },
+    Polled { pane_id: String },
 }
 
 impl PreviewVisibility {
     fn new(popup: bool, identity: Option<tmux::PanelIdentity>) -> Self {
         match (popup, identity) {
             (false, Some(identity)) => Self::Polled {
-                session_id: identity.session_id,
-                window_id: identity.window_id,
                 pane_id: identity.pane_id,
-                visible: false,
             },
             _ => Self::Always,
         }
     }
 
-    fn is_visible(&self) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Polled { visible, .. } => *visible,
-        }
-    }
-
-    fn identity(&self) -> Option<(&str, &str)> {
+    fn pane_id(&self) -> Option<&str> {
         match self {
             Self::Always => None,
-            Self::Polled {
-                session_id,
-                window_id,
-                ..
-            } => Some((session_id, window_id)),
+            Self::Polled { pane_id } => Some(pane_id),
         }
     }
 
-    fn panel_location(&self) -> Option<(&str, &str)> {
-        match self {
-            Self::Always => None,
-            Self::Polled {
-                window_id, pane_id, ..
-            } => Some((window_id, pane_id)),
+    fn is_always(&self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PanelTopology {
+    session_id: String,
+    window_id: String,
+    visible: bool,
+    geometry: tmux::PaneGeometry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentTopology {
+    pane_id: String,
+    window_id: String,
+    window_panes: u32,
+    window_index: u32,
+    window_name: String,
+    geometry: tmux::PaneGeometry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreviewTopology {
+    panel: Option<PanelTopology>,
+    agent: Option<AgentTopology>,
+    visible: bool,
+    colocated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TopologyAction {
+    Clear,
+    Placard(Direction),
+    Live {
+        agent: AgentTopology,
+        visible: bool,
+        reacquire: bool,
+    },
+}
+
+fn panel_topology(
+    visibility: &PreviewVisibility,
+    rows: &[tmux::TopologyRow],
+) -> Option<PanelTopology> {
+    let pane_id = visibility.pane_id()?;
+    let row = rows
+        .iter()
+        .filter(|row| row.pane_id == pane_id)
+        .max_by_key(|row| (row.session_attached, row.window_active))?;
+    Some(PanelTopology {
+        session_id: row.session_id.clone(),
+        window_id: row.window_id.clone(),
+        visible: row.window_active && row.session_attached,
+        geometry: row.geometry,
+    })
+}
+
+fn reduce_topology(
+    visibility: &PreviewVisibility,
+    selected_pane_id: Option<&str>,
+    rows: &[tmux::TopologyRow],
+    previous: Option<&PreviewTopology>,
+) -> (PreviewTopology, TopologyAction) {
+    let panel = panel_topology(visibility, rows);
+    let preferred_session = panel.as_ref().map(|panel| panel.session_id.as_str());
+    let agent = selected_pane_id.and_then(|pane_id| {
+        let mut candidates = rows.iter().filter(|row| row.pane_id == pane_id);
+        let first = candidates.next()?;
+        let row = preferred_session
+            .and_then(|session_id| {
+                std::iter::once(first)
+                    .chain(candidates)
+                    .find(|row| row.session_id == session_id)
+            })
+            .unwrap_or(first);
+        Some(AgentTopology {
+            pane_id: row.pane_id.clone(),
+            window_id: row.window_id.clone(),
+            window_panes: row.window_panes,
+            window_index: row.window_index,
+            window_name: row.window_name.clone(),
+            geometry: row.geometry,
+        })
+    });
+    let visible = if visibility.is_always() {
+        true
+    } else {
+        panel.as_ref().is_some_and(|panel| panel.visible)
+    };
+    let colocated = !visibility.is_always()
+        && panel
+            .as_ref()
+            .zip(agent.as_ref())
+            .is_some_and(|(panel, agent)| panel.window_id == agent.window_id);
+    let topology = PreviewTopology {
+        panel,
+        agent,
+        visible,
+        colocated,
+    };
+    let action = match topology.agent.as_ref() {
+        None => TopologyAction::Clear,
+        Some(agent) if topology.colocated => {
+            let panel = topology.panel.as_ref().expect("colocated panel exists");
+            TopologyAction::Placard(pane_direction(panel.geometry, agent.geometry))
         }
-    }
-
-    fn is_colocated(&self, window_id: &str) -> bool {
-        self.panel_location()
-            .is_some_and(|(panel_window_id, _)| panel_window_id == window_id)
-    }
-
-    fn should_poll(&self, has_selection: bool) -> bool {
-        matches!(self, Self::Polled { .. }) && has_selection
-    }
-
-    fn set_visible(&mut self, visible: bool) -> bool {
-        let Self::Polled {
-            visible: current, ..
-        } = self
-        else {
-            return false;
-        };
-        let changed = *current != visible;
-        *current = visible;
-        changed
-    }
+        Some(agent) => {
+            let reacquire = previous.is_none_or(|previous| {
+                previous.colocated
+                    || previous.agent.as_ref().is_none_or(|old| {
+                        old.pane_id != agent.pane_id
+                            || old.window_id != agent.window_id
+                            || old.window_panes != agent.window_panes
+                    })
+            });
+            TopologyAction::Live {
+                agent: agent.clone(),
+                visible,
+                reacquire,
+            }
+        }
+    };
+    (topology, action)
 }
 
 struct App {
@@ -161,6 +239,8 @@ struct App {
     live_preview: Preview,
     preview_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     preview_visibility: PreviewVisibility,
+    preview_topology: Option<PreviewTopology>,
+    fallback_session_id: Option<String>,
     exit_after_jump: bool,
 }
 
@@ -173,20 +253,17 @@ impl App {
         let panel_identity = if exit_after_jump {
             None
         } else {
-            std::env::var("TMUX_PANE").ok().and_then(|pane_id| {
-                match tmux::panel_identity(&pane_id) {
-                    Ok(identity) => Some(identity),
-                    Err(error) => {
-                        gw_core::tui_log::error(&format!(
-                            "live preview panel identity resolution failed: {error:#}"
-                        ));
-                        None
-                    }
-                }
-            })
+            std::env::var("TMUX_PANE")
+                .ok()
+                .map(|pane_id| tmux::PanelIdentity { pane_id })
         };
         let preview_visibility = PreviewVisibility::new(exit_after_jump, panel_identity);
-        let preview_visible = preview_visibility.is_visible();
+        let preview_visible = preview_visibility.is_always();
+        let fallback_session_id = if preview_visibility.is_always() {
+            Some(tmux::current_session_id()?)
+        } else {
+            None
+        };
         let mut app = Self {
             store,
             plugins: plugins::discover()?,
@@ -204,6 +281,8 @@ impl App {
             live_preview: Preview::new(preview_tx, preview_visible),
             preview_rx,
             preview_visibility,
+            preview_topology: None,
+            fallback_session_id,
             exit_after_jump,
         };
         app.refresh();
@@ -221,8 +300,8 @@ impl App {
 
         let mut input = EventStream::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-        let mut visibility_tick = tokio::time::interval(std::time::Duration::from_millis(500));
-        visibility_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut topology_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        topology_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pulse_tick = tokio::time::interval(PULSE_TICK);
         pulse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -231,8 +310,8 @@ impl App {
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
                 _ = pulse_tick.tick(), if self.preview_direction.is_some() => {}
-                _ = visibility_tick.tick(), if self.preview_visibility.should_poll(self.live_preview.has_selection()) => {
-                    self.poll_preview_visibility();
+                _ = topology_tick.tick(), if self.selected_agent().is_some() => {
+                    self.topology_tick();
                 }
                 Some(_) = fs_rx.recv() => {
                     while fs_rx.try_recv().is_ok() {}
@@ -254,9 +333,10 @@ impl App {
                 }
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
-                        self.set_preview_visible(true);
-                        if matches!(self.on_key(key)?, Flow::Quit) {
-                            return Ok(());
+                        match self.on_key(key)? {
+                            Flow::Quit => return Ok(()),
+                            Flow::Continue => self.topology_tick(),
+                            Flow::Refreshed => {}
                         }
                     }
                 }
@@ -265,18 +345,33 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        let topology = match tmux::observe_topology() {
+            Ok(topology) => topology,
+            Err(error) => {
+                gw_core::tui_log::error(&format!("topology snapshot failed: {error:#}"));
+                self.apply_topology(&[]);
+                return;
+            }
+        };
         let now = Utc::now();
-        match discover::snapshot(
-            &self.store,
-            &self.plugins,
-            now,
-            Duration::minutes(STALE_AFTER_MINUTES),
-        ) {
-            Ok(snapshot) => self.snapshot = snapshot,
-            Err(err) => gw_core::tui_log::error(&format!("snapshot failed: {err:#}")),
+        let session_id = panel_topology(&self.preview_visibility, &topology)
+            .map(|panel| panel.session_id)
+            .or_else(|| self.fallback_session_id.clone());
+        if let Some(session_id) = session_id {
+            match discover::snapshot(
+                &self.store,
+                &self.plugins,
+                now,
+                Duration::minutes(STALE_AFTER_MINUTES),
+                &topology,
+                &session_id,
+            ) {
+                Ok(snapshot) => self.snapshot = snapshot,
+                Err(err) => gw_core::tui_log::error(&format!("snapshot failed: {err:#}")),
+            }
         }
         self.selected = self.selected.min(self.row_count().saturating_sub(1));
-        self.refresh_preview();
+        self.apply_topology(&topology);
     }
 
     fn row_count(&self) -> usize {
@@ -317,6 +412,7 @@ impl App {
                 };
                 self.selected = 0;
                 self.refresh();
+                return Ok(Flow::Refreshed);
             }
             KeyCode::Enter => return self.activate(),
             _ => {}
@@ -356,7 +452,6 @@ impl App {
         let count = self.row_count() as i64;
         if count > 0 {
             self.selected = (self.selected as i64 + delta).rem_euclid(count) as usize;
-            self.refresh_preview();
         }
     }
 
@@ -367,92 +462,64 @@ impl App {
             .find(|&i| matches!(agents[i].status, AgentStatus::Attention(_)));
         if let Some(i) = next {
             self.selected = i;
-            self.refresh_preview();
         }
     }
 
-    fn refresh_preview(&mut self) {
-        let selected = self
-            .selected_agent()
-            .map(|agent| (agent.pane.id.clone(), agent.pane.window_id.clone()));
-        match selected {
-            Some((pane_id, window_id)) => {
-                let panel = self
-                    .preview_visibility
-                    .panel_location()
-                    .map(|(window_id, pane_id)| (window_id.to_owned(), pane_id.to_owned()));
-                if let Some((_, panel_pane_id)) =
-                    panel.filter(|(panel_window_id, _)| panel_window_id == &window_id)
-                {
-                    self.live_preview.deselect();
-                    self.snapshot_preview.clear();
-                    self.preview_direction = match (|| -> Result<Direction> {
-                        let panel = tmux::pane_geometry(&panel_pane_id)
-                            .context("query panel pane geometry")?;
-                        let agent =
-                            tmux::pane_geometry(&pane_id).context("query agent pane geometry")?;
-                        Ok(pane_direction(panel, agent))
-                    })() {
-                        Ok(direction) => Some(direction),
-                        Err(error) => {
-                            gw_core::tui_log::error(&format!(
-                                "preview direction query failed: {error:#}"
-                            ));
-                            None
-                        }
-                    };
-                    return;
-                }
-                self.preview_direction = None;
-                if !self.live_preview.select(&window_id, &pane_id) {
-                    self.snapshot_preview =
-                        tmux::capture(&pane_id, PREVIEW_LINES).unwrap_or_default();
-                }
+    fn topology_tick(&mut self) {
+        match tmux::observe_topology() {
+            Ok(topology) => self.apply_topology(&topology),
+            Err(error) => {
+                gw_core::tui_log::error(&format!("topology snapshot failed: {error:#}"));
+                self.apply_topology(&[]);
             }
-            None => {
+        }
+    }
+
+    fn apply_topology(&mut self, rows: &[tmux::TopologyRow]) {
+        let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
+        let (topology, action) = reduce_topology(
+            &self.preview_visibility,
+            selected_pane_id.as_deref(),
+            rows,
+            self.preview_topology.as_ref(),
+        );
+        self.preview_topology = Some(topology);
+        match action {
+            TopologyAction::Clear => {
                 self.live_preview.deselect();
                 self.snapshot_preview.clear();
                 self.preview_direction = None;
+            }
+            TopologyAction::Placard(direction) => {
+                self.live_preview.deselect();
+                self.snapshot_preview.clear();
+                self.preview_direction = Some(direction);
+            }
+            TopologyAction::Live {
+                agent,
+                visible,
+                reacquire,
+            } => {
+                self.preview_direction = None;
+                if reacquire {
+                    self.live_preview.deselect();
+                }
+                self.live_preview.set_visible(visible);
+                if !self.live_preview.select(&agent.window_id, &agent.pane_id) && visible {
+                    self.snapshot_preview =
+                        tmux::capture(&agent.pane_id, PREVIEW_LINES).unwrap_or_default();
+                }
             }
         }
     }
 
     fn capture_preview(&mut self) {
         self.snapshot_preview = self
-            .selected_agent()
-            .and_then(|agent| tmux::capture(&agent.pane.id, PREVIEW_LINES).ok())
+            .preview_topology
+            .as_ref()
+            .and_then(|topology| topology.agent.as_ref())
+            .and_then(|agent| tmux::capture(&agent.pane_id, PREVIEW_LINES).ok())
             .unwrap_or_default();
-    }
-
-    fn poll_preview_visibility(&mut self) {
-        let Some((session_id, window_id)) = self
-            .preview_visibility
-            .identity()
-            .map(|(session_id, window_id)| (session_id.to_owned(), window_id.to_owned()))
-        else {
-            return;
-        };
-        match tmux::session_current_window(&session_id) {
-            Ok(current_window) => self.set_preview_visible(current_window == window_id),
-            Err(error) => {
-                gw_core::tui_log::error(&format!(
-                    "live preview visibility query failed: {error:#}"
-                ));
-                self.set_preview_visible(false);
-            }
-        }
-    }
-
-    fn set_preview_visible(&mut self, visible: bool) {
-        if !self.preview_visibility.set_visible(visible) {
-            return;
-        }
-        let colocated = self
-            .selected_agent()
-            .is_some_and(|agent| self.preview_visibility.is_colocated(&agent.pane.window_id));
-        if !self.live_preview.set_visible(visible) && !colocated {
-            self.capture_preview();
-        }
     }
 
     fn activate(&mut self) -> Result<Flow> {
@@ -493,7 +560,7 @@ impl App {
             return Ok(Flow::Quit);
         }
         self.refresh();
-        Ok(Flow::Continue)
+        Ok(Flow::Refreshed)
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -684,16 +751,10 @@ impl App {
             self.live_preview.deselect();
             return;
         }
-        let selected = self.selected_agent().map(|agent| {
-            (
-                agent.pane.id.clone(),
-                agent.pane.window_id.clone(),
-                agent.pane.window_index,
-                agent.pane.window_name.clone(),
-            )
-        });
-        let Some((pane_id, window_id, window_index, window_name)) = selected else {
-            self.live_preview.deselect();
+        let Some(topology) = self.preview_topology.as_ref() else {
+            return;
+        };
+        let Some(agent) = topology.agent.clone() else {
             return;
         };
         let viewport = Rect::new(
@@ -710,11 +771,11 @@ impl App {
             .title_style(frame_style)
             .title_alignment(Alignment::Left)
             .title_position(TitlePosition::Top)
-            .title(format!(" {window_index}:{window_name} "));
+            .title(format!(" {}:{} ", agent.window_index, agent.window_name));
         let terminal = block.inner(viewport);
         frame.render_widget(block, viewport);
 
-        if self.preview_visibility.is_colocated(&window_id) {
+        if topology.colocated {
             if let Some(direction) = self.preview_direction {
                 let accent = self
                     .selected_agent()
@@ -728,10 +789,7 @@ impl App {
                 let width = lines.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
                 let height = lines.len() as u16;
                 let area = center(terminal, width, height);
-                frame.render_widget(
-                    Paragraph::new(lines).alignment(Alignment::Center),
-                    area,
-                );
+                frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
                 if let Some((bar_area, bar_lines)) = edge_bar(direction, viewport) {
                     frame.render_widget(
                         Paragraph::new(bar_lines)
@@ -747,9 +805,8 @@ impl App {
             self.capture_preview();
         }
         let was_live = self.live_preview.is_live();
-        let selected_live = self.live_preview.select(&window_id, &pane_id);
         let resized_live = self.live_preview.resize(terminal.width, terminal.height);
-        if was_live && !(selected_live && resized_live) {
+        if was_live && !resized_live {
             self.capture_preview();
         }
         if let Some(parser) = self.live_preview.parser() {
@@ -1210,7 +1267,11 @@ fn chevron_rail(
             vec![Line::from(spans)]
         }
         Direction::Up | Direction::Down => {
-            let glyph = if direction == Direction::Up { "▲" } else { "▼" };
+            let glyph = if direction == Direction::Up {
+                "▲"
+            } else {
+                "▼"
+            };
             (0..len)
                 .map(|slot| Line::from(Span::styled(glyph, chevron(slot))))
                 .collect()
@@ -1261,36 +1322,142 @@ mod tests {
     use super::*;
     use ratatui::style::Modifier;
 
+    fn topology_row(
+        session_id: &str,
+        window_id: &str,
+        window_active: bool,
+        pane_id: &str,
+        left: u32,
+        top: u32,
+        window_panes: u32,
+    ) -> tmux::TopologyRow {
+        tmux::TopologyRow {
+            session_name: session_id.trim_start_matches('$').into(),
+            session_id: session_id.into(),
+            window_id: window_id.into(),
+            window_active,
+            session_attached: true,
+            pane_id: pane_id.into(),
+            pane_pid: 100,
+            pane_tty: "ttys001".into(),
+            pane_current_path: "/work".into(),
+            window_index: 1,
+            window_name: "agent".into(),
+            geometry: tmux::PaneGeometry {
+                left,
+                top,
+                cols: 20,
+                rows: 10,
+            },
+            window_panes,
+        }
+    }
+
+    fn live_action(action: TopologyAction) -> (String, bool, bool) {
+        match action {
+            TopologyAction::Live {
+                agent,
+                visible,
+                reacquire,
+            } => (agent.window_id, visible, reacquire),
+            action => panic!("expected live action, got {action:?}"),
+        }
+    }
+
     #[test]
-    fn gates_dashboard_preview_by_visibility() {
-        let identity = || tmux::PanelIdentity {
-            session_id: "$1".into(),
-            window_id: "@7".into(),
-            pane_id: "%1".into(),
-        };
-        let mut popup = PreviewVisibility::new(true, Some(identity()));
-        assert!(popup.is_visible());
-        assert!(!popup.should_poll(true));
-        assert!(!popup.set_visible(false));
-        assert!(popup.is_visible());
-        assert!(!popup.is_colocated("@7"));
+    fn reduces_topology_changes_from_fresh_rows() {
+        let dashboard = PreviewVisibility::new(
+            false,
+            Some(tmux::PanelIdentity {
+                pane_id: "%panel".into(),
+            }),
+        );
+        let base = vec![
+            topology_row("$1", "@panel", true, "%panel", 0, 0, 1),
+            topology_row("$1", "@agent", false, "%agent", 40, 0, 1),
+        ];
+        let (initial, action) = reduce_topology(&dashboard, Some("%agent"), &base, None);
+        assert_eq!(live_action(action), ("@agent".into(), true, true));
 
-        let no_pane = PreviewVisibility::new(false, None);
-        assert!(no_pane.is_visible());
-        assert!(!no_pane.should_poll(true));
+        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &base, Some(&initial));
+        assert_eq!(live_action(action), ("@agent".into(), true, false));
 
-        let mut dashboard = PreviewVisibility::new(false, Some(identity()));
-        assert!(!dashboard.is_visible());
-        assert!(!dashboard.should_poll(false));
-        assert!(dashboard.should_poll(true));
-        assert_eq!(dashboard.identity(), Some(("$1", "@7")));
-        assert!(dashboard.is_colocated("@7"));
-        assert!(!dashboard.is_colocated("@8"));
-        assert!(dashboard.set_visible(true));
-        assert!(dashboard.is_visible());
-        assert!(!dashboard.set_visible(true));
-        assert!(dashboard.set_visible(false));
-        assert!(!dashboard.is_visible());
+        let hidden = vec![
+            topology_row("$1", "@panel", false, "%panel", 0, 0, 1),
+            base[1].clone(),
+        ];
+        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &hidden, Some(&initial));
+        assert_eq!(live_action(action), ("@agent".into(), false, false));
+
+        let mut detached_panel = topology_row("$1", "@panel", true, "%panel", 0, 0, 1);
+        detached_panel.session_attached = false;
+        let detached = vec![detached_panel, base[1].clone()];
+        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &detached, Some(&initial));
+        assert_eq!(live_action(action), ("@agent".into(), false, false));
+
+        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &base[1..], Some(&initial));
+        assert_eq!(live_action(action), ("@agent".into(), false, false));
+
+        let (gone, action) =
+            reduce_topology(&dashboard, Some("%agent"), &base[..1], Some(&initial));
+        assert_eq!(action, TopologyAction::Clear);
+        assert!(gone.agent.is_none());
+
+        let moved_agent = vec![
+            base[0].clone(),
+            topology_row("$1", "@other", false, "%agent", 40, 0, 1),
+        ];
+        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &moved_agent, Some(&initial));
+        assert_eq!(live_action(action), ("@other".into(), true, true));
+
+        let more_panes = vec![
+            base[0].clone(),
+            topology_row("$1", "@agent", false, "%agent", 40, 0, 2),
+        ];
+        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &more_panes, Some(&initial));
+        assert_eq!(live_action(action), ("@agent".into(), true, true));
+
+        let colocated = vec![
+            topology_row("$1", "@shared", true, "%panel", 0, 0, 2),
+            topology_row("$1", "@shared", true, "%agent", 40, 0, 2),
+        ];
+        let (placard, action) =
+            reduce_topology(&dashboard, Some("%agent"), &colocated, Some(&initial));
+        assert_eq!(action, TopologyAction::Placard(Direction::Right));
+
+        let shifted_placard = vec![
+            topology_row("$1", "@shared", true, "%panel", 0, 0, 2),
+            topology_row("$1", "@shared", true, "%agent", 0, 30, 2),
+        ];
+        let (_, action) =
+            reduce_topology(&dashboard, Some("%agent"), &shifted_placard, Some(&placard));
+        assert_eq!(action, TopologyAction::Placard(Direction::Down));
+
+        let moved_out = vec![
+            topology_row("$2", "@panel2", true, "%panel", 0, 0, 1),
+            topology_row("$2", "@agent2", false, "%agent", 0, 30, 1),
+        ];
+        let (moved, action) =
+            reduce_topology(&dashboard, Some("%agent"), &moved_out, Some(&placard));
+        assert_eq!(live_action(action), ("@agent2".into(), true, true));
+        assert_eq!(moved.panel.as_ref().unwrap().session_id, "$2");
+
+        let popup = PreviewVisibility::new(true, None);
+        let (_, action) = reduce_topology(&popup, Some("%agent"), &colocated, None);
+        assert_eq!(live_action(action), ("@shared".into(), true, true));
+
+        let mut old_panel = topology_row("$1", "@old", true, "%panel", 0, 0, 1);
+        old_panel.session_attached = false;
+        let grouped_panel = vec![
+            old_panel,
+            topology_row("$2", "@fresh", false, "%panel", 0, 0, 1),
+        ];
+        assert_eq!(
+            panel_topology(&dashboard, &grouped_panel)
+                .unwrap()
+                .session_id,
+            "$2"
+        );
     }
 
     #[test]

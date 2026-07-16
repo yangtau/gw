@@ -57,10 +57,14 @@ Environment facts (verified):
    original aggressive-resize approach.
 1b. **Visibility gating.** The preview's shared-state borrows (manual window size,
    zoom) are held only while the Panel is visible: always in popup mode; in
-   dashboard mode only while the Panel's own window is its session's current window
-   (polled, plus any received key event implies visible). On visibility loss the
-   selection is released but remembered; on regain it is re-acquired. The nested
-   client and grouped session stay alive throughout.
+   dashboard mode only while the Panel's pane sits in its session's active window
+   with a client attached. On visibility loss the selection is released but
+   remembered; on regain it is re-acquired. The nested client and grouped session
+   stay alive throughout. Since issue 09 all such judgments derive from one
+   `list-panes -a` topology snapshot per 500ms tick (panel row: `window_active`
+   && `session_attached`; the panel's only stable anchor is its pane id), reduced
+   by a single transition function; a key event triggers an immediate snapshot
+   instead of implying visibility.
 2. **Dependency path:** upgrade workspace to ratatui 0.30 + crossterm 0.29 as a
    separate prerequisite commit, then use tui-term 0.3.4 (vt100 feature) +
    portable-pty + vt100.

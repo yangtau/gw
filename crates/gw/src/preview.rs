@@ -152,10 +152,6 @@ impl Preview {
         self.is_live()
     }
 
-    pub fn has_selection(&self) -> bool {
-        self.wanted.is_some()
-    }
-
     pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
         self.sync_health();
         if cols == 0 || rows == 0 {
@@ -289,7 +285,7 @@ impl Preview {
         live.master
             .resize(parked_size())
             .context("park preview PTY before selection release")?;
-        release_selection(selected);
+        release_selection(selected).context("restore previewed window")?;
         self.selected = None;
         Ok(())
     }
@@ -348,7 +344,9 @@ impl Preview {
             }
         }
         if let Some(selected) = self.selected.take() {
-            release_selection(&selected);
+            if let Err(error) = release_selection(&selected) {
+                tui_log::error(&format!("live preview release failed: {error:#}"));
+            }
         }
         self.wanted = None;
         self.state = State::Dead;
@@ -385,7 +383,9 @@ impl Drop for Preview {
             }
         }
         if let Some(selected) = self.selected.take() {
-            release_selection(&selected);
+            if let Err(error) = release_selection(&selected) {
+                tui_log::error(&format!("live preview release failed: {error:#}"));
+            }
         }
     }
 }
@@ -438,27 +438,43 @@ fn acquire_selection(
     Ok(())
 }
 
-fn release_selection(selected: &Selection) {
+fn release_selection(selected: &Selection) -> Result<()> {
     if selected.zoomed_by_us {
         match tmux::preview_window_state(&selected.window_id) {
             Ok(window) if window.zoomed => {
                 if let Err(error) = tmux::toggle_pane_zoom(&selected.pane_id) {
-                    tui_log::error(&format!("live preview zoom restore failed: {error:#}"));
+                    if !is_missing_target(&error) {
+                        return Err(error).context("restore preview pane zoom");
+                    }
                 }
             }
             Ok(_) => {}
-            Err(error) => {
-                tui_log::error(&format!("live preview zoom state query failed: {error:#}"))
-            }
+            Err(error) if is_missing_target(&error) => {}
+            Err(error) => return Err(error).context("query preview zoom state during release"),
         }
     }
     if selected.size_pinned_by_us {
         if let Err(error) = tmux::release_window_size(&selected.window_id) {
-            tui_log::error(&format!(
-                "live preview window size release failed: {error:#}"
-            ));
+            if !is_missing_target(&error) {
+                return Err(error).context("release preview window size");
+            }
         }
     }
+    Ok(())
+}
+
+fn is_missing_target(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "can't find window",
+        "can't find pane",
+        "no such window",
+        "no such pane",
+        "window not found",
+        "pane not found",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 fn spawn_reader(
@@ -520,5 +536,18 @@ mod tests {
                 "on",
             ]
         );
+    }
+
+    #[test]
+    fn missing_release_targets_are_tolerated() {
+        assert!(is_missing_target(&anyhow!(
+            "tmux failed: can't find window: @7"
+        )));
+        assert!(is_missing_target(&anyhow!(
+            "tmux failed: pane not found: %3"
+        )));
+        assert!(!is_missing_target(&anyhow!(
+            "tmux failed: server exited unexpectedly"
+        )));
     }
 }

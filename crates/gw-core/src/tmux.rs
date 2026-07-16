@@ -1,5 +1,6 @@
-//! Thin wrapper over the tmux CLI. Scope is always the current session.
+//! Thin wrapper over the tmux CLI.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -27,8 +28,6 @@ pub struct PreviewWindowState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelIdentity {
-    pub session_id: String,
-    pub window_id: String,
     pub pane_id: String,
 }
 
@@ -40,15 +39,45 @@ pub struct PaneGeometry {
     pub rows: u32,
 }
 
-/// Panes of the current session (`list-panes -s`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyRow {
+    pub session_name: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub window_active: bool,
+    pub session_attached: bool,
+    pub pane_id: String,
+    pub pane_pid: i32,
+    pub pane_tty: String,
+    pub pane_current_path: PathBuf,
+    pub window_index: u32,
+    pub window_name: String,
+    pub geometry: PaneGeometry,
+    pub window_panes: u32,
+}
+
+impl TopologyRow {
+    pub fn pane(&self) -> Pane {
+        Pane {
+            id: self.pane_id.clone(),
+            window_id: self.window_id.clone(),
+            pid: self.pane_pid,
+            tty: self.pane_tty.clone(),
+            cwd: self.pane_current_path.clone(),
+            window_index: self.window_index,
+            window_name: self.window_name.clone(),
+        }
+    }
+}
+
+/// Panes across non-preview sessions, deduplicated by pane id.
 pub fn list_panes() -> Result<Vec<Pane>> {
-    let stdout = run_tmux(&[
-        "list-panes".into(),
-        "-s".into(),
-        "-F".into(),
-        "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}".into(),
-    ])?;
-    parse_panes(&stdout)
+    let mut seen = HashSet::new();
+    Ok(observe_topology()?
+        .into_iter()
+        .filter(|row| seen.insert(row.pane_id.clone()))
+        .map(|row| row.pane())
+        .collect())
 }
 
 /// Pane whose tty matches, if any.
@@ -104,6 +133,30 @@ pub fn current_session_name() -> Result<String> {
     ])?
     .trim()
     .to_owned())
+}
+
+pub fn current_session_id() -> Result<String> {
+    Ok(run_tmux(&[
+        "display-message".into(),
+        "-p".into(),
+        "#{session_id}".into(),
+    ])?
+    .trim()
+    .to_owned())
+}
+
+pub fn observe_topology() -> Result<Vec<TopologyRow>> {
+    let args = observe_topology_command();
+    parse_topology(&run_tmux(&args)?)
+}
+
+fn observe_topology_command() -> Vec<OsString> {
+    vec![
+        "list-panes".into(),
+        "-a".into(),
+        "-F".into(),
+        "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_panes}".into(),
+    ]
 }
 
 pub fn preview_session_create(name: &str, group_with: &str) -> Result<()> {
@@ -200,55 +253,6 @@ pub fn preview_window_state(window_id: &str) -> Result<PreviewWindowState> {
     parse_preview_window_state(&run_tmux(&args)?)
 }
 
-pub fn panel_identity(pane_id: &str) -> Result<PanelIdentity> {
-    let args = panel_identity_command();
-    parse_panel_identity(&run_tmux(&args)?, pane_id)
-}
-
-fn panel_identity_command() -> Vec<OsString> {
-    vec![
-        "list-panes".into(),
-        "-a".into(),
-        "-F".into(),
-        "#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}".into(),
-    ]
-}
-
-pub fn session_current_window(session_id: &str) -> Result<String> {
-    let args = session_current_window_command(session_id);
-    let window_id = run_tmux(&args)?;
-    let window_id = window_id.trim();
-    if window_id.is_empty() {
-        bail!("tmux returned an empty current window id");
-    }
-    Ok(window_id.to_owned())
-}
-
-fn session_current_window_command(session_id: &str) -> Vec<OsString> {
-    vec![
-        "display-message".into(),
-        "-p".into(),
-        "-t".into(),
-        session_id.into(),
-        "#{window_id}".into(),
-    ]
-}
-
-pub fn pane_geometry(pane_id: &str) -> Result<PaneGeometry> {
-    let args = pane_geometry_command(pane_id);
-    parse_pane_geometry(&run_tmux(&args)?)
-}
-
-fn pane_geometry_command(pane_id: &str) -> Vec<OsString> {
-    vec![
-        "display-message".into(),
-        "-p".into(),
-        "-t".into(),
-        pane_id.into(),
-        "#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}".into(),
-    ]
-}
-
 fn preview_window_state_command(window_id: &str) -> Vec<OsString> {
     vec![
         "display-message".into(),
@@ -325,35 +329,88 @@ fn run_tmux(args: &[OsString]) -> Result<String> {
         .context("tmux was not found on PATH or in common locations")
 }
 
-fn parse_panes(stdout: &str) -> Result<Vec<Pane>> {
+fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
     stdout
         .lines()
         .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !line
+                .split_once('\t')
+                .is_some_and(|(session_name, _)| session_name.starts_with("gw-preview-"))
+        })
         .map(|line| {
-            let mut fields = line.splitn(7, '\t');
-            let id = fields.next().context("missing pane id")?;
+            let mut fields = line.splitn(16, '\t');
+            let session_name = fields.next().context("missing session name")?;
+            let session_id = fields.next().context("missing session id")?;
             let window_id = fields.next().context("missing window id")?;
-            let pid = fields
+            let window_active = parse_flag(
+                fields.next().context("missing window active flag")?,
+                "window active flag",
+            )?;
+            let session_attached = fields
+                .next()
+                .context("missing session attached count")?
+                .parse::<u32>()
+                .context("invalid session attached count")?
+                > 0;
+            let pane_id = fields.next().context("missing pane id")?;
+            let pane_pid = fields
                 .next()
                 .context("missing pane pid")?
                 .parse()
                 .context("invalid pane pid")?;
-            let tty = fields.next().context("missing pane tty")?;
-            let cwd = fields.next().context("missing pane cwd")?;
+            let pane_tty = fields.next().context("missing pane tty")?;
+            let pane_current_path = fields.next().context("missing pane cwd")?;
             let window_index = fields
                 .next()
                 .context("missing window index")?
                 .parse()
                 .context("invalid window index")?;
             let window_name = fields.next().context("missing window name")?;
-            Ok(Pane {
-                id: id.into(),
+            let left = fields
+                .next()
+                .context("missing pane left")?
+                .parse()
+                .context("invalid pane left")?;
+            let top = fields
+                .next()
+                .context("missing pane top")?
+                .parse()
+                .context("invalid pane top")?;
+            let cols = fields
+                .next()
+                .context("missing pane width")?
+                .parse()
+                .context("invalid pane width")?;
+            let rows = fields
+                .next()
+                .context("missing pane height")?
+                .parse()
+                .context("invalid pane height")?;
+            let window_panes = fields
+                .next()
+                .context("missing window pane count")?
+                .parse()
+                .context("invalid window pane count")?;
+            Ok(TopologyRow {
+                session_name: session_name.into(),
+                session_id: session_id.into(),
                 window_id: window_id.into(),
-                pid,
-                tty: tty.into(),
-                cwd: cwd.into(),
+                window_active,
+                session_attached,
+                pane_id: pane_id.into(),
+                pane_pid,
+                pane_tty: pane_tty.into(),
+                pane_current_path: pane_current_path.into(),
                 window_index,
                 window_name: window_name.into(),
+                geometry: PaneGeometry {
+                    left,
+                    top,
+                    cols,
+                    rows,
+                },
+                window_panes,
             })
         })
         .collect()
@@ -371,49 +428,6 @@ fn parse_preview_window_state(stdout: &str) -> Result<PreviewWindowState> {
     let pane_count = pane_count.parse().context("invalid window pane count")?;
     let zoomed = parse_flag(zoomed, "window zoomed flag")?;
     Ok(PreviewWindowState { pane_count, zoomed })
-}
-
-fn parse_panel_identity(stdout: &str, pane_id: &str) -> Result<PanelIdentity> {
-    for line in stdout.lines() {
-        let mut fields = line.splitn(4, '\t');
-        let Some(session_name) = fields.next() else {
-            continue;
-        };
-        let Some(session_id) = fields.next() else {
-            continue;
-        };
-        let Some(window_id) = fields.next() else {
-            continue;
-        };
-        let Some(row_pane_id) = fields.next() else {
-            continue;
-        };
-        if row_pane_id == pane_id && !session_name.starts_with("gw-preview-") {
-            return Ok(PanelIdentity {
-                session_id: session_id.to_owned(),
-                window_id: window_id.to_owned(),
-                pane_id: row_pane_id.to_owned(),
-            });
-        }
-    }
-    bail!("panel pane {pane_id} was not found outside preview sessions")
-}
-
-fn parse_pane_geometry(stdout: &str) -> Result<PaneGeometry> {
-    let mut fields = stdout.trim().splitn(4, '\t');
-    let mut next = |name| -> Result<u32> {
-        fields
-            .next()
-            .with_context(|| format!("missing pane {name}"))?
-            .parse()
-            .with_context(|| format!("invalid pane {name}"))
-    };
-    Ok(PaneGeometry {
-        left: next("left")?,
-        top: next("top")?,
-        cols: next("width")?,
-        rows: next("height")?,
-    })
 }
 
 fn parse_flag(stdout: &str, name: &str) -> Result<bool> {
@@ -446,22 +460,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_list_panes_output() {
-        let panes = parse_panes(
-            "%1\t@2\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\n\
-             %2\t@3\t456\tttys002\t/tmp\t3\tsecond window\n",
+    fn constructs_and_parses_topology_snapshot() {
+        let command = observe_topology_command()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command,
+            [
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_panes}",
+            ]
+        );
+
+        let rows = parse_topology(
+            "gw-preview-42\t$2\t@8\t1\t0\t%3\t999\tttys009\t/tmp\t8\tpreview\t0\t0\t80\t24\t1\n\
+             main\t$1\t@7\t1\t2\t%3\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\t12\t4\t80\t24\t3\n\
+             main\t$1\t@9\t0\t2\t%4\t456\tttys002\t/tmp\t3\tsecond window\t0\t0\t100\t30\t1\n",
         )
         .unwrap();
 
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].id, "%1");
-        assert_eq!(panes[0].window_id, "@2");
-        assert_eq!(panes[0].pid, 123);
-        assert_eq!(panes[0].tty, "/dev/ttys001");
-        assert_eq!(panes[0].cwd, PathBuf::from("/Users/me/project one"));
-        assert_eq!(panes[0].window_index, 2);
-        assert_eq!(panes[0].window_name, "agent");
-        assert_eq!(panes[1].window_name, "second window");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_name, "main");
+        assert_eq!(rows[0].session_id, "$1");
+        assert_eq!(rows[0].window_id, "@7");
+        assert!(rows[0].window_active);
+        assert!(rows[0].session_attached);
+        assert_eq!(rows[0].pane_id, "%3");
+        assert_eq!(rows[0].pane_pid, 123);
+        assert_eq!(rows[0].pane_tty, "/dev/ttys001");
+        assert_eq!(
+            rows[0].pane_current_path,
+            PathBuf::from("/Users/me/project one")
+        );
+        assert_eq!(rows[0].window_index, 2);
+        assert_eq!(rows[0].window_name, "agent");
+        assert_eq!(rows[0].geometry.left, 12);
+        assert_eq!(rows[0].geometry.top, 4);
+        assert_eq!(rows[0].geometry.cols, 80);
+        assert_eq!(rows[0].geometry.rows, 24);
+        assert_eq!(rows[0].window_panes, 3);
+        assert!(!rows[1].window_active);
     }
 
     #[test]
@@ -565,75 +606,5 @@ mod tests {
                 vec!["set-option", "-uw", "-t", "@7", "window-size"],
             ]
         );
-    }
-
-    #[test]
-    fn resolves_panel_identity_outside_preview_sessions() {
-        let list = panel_identity_command()
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let current = session_current_window_command("$1")
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            list,
-            [
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}",
-            ]
-        );
-        assert_eq!(
-            current,
-            ["display-message", "-p", "-t", "$1", "#{window_id}"]
-        );
-        assert_eq!(
-            parse_panel_identity(
-                "gw-preview-42\t$2\t@8\t%3\n\
-                 user\t$1\t@7\t%3\n\
-                 other\t$3\t@9\t%4\n",
-                "%3",
-            )
-            .unwrap(),
-            PanelIdentity {
-                session_id: "$1".into(),
-                window_id: "@7".into(),
-                pane_id: "%3".into(),
-            }
-        );
-        assert!(parse_panel_identity("gw-preview-42\t$2\t@8\t%3\n", "%3").is_err());
-    }
-
-    #[test]
-    fn constructs_and_parses_pane_geometry() {
-        let command = pane_geometry_command("%3")
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            command,
-            [
-                "display-message",
-                "-p",
-                "-t",
-                "%3",
-                "#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}",
-            ]
-        );
-        assert_eq!(
-            parse_pane_geometry("12\t4\t80\t24\n").unwrap(),
-            PaneGeometry {
-                left: 12,
-                top: 4,
-                cols: 80,
-                rows: 24,
-            }
-        );
-        assert!(parse_pane_geometry("12\t4\t80\n").is_err());
     }
 }

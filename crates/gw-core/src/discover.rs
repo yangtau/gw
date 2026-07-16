@@ -13,8 +13,7 @@ use crate::procs::{self, Proc};
 use crate::protocol::{AttentionKind, Manifest};
 use crate::status::{self, Derived, SessionStatus, Subagent};
 use crate::store::{SessionRecord, Store};
-use crate::tmux;
-use crate::tmux::Pane;
+use crate::tmux::{Pane, TopologyRow};
 
 /// Variant order is priority order: the panel sorts by it, most urgent first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,8 +71,10 @@ pub fn snapshot(
     plugins: &[Plugin],
     now: DateTime<Utc>,
     stale_after: Duration,
+    topology: &[TopologyRow],
+    session_id: &str,
 ) -> Result<Snapshot> {
-    let panes = tmux::list_panes()?;
+    let panes = panes_in_session(topology, session_id);
     let procs = procs::snapshot()?;
     let sessions = store.sessions()?;
     let manifests: Vec<_> = plugins
@@ -89,6 +90,14 @@ pub fn snapshot(
         stale_after,
         procs::cwd_of,
     ))
+}
+
+fn panes_in_session(topology: &[TopologyRow], session_id: &str) -> Vec<Pane> {
+    topology
+        .iter()
+        .filter(|row| row.session_id == session_id)
+        .map(TopologyRow::pane)
+        .collect()
 }
 
 #[derive(Debug)]
@@ -301,6 +310,29 @@ mod tests {
         }
     }
 
+    fn topology_row(session_id: &str, pane: Pane) -> TopologyRow {
+        TopologyRow {
+            session_name: session_id.trim_start_matches('$').into(),
+            session_id: session_id.into(),
+            window_id: pane.window_id.clone(),
+            window_active: true,
+            session_attached: true,
+            pane_id: pane.id.clone(),
+            pane_pid: pane.pid,
+            pane_tty: pane.tty.clone(),
+            pane_current_path: pane.cwd.clone(),
+            window_index: pane.window_index,
+            window_name: pane.window_name.clone(),
+            geometry: crate::tmux::PaneGeometry {
+                left: 0,
+                top: 0,
+                cols: 80,
+                rows: 24,
+            },
+            window_panes: 1,
+        }
+    }
+
     fn proc_(pid: i32, ppid: i32, command: &str) -> Proc {
         Proc {
             pid,
@@ -308,6 +340,20 @@ mod tests {
             tty: Some(format!("ttys{pid}")),
             argv: vec![command.into()],
         }
+    }
+
+    #[test]
+    fn scopes_topology_rows_to_the_fresh_panel_session() {
+        let rows = [
+            topology_row("$1", pane("%1", 100, 1, "/one")),
+            topology_row("$2", pane("%2", 200, 2, "/two")),
+        ];
+
+        let panes = panes_in_session(&rows, "$2");
+
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].id, "%2");
+        assert_eq!(panes[0].cwd, PathBuf::from("/two"));
     }
 
     fn manifest(id: &str, hooks: bool) -> Manifest {
