@@ -10,7 +10,6 @@
 //! text absorbs whatever space is left.
 
 use std::path::PathBuf;
-use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -18,7 +17,7 @@ use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyMo
 use futures::StreamExt;
 use gw_core::discover::{self, Agent, AgentStatus, Snapshot};
 use gw_core::plugins::{self, Plugin};
-use gw_core::protocol::AttentionKind;
+use gw_core::protocol::{AttentionKind, Event, EventKind};
 use gw_core::store::Store;
 use gw_core::tmux;
 use notify::Watcher;
@@ -29,15 +28,13 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, Paragraph, TitlePosition,
 };
 use ratatui::Frame;
-use tui_term::widget::{Cursor, PseudoTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use crate::preview::{Direction, Preview, PreviewContent, PreviewVisibility};
 
 const STALE_AFTER_MINUTES: i64 = 30;
 const RETENTION_DAYS: i64 = 7;
-const PREVIEW_FRAME_INTERVAL: StdDuration = StdDuration::from_millis(33);
-const MIN_PREVIEW_TERM_HEIGHT: u16 = 16;
+const MIN_ACTIVITY_TERM_HEIGHT: u16 = 16;
+const ACTIVITY_AGE_W: usize = 4;
+const ACTIVITY_LABEL_W: usize = 9;
 const MARKER_W: usize = 3;
 const COL_GAP: usize = 2;
 const MIN_DETAIL: usize = 16;
@@ -72,45 +69,39 @@ enum Flow {
 struct FrameLayout {
     banner: Rect,
     main: Rect,
-    preview: Rect,
+    activity: Rect,
     footer: Rect,
 }
 
 fn frame_layout(area: Rect, view: &View, show_banner: bool) -> FrameLayout {
     let banner_height = u16::from(show_banner);
-    let preview_height = if matches!(view, View::Ended) || area.height < MIN_PREVIEW_TERM_HEIGHT {
+    let activity_height = if matches!(view, View::Ended) || area.height < MIN_ACTIVITY_TERM_HEIGHT {
         Constraint::Length(0)
     } else {
         Constraint::Percentage(40)
     };
-    let [banner, main, preview, footer] = Layout::vertical([
+    let [banner, main, activity, footer] = Layout::vertical([
         Constraint::Length(banner_height),
         Constraint::Min(5),
-        preview_height,
+        activity_height,
         Constraint::Length(1),
     ])
     .areas(area);
     FrameLayout {
         banner,
         main,
-        preview,
+        activity,
         footer,
     }
 }
 
-fn preview_viewport(area: Rect) -> Rect {
+fn activity_viewport(area: Rect) -> Rect {
     Rect::new(
         area.x.saturating_add(1),
         area.y,
         area.width.saturating_sub(2),
         area.height,
     )
-}
-
-fn preview_terminal(area: Rect) -> Rect {
-    Block::new()
-        .borders(Borders::ALL)
-        .inner(preview_viewport(area))
 }
 
 struct App {
@@ -120,9 +111,6 @@ struct App {
     view: View,
     selected: usize,
     picker: Option<usize>,
-    epoch: Instant,
-    preview: Preview,
-    preview_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     panel_pane_id: Option<String>,
     fallback_session_id: Option<String>,
     exit_after_jump: bool,
@@ -132,14 +120,12 @@ impl App {
     fn new() -> Result<Self> {
         let store = Store::open_default()?;
         store.sweep(Duration::days(RETENTION_DAYS))?;
-        let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
         let exit_after_jump = tmux::inside_popup();
         let panel_pane_id = if exit_after_jump {
             None
         } else {
             std::env::var("TMUX_PANE").ok()
         };
-        let preview_visibility = PreviewVisibility::new(exit_after_jump, panel_pane_id.clone());
         let fallback_session_id = if panel_pane_id.is_none() {
             Some(tmux::current_session_id()?)
         } else {
@@ -156,9 +142,6 @@ impl App {
             view: View::Agents,
             selected: 0,
             picker: None,
-            epoch: Instant::now(),
-            preview: Preview::new(preview_tx, preview_visibility),
-            preview_rx,
             panel_pane_id,
             fallback_session_id,
             exit_after_jump,
@@ -178,43 +161,19 @@ impl App {
 
         let mut input = EventStream::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-        let mut topology_tick = tokio::time::interval(std::time::Duration::from_millis(500));
-        topology_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut pulse_tick = tokio::time::interval(PULSE_TICK);
-        pulse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let size = terminal.size()?;
-            let area = Rect::new(0, 0, size.width, size.height);
-            let layout = frame_layout(area, &self.view, !self.snapshot.uninstrumented.is_empty());
-            let preview = preview_terminal(layout.preview);
-            self.preview.set_size(preview.width, preview.height);
             terminal.draw(|f| self.render(f))?;
-            let last_draw = Instant::now();
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
-                _ = pulse_tick.tick(), if matches!(self.preview.view().content, PreviewContent::Placard(_)) => {}
-                _ = topology_tick.tick(), if self.selected_agent().is_some() => {
-                    self.topology_tick();
-                }
                 Some(_) = fs_rx.recv() => {
                     while fs_rx.try_recv().is_ok() {}
                     self.refresh();
-                }
-                Some(_) = self.preview_rx.recv() => {
-                    while self.preview_rx.try_recv().is_ok() {}
-                    self.preview.sync();
-                    let wait = PREVIEW_FRAME_INTERVAL.saturating_sub(last_draw.elapsed());
-                    if !wait.is_zero() {
-                        tokio::time::sleep(wait).await;
-                    }
-                    while self.preview_rx.try_recv().is_ok() {}
-                    self.preview.sync();
                 }
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
                         match self.on_key(key)? {
                             Flow::Quit => return Ok(()),
-                            Flow::Continue => self.topology_tick(),
+                            Flow::Continue => {}
                             Flow::Refreshed => {}
                         }
                     }
@@ -228,8 +187,6 @@ impl App {
             Ok(topology) => topology,
             Err(error) => {
                 gw_core::tui_log::error(&format!("topology snapshot failed: {error:#}"));
-                let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
-                self.preview.tick(&[], selected_pane_id.as_deref());
                 return;
             }
         };
@@ -254,8 +211,6 @@ impl App {
             }
         }
         self.selected = self.selected.min(self.row_count().saturating_sub(1));
-        let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
-        self.preview.tick(&topology, selected_pane_id.as_deref());
     }
 
     fn row_count(&self) -> usize {
@@ -349,20 +304,6 @@ impl App {
         }
     }
 
-    fn topology_tick(&mut self) {
-        match tmux::observe_topology() {
-            Ok(topology) => {
-                let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
-                self.preview.tick(&topology, selected_pane_id.as_deref());
-            }
-            Err(error) => {
-                gw_core::tui_log::error(&format!("topology snapshot failed: {error:#}"));
-                let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
-                self.preview.tick(&[], selected_pane_id.as_deref());
-            }
-        }
-    }
-
     fn activate(&mut self) -> Result<Flow> {
         match self.view {
             View::Agents => match self.snapshot.agents.get(self.selected) {
@@ -395,7 +336,6 @@ impl App {
     }
 
     fn jump(&mut self, pane_id: &str) -> Result<Flow> {
-        self.preview.tick(&[], None);
         tmux::focus(pane_id)?;
         if self.exit_after_jump {
             return Ok(Flow::Quit);
@@ -423,7 +363,7 @@ impl App {
             View::Agents => self.render_agents(frame, layout.main),
             View::Ended => self.render_ended(frame, layout.main),
         }
-        self.render_preview(frame, layout.preview);
+        self.render_activity(frame, layout.activity);
         self.render_footer(frame, layout.footer);
         if self.picker.is_some() {
             self.render_picker(frame);
@@ -571,15 +511,14 @@ impl App {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_preview(&self, frame: &mut Frame, area: Rect) {
+    fn render_activity(&self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
         }
-        let view = self.preview.view();
-        let Some(title) = view.title else {
+        let Some(agent) = self.selected_agent() else {
             return;
         };
-        let viewport = preview_viewport(area);
+        let viewport = activity_viewport(area);
         let frame_style = Style::new().fg(Color::DarkGray).dim();
         let block = Block::new()
             .borders(Borders::ALL)
@@ -588,52 +527,33 @@ impl App {
             .title_style(frame_style)
             .title_alignment(Alignment::Left)
             .title_position(TitlePosition::Top)
-            .title(format!(" {title} "));
-        let terminal = preview_terminal(area);
+            .title(format!(
+                " {}:{} ",
+                agent.pane.window_index, agent.pane.window_name
+            ));
+        let inner = block.inner(viewport);
         frame.render_widget(block, viewport);
-
-        match view.content {
-            PreviewContent::Empty => {}
-            PreviewContent::Placard(direction) => {
-                let accent = self
-                    .selected_agent()
-                    .and_then(|agent| self.plugin(&agent.provider))
-                    .and_then(|plugin| plugin.manifest.color.as_deref())
-                    .and_then(hex_color)
-                    .and_then(rgb_of)
-                    .unwrap_or(NEUTRAL_ACCENT);
-                let phase = (self.epoch.elapsed().as_millis() / PULSE_TICK.as_millis()) as u64;
-                let lines = chevron_rail(direction, accent, phase, terminal);
-                let width = lines.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
-                let height = lines.len() as u16;
-                let area = center(terminal, width, height);
-                frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
-                if let Some((bar_area, bar_lines)) = edge_bar(direction, viewport) {
-                    frame.render_widget(
-                        Paragraph::new(bar_lines)
-                            .style(Style::new().fg(Color::Rgb(accent.0, accent.1, accent.2))),
-                        bar_area,
-                    );
-                }
-            }
-            PreviewContent::Live(parser) => {
-                let parser = parser.lock().unwrap_or_else(|error| error.into_inner());
-                frame.render_widget(
-                    PseudoTerminal::new(parser.screen())
-                        .cursor(Cursor::default().visibility(false)),
-                    terminal,
-                );
-            }
-            PreviewContent::Snapshot(snapshot) => {
-                let all: Vec<&str> = snapshot.lines().collect();
-                let visible = terminal.height as usize;
-                let lines = all[all.len().saturating_sub(visible)..]
-                    .iter()
-                    .map(|line| Line::styled(*line, Style::new().dim()))
-                    .collect::<Vec<_>>();
-                frame.render_widget(Paragraph::new(lines), terminal);
-            }
+        if inner.is_empty() {
+            return;
         }
+
+        let rows = activity_rows(&agent.events, Utc::now());
+        if rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::styled("no events yet", Style::new().dim())),
+                inner,
+            );
+            return;
+        }
+
+        let visible = inner.height as usize;
+        let rows = &rows[rows.len().saturating_sub(visible)..];
+        let mut lines = vec![Line::default(); visible.saturating_sub(rows.len())];
+        lines.extend(
+            rows.iter()
+                .map(|row| activity_line(row, inner.width as usize)),
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -855,6 +775,106 @@ fn status_cell(status: AgentStatus) -> (&'static str, &'static str, Color) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityRow {
+    age: String,
+    label: &'static str,
+    color: Color,
+    text: String,
+}
+
+fn activity_rows(events: &[Event], now: DateTime<Utc>) -> Vec<ActivityRow> {
+    events
+        .iter()
+        .map(|event| {
+            let age = event.ts.map(|ts| ago(ts, now)).unwrap_or_default();
+            let (label, color, text) = match &event.kind {
+                EventKind::SessionStart { model } => (
+                    "session",
+                    Color::DarkGray,
+                    model.clone().unwrap_or_default(),
+                ),
+                EventKind::TurnStart { summary } => (
+                    "turn",
+                    status_cell(AgentStatus::Working).2,
+                    summary.clone().unwrap_or_default(),
+                ),
+                EventKind::Heartbeat { activity } => (
+                    "tool",
+                    Color::DarkGray,
+                    activity.clone().unwrap_or_default(),
+                ),
+                EventKind::Attention { attention, summary } => {
+                    let label = match attention {
+                        AttentionKind::Approval => "approval",
+                        AttentionKind::Question => "question",
+                    };
+                    (
+                        label,
+                        status_cell(AgentStatus::Attention(*attention)).2,
+                        summary.clone().unwrap_or_default(),
+                    )
+                }
+                EventKind::TurnEnd { summary } => (
+                    "done",
+                    status_cell(AgentStatus::Done).2,
+                    summary.clone().unwrap_or_default(),
+                ),
+                EventKind::TurnError { reason, summary } => (
+                    "error",
+                    status_cell(AgentStatus::Error).2,
+                    summary
+                        .clone()
+                        .or_else(|| reason.clone())
+                        .unwrap_or_default(),
+                ),
+                EventKind::SubagentStart {
+                    agent_type,
+                    summary,
+                    ..
+                } => (
+                    "subagent+",
+                    Color::DarkGray,
+                    [agent_type.as_deref(), summary.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(SEP),
+                ),
+                EventKind::SubagentEnd { agent } => ("subagent-", Color::DarkGray, agent.clone()),
+                EventKind::SessionEnd => ("session", Color::DarkGray, "ended".into()),
+            };
+            ActivityRow {
+                age,
+                label,
+                color,
+                text,
+            }
+        })
+        .collect()
+}
+
+fn activity_line(row: &ActivityRow, width: usize) -> Line<'static> {
+    let age = pad_left(&tail_truncate(&row.age, ACTIVITY_AGE_W), ACTIVITY_AGE_W);
+    let label = pad(row.label, ACTIVITY_LABEL_W);
+    let prefix_width = ACTIVITY_AGE_W + 1 + ACTIVITY_LABEL_W + 2;
+    let mut row_style = Style::new().fg(row.color);
+    if row.color == Color::DarkGray {
+        row_style = row_style.dim();
+    }
+    if width < prefix_width {
+        return Line::styled(truncate(&format!("{age} {label}  "), width), row_style);
+    }
+    Line::from(vec![
+        Span::styled(age, Style::new().fg(Color::DarkGray).dim()),
+        Span::raw(" "),
+        Span::styled(label, row_style),
+        Span::raw("  "),
+        Span::styled(truncate(&row.text, width - prefix_width), row_style),
+    ])
+}
+
 fn hex_color(hex: &str) -> Option<Color> {
     let hex = hex.strip_prefix('#')?;
     if hex.len() != 6 {
@@ -971,190 +991,145 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
     mid
 }
 
-const PULSE_TICK: StdDuration = StdDuration::from_millis(90);
-const PULSE_TAIL: u64 = 3;
-const RAIL_MAX: usize = 5;
-const RAIL_BASE: (u8, u8, u8) = (92, 92, 92);
-const NEUTRAL_ACCENT: (u8, u8, u8) = (200, 200, 200);
-const EDGE_BAR_SIDE: u16 = 3;
-const EDGE_BAR_FLAT: u16 = 6;
-
-fn rgb_of(color: Color) -> Option<(u8, u8, u8)> {
-    match color {
-        Color::Rgb(r, g, b) => Some((r, g, b)),
-        _ => None,
-    }
-}
-
-fn lerp_rgb(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
-}
-
-fn rail_len(direction: Direction, area: Rect) -> usize {
-    let available = match direction {
-        Direction::Left | Direction::Right => area.width / 2,
-        Direction::Up | Direction::Down => area.height,
-    };
-    (available as usize).clamp(1, RAIL_MAX)
-}
-
-/// Comet brightness for the chevron `tip_distance` steps from the rail's tail.
-/// The head sweeps tail -> tip, so the pulse always travels toward the agent.
-fn pulse_intensity(tip_distance: usize, phase: u64, len: usize) -> f32 {
-    let period = len as u64 + PULSE_TAIL;
-    let head = (phase % period) as i64;
-    let behind = head - tip_distance as i64;
-    if (0..=PULSE_TAIL as i64).contains(&behind) {
-        1.0 - behind as f32 / (PULSE_TAIL as f32 + 1.0)
-    } else {
-        0.0
-    }
-}
-
-fn pulse_style(accent: (u8, u8, u8), intensity: f32) -> Style {
-    let style = Style::new().fg(lerp_rgb(RAIL_BASE, accent, intensity));
-    if intensity >= 0.99 {
-        style.bold()
-    } else {
-        style
-    }
-}
-
-fn chevron_rail(
-    direction: Direction,
-    accent: (u8, u8, u8),
-    phase: u64,
-    area: Rect,
-) -> Vec<Line<'static>> {
-    let len = rail_len(direction, area);
-    let chevron = |slot: usize| {
-        let tip_distance = match direction {
-            Direction::Right | Direction::Down => slot,
-            Direction::Left | Direction::Up => len - 1 - slot,
-        };
-        pulse_style(accent, pulse_intensity(tip_distance, phase, len))
-    };
-    match direction {
-        Direction::Left | Direction::Right => {
-            let glyph = if direction == Direction::Left {
-                "❮"
-            } else {
-                "❯"
-            };
-            let mut spans = Vec::new();
-            for slot in 0..len {
-                if slot > 0 {
-                    spans.push(Span::raw(" "));
-                }
-                spans.push(Span::styled(glyph, chevron(slot)));
-            }
-            vec![Line::from(spans)]
-        }
-        Direction::Up | Direction::Down => {
-            let glyph = if direction == Direction::Up {
-                "▲"
-            } else {
-                "▼"
-            };
-            (0..len)
-                .map(|slot| Line::from(Span::styled(glyph, chevron(slot))))
-                .collect()
-        }
-    }
-}
-
-/// Steady accent bar on the card border edge facing the agent pane.
-fn edge_bar(direction: Direction, viewport: Rect) -> Option<(Rect, Vec<Line<'static>>)> {
-    if viewport.width < 2 || viewport.height < 2 {
-        return None;
-    }
-    let (area, glyph) = match direction {
-        Direction::Left | Direction::Right => {
-            let height = EDGE_BAR_SIDE.min(viewport.height);
-            let y = viewport.y + (viewport.height - height) / 2;
-            let x = if direction == Direction::Left {
-                viewport.x
-            } else {
-                viewport.right() - 1
-            };
-            let glyph = if direction == Direction::Left {
-                "▌"
-            } else {
-                "▐"
-            };
-            (Rect::new(x, y, 1, height), glyph)
-        }
-        Direction::Up | Direction::Down => {
-            let width = EDGE_BAR_FLAT.min(viewport.width);
-            let x = viewport.x + (viewport.width - width) / 2;
-            let (y, glyph) = if direction == Direction::Up {
-                (viewport.y, "▄")
-            } else {
-                (viewport.bottom() - 1, "▀")
-            };
-            (Rect::new(x, y, width, 1), glyph)
-        }
-    };
-    let lines = (0..area.height)
-        .map(|_| Line::from(glyph.repeat(area.width as usize)))
-        .collect();
-    Some((area, lines))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Modifier;
 
-    #[test]
-    fn pulse_comet_travels_toward_the_tip_and_fades_behind() {
-        assert_eq!(pulse_intensity(0, 0, 5), 1.0);
-        assert_eq!(pulse_intensity(4, 4, 5), 1.0);
-        assert_eq!(pulse_intensity(2, 4, 5), 0.5);
-        assert_eq!(pulse_intensity(0, 4, 5), 0.0);
-        assert_eq!(pulse_intensity(4, 0, 5), 0.0);
-        assert_eq!(pulse_intensity(0, 8, 5), 1.0);
+    fn event(ts: Option<DateTime<Utc>>, kind: EventKind) -> Event {
+        Event {
+            v: 1,
+            ts,
+            session: "session-1".into(),
+            kind,
+        }
     }
 
     #[test]
-    fn chevron_rail_points_at_the_agent() {
-        let area = Rect::new(0, 0, 40, 12);
-        let phase = 4; // head sits on the tip
+    fn maps_every_event_kind_to_activity_rows() {
+        let now = DateTime::from_timestamp(7_200, 0).unwrap();
+        let events = vec![
+            event(
+                Some(now - Duration::minutes(1)),
+                EventKind::SessionStart {
+                    model: Some("opus".into()),
+                },
+            ),
+            event(
+                Some(now - Duration::hours(1)),
+                EventKind::TurnStart {
+                    summary: Some("implement activity".into()),
+                },
+            ),
+            event(
+                None,
+                EventKind::Heartbeat {
+                    activity: Some("cargo test".into()),
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::Attention {
+                    attention: AttentionKind::Approval,
+                    summary: Some("run command".into()),
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::Attention {
+                    attention: AttentionKind::Question,
+                    summary: Some("which option".into()),
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::TurnEnd {
+                    summary: Some("finished".into()),
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::TurnError {
+                    reason: Some("rate_limit".into()),
+                    summary: Some("try later".into()),
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::SubagentStart {
+                    agent: "agent-1".into(),
+                    agent_type: Some("Explore".into()),
+                    model: Some("haiku".into()),
+                    summary: Some("find tests".into()),
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::SubagentEnd {
+                    agent: "agent-1".into(),
+                },
+            ),
+            event(Some(now), EventKind::SessionEnd),
+        ];
 
-        let left = chevron_rail(Direction::Left, NEUTRAL_ACCENT, phase, area);
-        assert_eq!(left.len(), 1);
-        let glyphs: Vec<_> = left[0]
-            .spans
-            .iter()
-            .filter(|span| span.content != " ")
-            .map(|span| span.content.clone())
-            .collect();
-        assert_eq!(glyphs, vec!["❮"; 5]);
-        assert!(left[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
-
-        let down = chevron_rail(Direction::Down, NEUTRAL_ACCENT, phase, area);
-        assert_eq!(down.len(), 5);
-        assert!(down.iter().all(|line| line.spans[0].content == "▼"));
-        assert!(down[4].spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(!down[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
-
-        let narrow = chevron_rail(Direction::Right, NEUTRAL_ACCENT, 0, Rect::new(0, 0, 4, 12));
-        assert_eq!(narrow[0].spans.len(), 3); // 2 chevrons + separator
+        let rows = activity_rows(&events, now);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.age.as_str(), row.label, row.color, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("1m", "session", Color::DarkGray, "opus"),
+                ("1h0m", "turn", Color::Green, "implement activity"),
+                ("", "tool", Color::DarkGray, "cargo test"),
+                ("now", "approval", Color::Red, "run command"),
+                ("now", "question", Color::Red, "which option"),
+                ("now", "done", Color::Cyan, "finished"),
+                ("now", "error", Color::Magenta, "try later"),
+                ("now", "subagent+", Color::DarkGray, "Explore · find tests"),
+                ("now", "subagent-", Color::DarkGray, "agent-1"),
+                ("now", "session", Color::DarkGray, "ended"),
+            ]
+        );
     }
 
     #[test]
-    fn edge_bar_hugs_the_facing_border() {
-        let viewport = Rect::new(10, 5, 30, 10);
-        let (left, _) = edge_bar(Direction::Left, viewport).unwrap();
-        assert_eq!((left.x, left.width, left.height), (10, 1, EDGE_BAR_SIDE));
-        let (right, _) = edge_bar(Direction::Right, viewport).unwrap();
-        assert_eq!(right.x, viewport.right() - 1);
-        let (up, _) = edge_bar(Direction::Up, viewport).unwrap();
-        assert_eq!((up.y, up.height, up.width), (5, 1, EDGE_BAR_FLAT));
-        let (down, _) = edge_bar(Direction::Down, viewport).unwrap();
-        assert_eq!(down.y, viewport.bottom() - 1);
-        assert!(edge_bar(Direction::Left, Rect::new(0, 0, 1, 1)).is_none());
+    fn activity_text_fallbacks_and_render_truncation() {
+        let now = DateTime::from_timestamp(60, 0).unwrap();
+        let events = [
+            event(
+                Some(now),
+                EventKind::TurnError {
+                    reason: Some("rate_limit".into()),
+                    summary: None,
+                },
+            ),
+            event(
+                Some(now),
+                EventKind::SubagentStart {
+                    agent: "agent-1".into(),
+                    agent_type: None,
+                    model: None,
+                    summary: Some("inspect".into()),
+                },
+            ),
+            event(None, EventKind::SessionStart { model: None }),
+        ];
+        let rows = activity_rows(&events, now);
+        assert_eq!(rows[0].text, "rate_limit");
+        assert_eq!(rows[1].text, "inspect");
+        assert_eq!(rows[2].text, "");
+        assert_eq!(rows[2].age, "");
+
+        let line = activity_line(
+            &ActivityRow {
+                age: "now".into(),
+                label: "turn",
+                color: Color::Green,
+                text: "a long activity summary".into(),
+            },
+            24,
+        );
+        assert_eq!(line.width(), 24);
+        assert_eq!(line.spans.last().unwrap().content, "a long …");
     }
 
     fn cell(detail: &str, cwd: &str, branch: &str, window: &str, time: &str) -> AgentCells {

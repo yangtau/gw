@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
+use gw_plugin_protocol::Event;
 
 use crate::plugins::Plugin;
 use crate::procs::{self, Proc};
@@ -14,6 +15,8 @@ use crate::protocol::{AttentionKind, Manifest};
 use crate::status::{self, Derived, SessionStatus, Subagent};
 use crate::store::{SessionRecord, Store};
 use crate::tmux::{Pane, TopologyRow};
+
+const AGENT_EVENT_TAIL: usize = 64;
 
 /// Variant order is priority order: the panel sorts by it, most urgent first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,6 +46,7 @@ pub struct Agent {
     pub detail: Option<String>,
     /// Subagents currently running inside this session, in start order.
     pub subagents: Vec<Subagent>,
+    pub events: Vec<Event>,
 }
 
 /// An ended but resumable session (log has a session id, pane is gone).
@@ -137,7 +141,7 @@ fn join(
     let mut agents = Vec::new();
     for candidate in &live {
         let session_index = match_session(candidate, sessions, &derived, &matched);
-        let (session_id, agent_status, since, detail, subagents) = match session_index {
+        let (session_id, agent_status, since, detail, subagents, events) = match session_index {
             // A matched session can still derive nothing: a log whose every
             // line is retired vocabulary reads back empty.
             Some(index) => {
@@ -152,15 +156,26 @@ fn join(
                     None => (AgentStatus::Unknown, None, None),
                 };
                 let subagents = status::subagents(&session.events);
+                let events = session.events
+                    [session.events.len().saturating_sub(AGENT_EVENT_TAIL)..]
+                    .to_vec();
                 (
                     Some(session.meta.session.clone()),
                     status,
                     since,
                     detail,
                     subagents,
+                    events,
                 )
             }
-            None => (None, AgentStatus::Unknown, None, None, Vec::new()),
+            None => (
+                None,
+                AgentStatus::Unknown,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
         };
         agents.push(Agent {
             provider: candidate.provider.clone(),
@@ -172,6 +187,7 @@ fn join(
             since,
             detail,
             subagents,
+            events,
         });
     }
 
@@ -505,6 +521,7 @@ mod tests {
             AgentStatus::Attention(AttentionKind::Approval)
         ));
         assert_eq!(snapshot.agents[0].cwd, PathBuf::from("/real-claude"));
+        assert_eq!(snapshot.agents[0].events, sessions[0].events);
         assert_eq!(
             snapshot.agents[0].detail.as_deref(),
             Some("Bash: rm -rf build")
@@ -514,6 +531,7 @@ mod tests {
         assert_eq!(snapshot.agents[2].status, AgentStatus::Done);
         assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("agy-live"));
         assert_eq!(snapshot.agents[3].status, AgentStatus::Unknown);
+        assert!(snapshot.agents[3].events.is_empty());
         assert_eq!(
             snapshot
                 .ended
@@ -523,6 +541,46 @@ mod tests {
             ["claude-ended", "codex-old",]
         );
         assert_eq!(snapshot.uninstrumented, ["other"]);
+    }
+
+    #[test]
+    fn matched_agent_keeps_the_latest_event_tail() {
+        let panes = [pane("%1", 100, 1, "/work")];
+        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
+        let manifests = [manifest("claude", true)];
+        let mut sessions = [session(
+            "claude",
+            "live",
+            Some("%1"),
+            Some(101),
+            Some("/work"),
+            0,
+            EventKind::SessionStart { model: None },
+        )];
+        sessions[0].events = (0..65)
+            .map(|secs| Event {
+                v: 1,
+                ts: Some(at(secs)),
+                session: "live".into(),
+                kind: EventKind::Heartbeat {
+                    activity: Some(secs.to_string()),
+                },
+            })
+            .collect();
+
+        let snapshot = join(
+            &panes,
+            &procs,
+            &sessions,
+            &manifests,
+            at(65),
+            Duration::minutes(30),
+            |_| None,
+        );
+
+        assert_eq!(snapshot.agents[0].events.len(), AGENT_EVENT_TAIL);
+        assert_eq!(snapshot.agents[0].events[0].ts, Some(at(1)));
+        assert_eq!(snapshot.agents[0].events[63].ts, Some(at(64)));
     }
 
     #[test]

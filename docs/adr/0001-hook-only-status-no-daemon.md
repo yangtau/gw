@@ -10,7 +10,7 @@ The panel must show what each agent is doing (working / waiting for approval / i
 
 ## Decision
 
-Status is derived **exclusively from provider hook events**. The tool never captures pane content for state (capture-pane is allowed only for the human-facing preview) and never injects keys.
+Status is derived **exclusively from provider hook events**. The tool never captures pane content for state and never injects keys. (An earlier allowance of capture-pane for the human-facing preview ended with ADR-0004; the tool no longer reads pane content at all.)
 
 There is **no daemon**. Each hook invocation appends normalized events to a per-session append-only JSONL log. The TUI replays the log to derive status (`fn derive(events) -> Status` is pure) and follows it live via filesystem watch. Statuses are eventually consistent: attention clears when later activity events arrive, never by explicit acknowledgement.
 

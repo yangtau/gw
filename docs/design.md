@@ -18,7 +18,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 
 - **Panel** runs identically in a persistent pane (dashboard) or `tmux display-popup` (primary posture); after a jump the popup instance exits. Scope: current session only.
 - **List columns**: provider, status (+ duration in that status), window/pane, detail (one-line status context: current activity · task, awaited approval, turn summary, failure reason), cwd (abbreviated), git branch. Running subagents render as dim indented sub-lines under their agent's row (`↳ type · model · task · age`).
-- **Preview**: read-only `capture-pane` tail of the selected agent (display only, never used for status).
+- **Activity**: compact event timeline of the selected agent (recent turns, tool activity, attention, subagents from its Event Log; display only — the panel never touches the agent's window).
 - **Keys (v1)**: `j/k` move, `Enter` jump, `n` launch (pick provider → new window in the panel's cwd → jump), `r` resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` jump to next Attention agent, `q` quit.
 - **Notifications**: `gw hook` itself fires a desktop notification (macOS `osascript`) + terminal bell when writing an attention event — global notifications without a daemon.
 - **Setup**: `gw setup` installs hooks into provider global configs for every discovered plugin. Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. The panel banners providers that are discovered but uninstrumented.

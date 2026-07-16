@@ -21,12 +21,6 @@ pub struct Pane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreviewWindowState {
-    pub pane_count: u32,
-    pub zoomed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneGeometry {
     pub left: u32,
     pub top: u32,
@@ -86,7 +80,8 @@ pub fn locate_panel(pane_id: &str, rows: &[TopologyRow]) -> Option<PanelLocation
     })
 }
 
-/// Panes across non-preview sessions, deduplicated by pane id.
+/// Panes across all sessions, deduplicated by pane id because grouped sessions
+/// can report the same pane more than once.
 pub fn list_panes() -> Result<Vec<Pane>> {
     let mut seen = HashSet::new();
     Ok(observe_topology()?
@@ -129,18 +124,6 @@ pub fn focus(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Last `lines` visible lines of the pane, for the preview.
-pub fn capture(pane_id: &str, lines: u32) -> Result<String> {
-    run_tmux(&[
-        "capture-pane".into(),
-        "-p".into(),
-        "-t".into(),
-        pane_id.into(),
-        "-S".into(),
-        format!("-{lines}").into(),
-    ])
-}
-
 pub fn current_session_name() -> Result<String> {
     Ok(run_tmux(&[
         "display-message".into(),
@@ -173,147 +156,6 @@ fn observe_topology_command() -> Vec<OsString> {
         "-F".into(),
         "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_panes}".into(),
     ]
-}
-
-pub fn preview_session_create(name: &str, group_with: &str) -> Result<()> {
-    let commands = preview_session_create_commands(name, group_with);
-    run_tmux(&commands[0])?;
-    let configured = commands[1..]
-        .iter()
-        .try_for_each(|command| run_tmux(command).map(|_| ()));
-    if configured.is_err() {
-        let _ = kill_session(name);
-    }
-    configured
-}
-
-fn preview_session_create_commands(name: &str, group_with: &str) -> Vec<Vec<OsString>> {
-    vec![
-        vec![
-            "new-session".into(),
-            "-d".into(),
-            "-s".into(),
-            name.into(),
-            "-t".into(),
-            group_with.into(),
-        ],
-        vec![
-            "set-option".into(),
-            "-t".into(),
-            name.into(),
-            "status".into(),
-            "off".into(),
-        ],
-    ]
-}
-
-pub fn preview_select_window(session: &str, window_id: &str) -> Result<()> {
-    run_tmux(&[
-        "select-window".into(),
-        "-t".into(),
-        format!("{session}:{window_id}").into(),
-    ])?;
-    Ok(())
-}
-
-pub fn pin_window_size(window_id: &str, cols: u16, rows: u16) -> Result<()> {
-    let args = pin_window_size_command(window_id, cols, rows);
-    run_tmux(&args)?;
-    Ok(())
-}
-
-fn pin_window_size_command(window_id: &str, cols: u16, rows: u16) -> Vec<OsString> {
-    vec![
-        "resize-window".into(),
-        "-t".into(),
-        window_id.into(),
-        "-x".into(),
-        cols.to_string().into(),
-        "-y".into(),
-        rows.to_string().into(),
-    ]
-}
-
-fn unset_window_size_command(window_id: &str) -> Vec<OsString> {
-    vec![
-        "set-option".into(),
-        "-uw".into(),
-        "-t".into(),
-        window_id.into(),
-        "window-size".into(),
-    ]
-}
-
-pub fn release_window_size(window_id: &str) -> Result<()> {
-    for command in release_window_size_commands(window_id) {
-        run_tmux(&command)?;
-    }
-    Ok(())
-}
-
-fn release_window_size_commands(window_id: &str) -> Vec<Vec<OsString>> {
-    vec![
-        unset_window_size_command(window_id),
-        vec![
-            "resize-window".into(),
-            "-A".into(),
-            "-t".into(),
-            window_id.into(),
-        ],
-        unset_window_size_command(window_id),
-    ]
-}
-
-pub fn preview_window_state(window_id: &str) -> Result<PreviewWindowState> {
-    let args = preview_window_state_command(window_id);
-    parse_preview_window_state(&run_tmux(&args)?)
-}
-
-fn preview_window_state_command(window_id: &str) -> Vec<OsString> {
-    vec![
-        "display-message".into(),
-        "-p".into(),
-        "-t".into(),
-        window_id.into(),
-        "#{window_panes}\t#{window_zoomed_flag}".into(),
-    ]
-}
-
-pub fn toggle_pane_zoom(pane_id: &str) -> Result<()> {
-    let args = toggle_pane_zoom_command(pane_id);
-    run_tmux(&args)?;
-    Ok(())
-}
-
-fn toggle_pane_zoom_command(pane_id: &str) -> Vec<OsString> {
-    vec![
-        "resize-pane".into(),
-        "-Z".into(),
-        "-t".into(),
-        pane_id.into(),
-    ]
-}
-
-pub fn kill_session(name: &str) -> Result<()> {
-    run_tmux(&["kill-session".into(), "-t".into(), name.into()])?;
-    Ok(())
-}
-
-pub fn stale_preview_sessions() -> Result<Vec<String>> {
-    let stdout = run_tmux(&[
-        "list-sessions".into(),
-        "-F".into(),
-        "#{session_name}".into(),
-    ])?;
-    stdout
-        .lines()
-        .filter_map(|name| preview_session_pid(name).map(|pid| (name, pid)))
-        .filter_map(|(name, pid)| match process_is_alive(pid) {
-            Ok(true) => None,
-            Ok(false) => Some(Ok(name.to_owned())),
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
 }
 
 /// Whether `GW_POPUP=1` marks this process as running in a tmux popup.
@@ -362,11 +204,6 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
     stdout
         .lines()
         .filter(|line| !line.is_empty())
-        .filter(|line| {
-            !line
-                .split_once('\t')
-                .is_some_and(|(session_name, _)| session_name.starts_with("gw-preview-"))
-        })
         .map(|line| {
             let mut fields = line.splitn(16, '\t');
             let session_name = fields.next().context("missing session name")?;
@@ -445,35 +282,12 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
         .collect()
 }
 
-fn preview_session_pid(name: &str) -> Option<u32> {
-    name.strip_prefix("gw-preview-")?.parse().ok()
-}
-
-fn parse_preview_window_state(stdout: &str) -> Result<PreviewWindowState> {
-    let (pane_count, zoomed) = stdout
-        .trim()
-        .split_once('\t')
-        .context("missing preview window state fields")?;
-    let pane_count = pane_count.parse().context("invalid window pane count")?;
-    let zoomed = parse_flag(zoomed, "window zoomed flag")?;
-    Ok(PreviewWindowState { pane_count, zoomed })
-}
-
 fn parse_flag(stdout: &str, name: &str) -> Result<bool> {
     match stdout.trim() {
         "0" => Ok(false),
         "1" => Ok(true),
         _ => bail!("invalid {name}"),
     }
-}
-
-fn process_is_alive(pid: u32) -> Result<bool> {
-    let status = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .context("failed to check preview process")?
-        .status;
-    Ok(status.success())
 }
 
 fn normalize_tty(tty: &str) -> &str {
@@ -505,13 +319,13 @@ mod tests {
         );
 
         let rows = parse_topology(
-            "gw-preview-42\t$2\t@8\t1\t0\t%3\t999\tttys009\t/tmp\t8\tpreview\t0\t0\t80\t24\t1\n\
-             main\t$1\t@7\t1\t2\t%3\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\t12\t4\t80\t24\t3\n\
-             main\t$1\t@9\t0\t2\t%4\t456\tttys002\t/tmp\t3\tsecond window\t0\t0\t100\t30\t1\n",
+            "main\t$1\t@7\t1\t2\t%3\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\t12\t4\t80\t24\t3\n\
+             main\t$1\t@9\t0\t2\t%4\t456\ttys002\t/tmp\t3\tsecond window\t0\t0\t100\t30\t1\n\
+             group\t$2\t@7\t1\t0\t%3\t123\ttys001\t/Users/me/project one\t2\tagent\t12\t4\t80\t24\t3\n",
         )
         .unwrap();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].session_name, "main");
         assert_eq!(rows[0].session_id, "$1");
         assert_eq!(rows[0].window_id, "@7");
@@ -570,102 +384,5 @@ mod tests {
     fn normalizes_tty_prefix_and_pane_id_output() {
         assert_eq!(normalize_tty("/dev/ttys012"), normalize_tty("ttys012"));
         assert_eq!(parse_pane_id("%7\n"), "%7");
-    }
-
-    #[test]
-    fn parses_preview_session_pid() {
-        assert_eq!(preview_session_pid("gw-preview-123"), Some(123));
-        assert_eq!(preview_session_pid("gw-preview-nope"), None);
-        assert_eq!(preview_session_pid("other-123"), None);
-    }
-
-    #[test]
-    fn preview_session_setup_does_not_destroy_before_attach() {
-        let commands = preview_session_create_commands("gw-preview-42", "main");
-        let commands = commands
-            .iter()
-            .map(|command| {
-                command
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(commands.len(), 2);
-        assert_eq!(
-            commands[1],
-            ["set-option", "-t", "gw-preview-42", "status", "off"]
-        );
-    }
-
-    #[test]
-    fn constructs_zoom_state_and_toggle_commands() {
-        let state = preview_window_state_command("@7")
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let toggle = toggle_pane_zoom_command("%9")
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            state,
-            [
-                "display-message",
-                "-p",
-                "-t",
-                "@7",
-                "#{window_panes}\t#{window_zoomed_flag}",
-            ]
-        );
-        assert_eq!(toggle, ["resize-pane", "-Z", "-t", "%9"]);
-    }
-
-    #[test]
-    fn parses_zoom_state() {
-        assert_eq!(
-            parse_preview_window_state("3\t1\n").unwrap(),
-            PreviewWindowState {
-                pane_count: 3,
-                zoomed: true,
-            }
-        );
-        assert_eq!(
-            parse_preview_window_state("1\t0\n").unwrap(),
-            PreviewWindowState {
-                pane_count: 1,
-                zoomed: false,
-            }
-        );
-        assert!(parse_preview_window_state("1\tmaybe\n").is_err());
-    }
-
-    #[test]
-    fn constructs_manual_pin_and_release_commands() {
-        let pin = pin_window_size_command("@7", 120, 17)
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let release = release_window_size_commands("@7")
-            .iter()
-            .map(|command| {
-                command
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(pin, ["resize-window", "-t", "@7", "-x", "120", "-y", "17"]);
-        assert_eq!(
-            release,
-            vec![
-                vec!["set-option", "-uw", "-t", "@7", "window-size"],
-                vec!["resize-window", "-A", "-t", "@7"],
-                vec!["set-option", "-uw", "-t", "@7", "window-size"],
-            ]
-        );
     }
 }

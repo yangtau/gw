@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod hook;
-mod preview;
 mod setup;
 mod tui;
 
