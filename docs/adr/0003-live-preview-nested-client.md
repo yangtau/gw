@@ -4,6 +4,8 @@
 
 The accepted trade-off: the source pane experiences a real resize (SIGWINCH redraw, possible scrollback reflow artifacts) while previewed and again when the preview moves away. `capture-pane` remains only as a degraded fallback when the live client cannot be established.
 
+One hard constraint shapes the client lifecycle: tmux 3.7b livelocks the whole server (100% CPU redraw loop) whenever a client's tty is smaller than the window it is viewing and that window's layout changes. The nested client therefore attaches with `ignore-size` and its PTY is never smaller than the viewed window — pinned-panel size while the preview is visible, a parked oversize otherwise.
+
 ## Considered options
 
 - **`capture-pane -e -J` + ANSI parsing**: colors and reflow of joined lines, zero side effects — but still a polled snapshot laid out for the source size; cannot re-render TUI frames. Kept as the fallback path.

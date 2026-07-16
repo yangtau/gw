@@ -7,6 +7,9 @@ use gw_core::{tmux, tui_log};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc::UnboundedSender;
 
+const PARKED_COLS: u16 = 800;
+const PARKED_ROWS: u16 = 240;
+
 pub struct Preview {
     session: String,
     state: State,
@@ -60,7 +63,7 @@ struct LiveClient {
     _child: Box<dyn Child + Send + Sync>,
     parser: Arc<Mutex<vt100::Parser>>,
     alive: Arc<AtomicBool>,
-    size: PtySize,
+    panel_size: PtySize,
 }
 
 impl Preview {
@@ -86,8 +89,9 @@ impl Preview {
         }
         self.wanted = Some(target.clone());
         if !self.visible {
-            if let Some(selected) = self.selected.take() {
-                release_selection(&selected);
+            if let Err(error) = self.release_live_selection() {
+                tui_log::error(&format!("live preview release failed: {error:#}"));
+                self.fail();
             }
             return false;
         }
@@ -96,15 +100,12 @@ impl Preview {
         }
 
         let result: Result<()> = (|| {
-            if let Some(previous) = self.selected.take() {
-                release_selection(&previous);
-            }
-            let size = match &self.state {
-                State::Live(live) => live.size,
-                _ => return Err(anyhow!("preview client is not live")),
+            self.release_live_selection()
+                .context("release previous preview selection")?;
+            let State::Live(live) = &mut self.state else {
+                return Err(anyhow!("preview client is not live"));
             };
-            self.selected = Some(acquire_selection(&self.session, &target, size)?);
-            Ok(())
+            acquire_selection(&self.session, &target, live, &mut self.selected)
         })();
         if let Err(error) = result {
             tui_log::error(&format!("live preview selection failed: {error:#}"));
@@ -115,8 +116,9 @@ impl Preview {
 
     pub fn deselect(&mut self) {
         self.wanted = None;
-        if let Some(selected) = self.selected.take() {
-            release_selection(&selected);
+        if let Err(error) = self.release_live_selection() {
+            tui_log::error(&format!("live preview deselect failed: {error:#}"));
+            self.fail();
         }
     }
 
@@ -127,25 +129,25 @@ impl Preview {
         }
         self.visible = visible;
         if !visible {
-            if let Some(selected) = self.selected.take() {
-                release_selection(&selected);
+            if let Err(error) = self.release_live_selection() {
+                tui_log::error(&format!(
+                    "live preview visibility release failed: {error:#}"
+                ));
+                self.fail();
             }
             return false;
         }
         let Some(target) = self.wanted.clone() else {
             return false;
         };
-        let State::Live(live) = &self.state else {
+        let State::Live(live) = &mut self.state else {
             return false;
         };
-        match acquire_selection(&self.session, &target, live.size) {
-            Ok(selected) => self.selected = Some(selected),
-            Err(error) => {
-                tui_log::error(&format!(
-                    "live preview visibility restore failed: {error:#}"
-                ));
-                self.fail();
-            }
+        if let Err(error) = acquire_selection(&self.session, &target, live, &mut self.selected) {
+            tui_log::error(&format!(
+                "live preview visibility restore failed: {error:#}"
+            ));
+            self.fail();
         }
         self.is_live()
     }
@@ -167,12 +169,11 @@ impl Preview {
         let State::Live(live) = &mut self.state else {
             return false;
         };
-        if live.size.cols == cols && live.size.rows == rows {
+        if live.panel_size.cols == cols && live.panel_size.rows == rows {
             return self.is_live();
         }
         let size = pty_size(cols, rows);
         let result: Result<()> = (|| {
-            live.master.resize(size).context("resize preview PTY")?;
             let mut parser = live
                 .parser
                 .lock()
@@ -180,8 +181,16 @@ impl Preview {
             parser.screen_mut().set_size(rows, cols);
             drop(parser);
             if let Some(selected) = &self.selected {
+                let bridge = pty_size(
+                    live.panel_size.cols.max(cols),
+                    live.panel_size.rows.max(rows),
+                );
+                live.master
+                    .resize(bridge)
+                    .context("grow preview PTY before window resize")?;
                 tmux::pin_window_size(&selected.window_id, cols, rows)
                     .with_context(|| format!("resize preview window {}", selected.window_id))?;
+                live.master.resize(size).context("resize preview PTY")?;
             }
             Ok(())
         })();
@@ -191,7 +200,7 @@ impl Preview {
             return false;
         }
         if let State::Live(live) = &mut self.state {
-            live.size = size;
+            live.panel_size = size;
         }
         self.is_live()
     }
@@ -259,24 +268,36 @@ impl Preview {
         };
         self.state = State::Live(live);
         if let Some(target) = self.wanted.clone() {
-            let size = match &self.state {
-                State::Live(live) => live.size,
-                _ => unreachable!(),
+            let State::Live(live) = &mut self.state else {
+                unreachable!()
             };
-            match acquire_selection(&self.session, &target, size) {
-                Ok(selected) => self.selected = Some(selected),
-                Err(error) => {
-                    tui_log::error(&format!("live preview selection failed: {error:#}"));
-                    self.fail();
-                }
+            if let Err(error) = acquire_selection(&self.session, &target, live, &mut self.selected)
+            {
+                tui_log::error(&format!("live preview selection failed: {error:#}"));
+                self.fail();
             }
         }
     }
 
+    fn release_live_selection(&mut self) -> Result<()> {
+        let Some(selected) = self.selected.as_ref() else {
+            return Ok(());
+        };
+        let State::Live(live) = &mut self.state else {
+            return Err(anyhow!("preview client is not live"));
+        };
+        live.master
+            .resize(parked_size())
+            .context("park preview PTY before selection release")?;
+        release_selection(selected);
+        self.selected = None;
+        Ok(())
+    }
+
     fn start_client(&self, cols: u16, rows: u16) -> Result<LiveClient> {
-        let size = pty_size(cols, rows);
+        let panel_size = pty_size(cols, rows);
         let pair = native_pty_system()
-            .openpty(size)
+            .openpty(parked_size())
             .context("failed to open preview PTY")?;
         let reader = pair
             .master
@@ -315,19 +336,21 @@ impl Preview {
             _child: child,
             parser,
             alive,
-            size,
+            panel_size,
         })
     }
 
     fn fail(&mut self) {
+        if let State::Live(live) = &self.state {
+            live.alive.store(false, Ordering::Release);
+            if let Err(error) = tmux::kill_session(&self.session) {
+                tui_log::error(&format!("live preview session teardown failed: {error:#}"));
+            }
+        }
         if let Some(selected) = self.selected.take() {
             release_selection(&selected);
         }
         self.wanted = None;
-        if let State::Live(live) = &self.state {
-            live.alive.store(false, Ordering::Release);
-            let _ = tmux::kill_session(&self.session);
-        }
         self.state = State::Dead;
     }
 }
@@ -337,7 +360,7 @@ fn attach_command(binary: &str, session: &str) -> CommandBuilder {
     command.args([
         "attach",
         "-f",
-        "read-only",
+        "read-only,ignore-size",
         "-t",
         session,
         ";",
@@ -356,11 +379,13 @@ fn attach_command(binary: &str, session: &str) -> CommandBuilder {
 impl Drop for Preview {
     fn drop(&mut self) {
         if let State::Live(live) = &self.state {
-            if let Some(selected) = self.selected.take() {
-                release_selection(&selected);
-            }
             live.alive.store(false, Ordering::Release);
-            let _ = tmux::kill_session(&self.session);
+            if let Err(error) = tmux::kill_session(&self.session) {
+                tui_log::error(&format!("live preview session teardown failed: {error:#}"));
+            }
+        }
+        if let Some(selected) = self.selected.take() {
+            release_selection(&selected);
         }
     }
 }
@@ -374,28 +399,43 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-fn acquire_selection(session: &str, target: &Target, size: PtySize) -> Result<Selection> {
+fn parked_size() -> PtySize {
+    pty_size(PARKED_COLS, PARKED_ROWS)
+}
+
+fn acquire_selection(
+    session: &str,
+    target: &Target,
+    live: &mut LiveClient,
+    selected: &mut Option<Selection>,
+) -> Result<()> {
     tmux::preview_select_window(session, &target.window_id)
         .with_context(|| format!("select preview window {}", target.window_id))?;
-    let mut selected = Selection::new(target);
-    let result: Result<()> = (|| {
-        let window = tmux::preview_window_state(&target.window_id)
-            .with_context(|| format!("query preview window {}", target.window_id))?;
-        if window.pane_count > 1 && !window.zoomed {
-            tmux::toggle_pane_zoom(&target.pane_id)
-                .with_context(|| format!("zoom preview pane {}", target.pane_id))?;
-            selected.zoomed_by_us = true;
-        }
-        tmux::pin_window_size(&target.window_id, size.cols, size.rows)
-            .with_context(|| format!("pin preview window {} size", target.window_id))?;
-        selected.size_pinned_by_us = true;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        release_selection(&selected);
-        return Err(error);
+    *selected = Some(Selection::new(target));
+    let selected = selected.as_mut().expect("preview selection was set");
+    let window = tmux::preview_window_state(&target.window_id)
+        .with_context(|| format!("query preview window {}", target.window_id))?;
+    if window.pane_count > 1 && !window.zoomed {
+        tmux::toggle_pane_zoom(&target.pane_id)
+            .with_context(|| format!("zoom preview pane {}", target.pane_id))?;
+        selected.zoomed_by_us = true;
     }
-    Ok(selected)
+    tmux::pin_window_size(
+        &target.window_id,
+        live.panel_size.cols,
+        live.panel_size.rows,
+    )
+    .with_context(|| format!("pin preview window {} size", target.window_id))?;
+    selected.size_pinned_by_us = true;
+    let mut parser = live
+        .parser
+        .lock()
+        .map_err(|_| anyhow!("preview parser lock was poisoned"))?;
+    live.master
+        .resize(live.panel_size)
+        .context("resize preview PTY to panel size")?;
+    parser.process(b"\x1bc");
+    Ok(())
 }
 
 fn release_selection(selected: &Selection) {
@@ -413,13 +453,10 @@ fn release_selection(selected: &Selection) {
         }
     }
     if selected.size_pinned_by_us {
-        if let Err(error) = tmux::unset_window_size(&selected.window_id) {
+        if let Err(error) = tmux::release_window_size(&selected.window_id) {
             tui_log::error(&format!(
                 "live preview window size release failed: {error:#}"
             ));
-        }
-        if let Err(error) = tmux::resize_window_to_available(&selected.window_id) {
-            tui_log::error(&format!("live preview window restore failed: {error:#}"));
         }
     }
 }
@@ -458,7 +495,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attach_is_read_only_but_participates_in_window_sizing() {
+    fn attach_is_read_only_and_ignores_client_sizing() {
         let command = attach_command("tmux", "gw-preview-42");
         let argv = command
             .get_argv()
@@ -472,7 +509,7 @@ mod tests {
                 "tmux",
                 "attach",
                 "-f",
-                "read-only",
+                "read-only,ignore-size",
                 "-t",
                 "gw-preview-42",
                 ";",

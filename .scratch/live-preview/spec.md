@@ -18,8 +18,17 @@ Environment facts (verified):
 
 - tmux 3.7b on the dev machine; grouped sessions, manual `resize-window`,
   `attach -f read-only`, `destroy-unattached` all available.
-- `attach -r` is an alias for `-f read-only,ignore-size`; the preview uses only
-  `read-only` so its client participates in window sizing.
+- `attach -r` is an alias for `-f read-only,ignore-size`; the preview attaches
+  with `read-only,ignore-size` — since sizing moved to manual pinning (decision 1)
+  the client must NOT participate in window sizing, and ignore-size keeps the
+  parked-size client (see below) from inflating the user's windows.
+- tmux 3.7b livelock (isolated repro, no gw involved): a client whose tty is
+  SMALLER than the window it views sends the server into a 100% CPU
+  `screen_redraw_screen`/`tty_draw_line` loop when that window's layout changes
+  (e.g. `split-window`); the whole server hangs. Equal-or-larger client tty is
+  safe. Invariant adopted: the nested client PTY is never smaller than the
+  window it views — panel size while a selection is held (window pinned to
+  match), parked size (800x240) otherwise. See issue 07.
 - tui-term 0.3.4 (actively maintained) requires ratatui 0.30 + crossterm 0.29;
   gw is currently on ratatui 0.29 + crossterm 0.28 → prerequisite upgrade.
 - Client-based sizing (`window-size latest`, with or without `aggressive-resize`)
@@ -43,7 +52,9 @@ Environment facts (verified):
    get live preview, including the window under the popup. The previewed window is
    pinned to the preview size with `resize-window -x -y` (manual sizing — no client
    arbitration, no flap), restored on release via `set -uw window-size` +
-   `resize-window -A`. Supersedes the original aggressive-resize approach.
+   `resize-window -A` + `set -uw window-size` again (`-A` re-marks the window
+   manual; the trailing unset clears the residue — verified). Supersedes the
+   original aggressive-resize approach.
 1b. **Visibility gating.** The preview's shared-state borrows (manual window size,
    zoom) are held only while the Panel is visible: always in popup mode; in
    dashboard mode only while the Panel's own window is its session's current window

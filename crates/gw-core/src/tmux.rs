@@ -156,12 +156,6 @@ fn pin_window_size_command(window_id: &str, cols: u16, rows: u16) -> Vec<OsStrin
     ]
 }
 
-pub fn unset_window_size(window_id: &str) -> Result<()> {
-    let args = unset_window_size_command(window_id);
-    run_tmux(&args)?;
-    Ok(())
-}
-
 fn unset_window_size_command(window_id: &str) -> Vec<OsString> {
     vec![
         "set-option".into(),
@@ -172,14 +166,24 @@ fn unset_window_size_command(window_id: &str) -> Vec<OsString> {
     ]
 }
 
-pub fn resize_window_to_available(window_id: &str) -> Result<()> {
-    run_tmux(&[
-        "resize-window".into(),
-        "-A".into(),
-        "-t".into(),
-        window_id.into(),
-    ])?;
+pub fn release_window_size(window_id: &str) -> Result<()> {
+    for command in release_window_size_commands(window_id) {
+        run_tmux(&command)?;
+    }
     Ok(())
+}
+
+fn release_window_size_commands(window_id: &str) -> Vec<Vec<OsString>> {
+    vec![
+        unset_window_size_command(window_id),
+        vec![
+            "resize-window".into(),
+            "-A".into(),
+            "-t".into(),
+            window_id.into(),
+        ],
+        unset_window_size_command(window_id),
+    ]
 }
 
 pub fn preview_window_state(window_id: &str) -> Result<PreviewWindowState> {
@@ -495,18 +499,30 @@ mod tests {
     }
 
     #[test]
-    fn constructs_manual_size_commands() {
+    fn constructs_manual_pin_and_release_commands() {
         let pin = pin_window_size_command("@7", 120, 17)
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let unset = unset_window_size_command("@7")
+        let release = release_window_size_commands("@7")
             .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
+            .map(|command| {
+                command
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(pin, ["resize-window", "-t", "@7", "-x", "120", "-y", "17"]);
-        assert_eq!(unset, ["set-option", "-uw", "-t", "@7", "window-size"]);
+        assert_eq!(
+            release,
+            vec![
+                vec!["set-option", "-uw", "-t", "@7", "window-size"],
+                vec!["resize-window", "-A", "-t", "@7"],
+                vec!["set-option", "-uw", "-t", "@7", "window-size"],
+            ]
+        );
     }
 
     #[test]
