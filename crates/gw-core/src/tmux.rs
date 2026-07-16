@@ -132,26 +132,38 @@ pub fn preview_select_window(session: &str, window_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn set_window_aggressive_resize(window_id: &str, on: bool) -> Result<()> {
-    let mut args = vec!["set-option".into()];
-    if on {
-        args.extend([
-            "-w".into(),
-            "-t".into(),
-            window_id.into(),
-            "aggressive-resize".into(),
-            "on".into(),
-        ]);
-    } else {
-        args.extend([
-            "-uw".into(),
-            "-t".into(),
-            window_id.into(),
-            "aggressive-resize".into(),
-        ]);
-    }
+pub fn pin_window_size(window_id: &str, cols: u16, rows: u16) -> Result<()> {
+    let args = pin_window_size_command(window_id, cols, rows);
     run_tmux(&args)?;
     Ok(())
+}
+
+fn pin_window_size_command(window_id: &str, cols: u16, rows: u16) -> Vec<OsString> {
+    vec![
+        "resize-window".into(),
+        "-t".into(),
+        window_id.into(),
+        "-x".into(),
+        cols.to_string().into(),
+        "-y".into(),
+        rows.to_string().into(),
+    ]
+}
+
+pub fn unset_window_size(window_id: &str) -> Result<()> {
+    let args = unset_window_size_command(window_id);
+    run_tmux(&args)?;
+    Ok(())
+}
+
+fn unset_window_size_command(window_id: &str) -> Vec<OsString> {
+    vec![
+        "set-option".into(),
+        "-uw".into(),
+        "-t".into(),
+        window_id.into(),
+        "window-size".into(),
+    ]
 }
 
 pub fn resize_window_to_available(window_id: &str) -> Result<()> {
@@ -167,6 +179,21 @@ pub fn resize_window_to_available(window_id: &str) -> Result<()> {
 pub fn preview_window_state(window_id: &str) -> Result<PreviewWindowState> {
     let args = preview_window_state_command(window_id);
     parse_preview_window_state(&run_tmux(&args)?)
+}
+
+pub fn pane_window_active(pane_id: &str) -> Result<bool> {
+    let args = pane_window_active_command(pane_id);
+    parse_flag(&run_tmux(&args)?, "window active flag")
+}
+
+fn pane_window_active_command(pane_id: &str) -> Vec<OsString> {
+    vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        pane_id.into(),
+        "#{window_active}".into(),
+    ]
 }
 
 fn preview_window_state_command(window_id: &str) -> Vec<OsString> {
@@ -289,12 +316,16 @@ fn parse_preview_window_state(stdout: &str) -> Result<PreviewWindowState> {
         .split_once('\t')
         .context("missing preview window state fields")?;
     let pane_count = pane_count.parse().context("invalid window pane count")?;
-    let zoomed = match zoomed {
-        "0" => false,
-        "1" => true,
-        _ => bail!("invalid window zoomed flag"),
-    };
+    let zoomed = parse_flag(zoomed, "window zoomed flag")?;
     Ok(PreviewWindowState { pane_count, zoomed })
+}
+
+fn parse_flag(stdout: &str, name: &str) -> Result<bool> {
+    match stdout.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => bail!("invalid {name}"),
+    }
 }
 
 fn process_is_alive(pid: u32) -> Result<bool> {
@@ -411,5 +442,30 @@ mod tests {
             }
         );
         assert!(parse_preview_window_state("1\tmaybe\n").is_err());
+    }
+
+    #[test]
+    fn constructs_manual_size_and_visibility_commands() {
+        let pin = pin_window_size_command("@7", 120, 17)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let unset = unset_window_size_command("@7")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let active = pane_window_active_command("%3")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(pin, ["resize-window", "-t", "@7", "-x", "120", "-y", "17"]);
+        assert_eq!(unset, ["set-option", "-uw", "-t", "@7", "window-size"]);
+        assert_eq!(
+            active,
+            ["display-message", "-p", "-t", "%3", "#{window_active}"]
+        );
+        assert!(parse_flag("1\n", "window active flag").unwrap());
+        assert!(!parse_flag("0\n", "window active flag").unwrap());
     }
 }

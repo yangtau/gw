@@ -68,6 +68,53 @@ enum Flow {
     Quit,
 }
 
+enum PreviewVisibility {
+    Always,
+    Polled { pane_id: String, visible: bool },
+}
+
+impl PreviewVisibility {
+    fn new(popup: bool, pane_id: Option<String>) -> Self {
+        match (popup, pane_id) {
+            (false, Some(pane_id)) => Self::Polled {
+                pane_id,
+                visible: false,
+            },
+            _ => Self::Always,
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Polled { visible, .. } => *visible,
+        }
+    }
+
+    fn pane_id(&self) -> Option<&str> {
+        match self {
+            Self::Always => None,
+            Self::Polled { pane_id, .. } => Some(pane_id),
+        }
+    }
+
+    fn should_poll(&self, has_selection: bool) -> bool {
+        matches!(self, Self::Polled { .. }) && has_selection
+    }
+
+    fn set_visible(&mut self, visible: bool) -> bool {
+        let Self::Polled {
+            visible: current, ..
+        } = self
+        else {
+            return false;
+        };
+        let changed = *current != visible;
+        *current = visible;
+        changed
+    }
+}
+
 struct App {
     store: Store,
     plugins: Vec<Plugin>,
@@ -78,6 +125,7 @@ struct App {
     snapshot_preview: String,
     live_preview: Preview,
     preview_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    preview_visibility: PreviewVisibility,
     exit_after_jump: bool,
 }
 
@@ -86,6 +134,10 @@ impl App {
         let store = Store::open_default()?;
         store.sweep(Duration::days(RETENTION_DAYS))?;
         let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exit_after_jump = tmux::inside_popup();
+        let preview_visibility =
+            PreviewVisibility::new(exit_after_jump, std::env::var("TMUX_PANE").ok());
+        let preview_visible = preview_visibility.is_visible();
         let mut app = Self {
             store,
             plugins: plugins::discover()?,
@@ -98,9 +150,10 @@ impl App {
             selected: 0,
             picker: None,
             snapshot_preview: String::new(),
-            live_preview: Preview::new(preview_tx),
+            live_preview: Preview::new(preview_tx, preview_visible),
             preview_rx,
-            exit_after_jump: tmux::inside_popup(),
+            preview_visibility,
+            exit_after_jump,
         };
         app.refresh();
         Ok(app)
@@ -117,11 +170,16 @@ impl App {
 
         let mut input = EventStream::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut visibility_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        visibility_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             terminal.draw(|f| self.render(f))?;
             let last_draw = Instant::now();
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
+                _ = visibility_tick.tick(), if self.preview_visibility.should_poll(self.live_preview.has_selection()) => {
+                    self.poll_preview_visibility();
+                }
                 Some(_) = fs_rx.recv() => {
                     while fs_rx.try_recv().is_ok() {}
                     self.refresh();
@@ -142,6 +200,7 @@ impl App {
                 }
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
+                        self.set_preview_visible(true);
                         if matches!(self.on_key(key)?, Flow::Quit) {
                             return Ok(());
                         }
@@ -281,6 +340,27 @@ impl App {
             .selected_agent()
             .and_then(|agent| tmux::capture(&agent.pane.id, PREVIEW_LINES).ok())
             .unwrap_or_default();
+    }
+
+    fn poll_preview_visibility(&mut self) {
+        let Some(pane_id) = self.preview_visibility.pane_id() else {
+            return;
+        };
+        match tmux::pane_window_active(pane_id) {
+            Ok(visible) => self.set_preview_visible(visible),
+            Err(error) => {
+                gw_core::tui_log::error(&format!("live preview visibility query failed: {error:#}"))
+            }
+        }
+    }
+
+    fn set_preview_visible(&mut self, visible: bool) {
+        if !self.preview_visibility.set_visible(visible) {
+            return;
+        }
+        if !self.live_preview.set_visible(visible) {
+            self.capture_preview();
+        }
     }
 
     fn activate(&mut self) -> Result<Flow> {
@@ -907,6 +987,29 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gates_dashboard_preview_by_visibility() {
+        let mut popup = PreviewVisibility::new(true, Some("%1".into()));
+        assert!(popup.is_visible());
+        assert!(!popup.should_poll(true));
+        assert!(!popup.set_visible(false));
+        assert!(popup.is_visible());
+
+        let no_pane = PreviewVisibility::new(false, None);
+        assert!(no_pane.is_visible());
+        assert!(!no_pane.should_poll(true));
+
+        let mut dashboard = PreviewVisibility::new(false, Some("%2".into()));
+        assert!(!dashboard.is_visible());
+        assert!(!dashboard.should_poll(false));
+        assert!(dashboard.should_poll(true));
+        assert!(dashboard.set_visible(true));
+        assert!(dashboard.is_visible());
+        assert!(!dashboard.set_visible(true));
+        assert!(dashboard.set_visible(false));
+        assert!(!dashboard.is_visible());
+    }
 
     fn cell(detail: &str, cwd: &str, branch: &str, window: &str, time: &str) -> AgentCells {
         AgentCells {

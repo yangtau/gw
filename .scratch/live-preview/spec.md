@@ -10,36 +10,46 @@ A grouped tmux session shares the window list with the user's session. gw attach
 **read-only nested client** to that grouped session inside a PTY it owns, sized to the
 preview area, and renders the client's screen into the preview Rect via an embedded
 terminal emulator. Because the nested client is the only session for which the
-previewed window is current (with `aggressive-resize on`), tmux resizes the window to
-the preview PTY's size and the agent program re-renders for it. This is deliberate and
-accepted (see ADR).
+previewed window is current, gw can switch it independently. gw manually pins that
+window to the preview PTY's size while the Panel is visible, so the agent program
+re-renders for it. This is deliberate and accepted (see ADR).
 
 Environment facts (verified):
 
-- tmux 3.7b on the dev machine; grouped sessions, `window-size latest` (default),
-  `aggressive-resize`, `attach -f read-only`, `destroy-unattached` all available.
+- tmux 3.7b on the dev machine; grouped sessions, manual `resize-window`,
+  `attach -f read-only`, `destroy-unattached` all available.
 - `attach -r` is an alias for `-f read-only,ignore-size`; the preview uses only
   `read-only` so its client participates in window sizing.
 - tui-term 0.3.4 (actively maintained) requires ratatui 0.30 + crossterm 0.29;
   gw is currently on ratatui 0.29 + crossterm 0.28 → prerequisite upgrade.
-- Default `window-size latest` without aggressive-resize lets the *user's* client
-  (attached to a session sharing the window) reclaim the window size on every
-  keystroke — so per-window `aggressive-resize on` during preview is required,
-  not an optimization.
+- Client-based sizing (`window-size latest`, with or without `aggressive-resize`)
+  is arbitration: whenever the previewed window is also current in the user's
+  session, the user's client wins and the nested client gets a clipped top-left
+  viewport that barely updates — the preview looks frozen. Verified escape hatch:
+  `resize-window -x <cols> -y <rows>` pins the window manually and beats any client
+  arbitration (user keystrokes included); `set-option -uw window-size` followed by
+  `resize-window -A` restores client sizing and snaps back to the attached client.
 - copy-mode is pane-level shared state → the preview must never enter it.
 - zoom (`resize-pane -Z`) is window-level shared state, but manageable with the same
-  set/restore discipline as aggressive-resize. Verified: zoom works from a plain
-  command (no client context); it survives the aggressive-resize window resize (the
-  zoomed pane tracks the new window size); `select-pane` onto the zoomed pane itself
+  set/restore discipline as manual window sizing. Verified: zoom works from a plain
+  command (no client context); it survives the manual window resize (the zoomed pane
+  tracks the new window size); `select-pane` onto the zoomed pane itself
   keeps zoom (jump lands there), selecting another pane auto-unzooms; restore must be
   conditional on `#{window_zoomed_flag}` (toggle only if still zoomed).
 
 ## Decisions (settled, do not relitigate)
 
-1. **Resize policy: fully accepted.** All agent windows get live preview, including
-   the window under the popup (its size may flap with user input; accepted, popup
-   covers it). `aggressive-resize` is set per-window on preview enter, unset
-   (`set -uw`) on leave.
+1. **Resize policy: fully accepted, pinned deterministically.** All agent windows
+   get live preview, including the window under the popup. The previewed window is
+   pinned to the preview size with `resize-window -x -y` (manual sizing — no client
+   arbitration, no flap), restored on release via `set -uw window-size` +
+   `resize-window -A`. Supersedes the original aggressive-resize approach.
+1b. **Visibility gating.** The preview's shared-state borrows (manual window size,
+   zoom) are held only while the Panel is visible: always in popup mode; in
+   dashboard mode only while the Panel's own window is its session's current window
+   (polled, plus any received key event implies visible). On visibility loss the
+   selection is released but remembered; on regain it is re-acquired. The nested
+   client and grouped session stay alive throughout.
 2. **Dependency path:** upgrade workspace to ratatui 0.30 + crossterm 0.29 as a
    separate prerequisite commit, then use tui-term 0.3.4 (vt100 feature) +
    portable-pty + vt100.
@@ -76,10 +86,13 @@ and tests clean.
   client only after it attaches, because enabling it on a never-attached session
   destroys that session immediately.
 - `preview_select_window(session, window_id)` → `select-window -t <session>:<window_id>`.
-- `set_window_aggressive_resize(window_id, on: bool)` →
-  `set-option -w -t <window_id> aggressive-resize on` / `set-option -uw ...`.
-  (`-u` on leave restores the inherited value; a user's explicit per-window setting
-  would be lost — accepted, noted here.)
+- `pin_window_size(window_id, cols, rows)` →
+  `resize-window -t <window_id> -x <cols> -y <rows>`.
+- `unset_window_size(window_id)` →
+  `set-option -uw -t <window_id> window-size`; follow it with
+  `resize-window -A -t <window_id>` on release.
+- `pane_window_active(pane_id)` →
+  `display-message -p -t <pane_id> '#{window_active}'`.
 - `kill_session(name)`.
 - `stale_preview_sessions()` → list sessions named `gw-preview-<pid>` whose pid is
   no longer alive (for the startup sweep).
@@ -99,17 +112,20 @@ and tests clean.
   list as `run_tmux`.
 - Feed PTY output into a `vt100::Parser` behind a mutex from a blocking reader task;
   after each read, send a notification on a `tokio::sync::watch`/`mpsc` channel.
-- Expose `resize(cols, rows)` → resize both the PTY master and the vt100 parser.
-- Expose `select(window_id)` → unset aggressive-resize on the previous window, set it
-  on the new one, `select-window`. Track the current window to avoid redundant calls.
-- After every successful aggressive-resize unset, best-effort
-  `resize-window -A -t <window_id>` so the released window snaps back immediately.
-- `deselect()` (no agent selected / Ended view): unset aggressive-resize on the last
-  window; stop rendering the live widget (client stays attached, harmless).
-- On drop / TUI exit: unset aggressive-resize, `kill_session`. `destroy-unattached on`
+- Expose `resize(cols, rows)` → resize both the PTY master and the vt100 parser, then
+  re-pin the selected window when live.
+- Expose `select(window_id)` → release the previous selection, `select-window`, apply
+  conditional zoom, then pin the new window to the current preview size. Track the
+  wanted and currently held selections separately.
+- Release conditional zoom, then best-effort unset `window-size` and
+  `resize-window -A -t <window_id>` so the window snaps back immediately.
+- `deselect()` (no agent selected / Ended view) releases and forgets the selection;
+  visibility loss releases it but remembers the target. In both cases the nested
+  client stays attached.
+- On drop / TUI exit: release the selection, `kill_session`. `destroy-unattached on`
   covers crashes (the nested client is a child process; gw death closes the PTY, the
-  client dies, tmux destroys the session). A `kill -9` may leak the per-window
-  aggressive-resize flag — accepted.
+  client dies, tmux destroys the session). A `kill -9` may leak manual window size or
+  zoom state — accepted.
 - Any error at any stage → mark the client dead and return; callers fall back to
   snapshots. Do not retry in a loop. Log degradation errors to the append-only
   `<state dir>/tui.log` without writing to stderr from the raw-mode TUI.
@@ -119,6 +135,9 @@ and tests clean.
 - Add the notification channel to the `tokio::select!` loop; throttle redraws to
   ~30 fps (e.g. coalesce notifications, `Instant`-based min interval — note
   `std::time::Instant` is fine here).
+- In dashboard mode, poll the Panel pane's `#{window_active}` every 500 ms while a
+  selection is held or wanted; any key marks it visible immediately. Popup mode and
+  environments without `TMUX_PANE` are always visible.
 - `refresh_preview()` on selection change: if live client healthy →
   `preview.select(window_id)`; else existing capture path.
 - `render_preview()`: keep the rule line (window index:name header). Below it, if
@@ -139,7 +158,7 @@ and tests clean.
   2. j/k across agents → preview follows instantly; no flicker to blank.
   3. Jump (enter), reopen gw → previewed window rendered at full size again.
   4. Quit gw → `tmux ls` shows no `gw-preview-*` session; previewed window back to
-     normal size; `show-options -w -t <win> aggressive-resize` unset.
+     normal size; `show-options -w -t <win> window-size` unset.
   5. Kill gw with SIGKILL → nested client dies, session auto-destroyed
      (`destroy-unattached`).
   6. Break the live path (e.g. temporarily point the attach argv at a bogus binary)
