@@ -91,8 +91,9 @@ and tests clean.
 - `unset_window_size(window_id)` →
   `set-option -uw -t <window_id> window-size`; follow it with
   `resize-window -A -t <window_id>` on release.
-- `pane_window_active(pane_id)` →
-  `display-message -p -t <pane_id> '#{window_active}'`.
+- `panel_identity(pane_id)` → list all panes with session/window identity and select
+  the matching row outside `gw-preview-*`; `session_current_window(session_id)` →
+  `display-message -p -t <session_id> '#{window_id}'`.
 - `kill_session(name)`.
 - `stale_preview_sessions()` → list sessions named `gw-preview-<pid>` whose pid is
   no longer alive (for the startup sweep).
@@ -135,9 +136,11 @@ and tests clean.
 - Add the notification channel to the `tokio::select!` loop; throttle redraws to
   ~30 fps (e.g. coalesce notifications, `Instant`-based min interval — note
   `std::time::Instant` is fine here).
-- In dashboard mode, poll the Panel pane's `#{window_active}` every 500 ms while a
-  selection is held or wanted; any key marks it visible immediately. Popup mode and
-  environments without `TMUX_PANE` are always visible.
+- In dashboard mode, resolve the Panel's non-preview session id and window id before
+  creating the preview session, then poll that session's current `#{window_id}` every
+  500 ms while a selection is held or wanted; any key marks it visible immediately.
+  Startup identity failure, popup mode, and environments without `TMUX_PANE` are
+  always visible. Runtime poll failure logs and hides the Preview.
 - `refresh_preview()` on selection change: if live client healthy →
   `preview.select(window_id)`; else existing capture path.
 - `render_preview()`: keep the rule line (window index:name header). Below it, if

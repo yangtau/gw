@@ -25,6 +25,12 @@ pub struct PreviewWindowState {
     pub zoomed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelIdentity {
+    pub session_id: String,
+    pub window_id: String,
+}
+
 /// Panes of the current session (`list-panes -s`).
 pub fn list_panes() -> Result<Vec<Pane>> {
     let stdout = run_tmux(&[
@@ -181,18 +187,37 @@ pub fn preview_window_state(window_id: &str) -> Result<PreviewWindowState> {
     parse_preview_window_state(&run_tmux(&args)?)
 }
 
-pub fn pane_window_active(pane_id: &str) -> Result<bool> {
-    let args = pane_window_active_command(pane_id);
-    parse_flag(&run_tmux(&args)?, "window active flag")
+pub fn panel_identity(pane_id: &str) -> Result<PanelIdentity> {
+    let args = panel_identity_command();
+    parse_panel_identity(&run_tmux(&args)?, pane_id)
 }
 
-fn pane_window_active_command(pane_id: &str) -> Vec<OsString> {
+fn panel_identity_command() -> Vec<OsString> {
+    vec![
+        "list-panes".into(),
+        "-a".into(),
+        "-F".into(),
+        "#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}".into(),
+    ]
+}
+
+pub fn session_current_window(session_id: &str) -> Result<String> {
+    let args = session_current_window_command(session_id);
+    let window_id = run_tmux(&args)?;
+    let window_id = window_id.trim();
+    if window_id.is_empty() {
+        bail!("tmux returned an empty current window id");
+    }
+    Ok(window_id.to_owned())
+}
+
+fn session_current_window_command(session_id: &str) -> Vec<OsString> {
     vec![
         "display-message".into(),
         "-p".into(),
         "-t".into(),
-        pane_id.into(),
-        "#{window_active}".into(),
+        session_id.into(),
+        "#{window_id}".into(),
     ]
 }
 
@@ -320,6 +345,31 @@ fn parse_preview_window_state(stdout: &str) -> Result<PreviewWindowState> {
     Ok(PreviewWindowState { pane_count, zoomed })
 }
 
+fn parse_panel_identity(stdout: &str, pane_id: &str) -> Result<PanelIdentity> {
+    for line in stdout.lines() {
+        let mut fields = line.splitn(4, '\t');
+        let Some(session_name) = fields.next() else {
+            continue;
+        };
+        let Some(session_id) = fields.next() else {
+            continue;
+        };
+        let Some(window_id) = fields.next() else {
+            continue;
+        };
+        let Some(row_pane_id) = fields.next() else {
+            continue;
+        };
+        if row_pane_id == pane_id && !session_name.starts_with("gw-preview-") {
+            return Ok(PanelIdentity {
+                session_id: session_id.to_owned(),
+                window_id: window_id.to_owned(),
+            });
+        }
+    }
+    bail!("panel pane {pane_id} was not found outside preview sessions")
+}
+
 fn parse_flag(stdout: &str, name: &str) -> Result<bool> {
     match stdout.trim() {
         "0" => Ok(false),
@@ -445,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn constructs_manual_size_and_visibility_commands() {
+    fn constructs_manual_size_commands() {
         let pin = pin_window_size_command("@7", 120, 17)
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -454,18 +504,48 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let active = pane_window_active_command("%3")
+
+        assert_eq!(pin, ["resize-window", "-t", "@7", "-x", "120", "-y", "17"]);
+        assert_eq!(unset, ["set-option", "-uw", "-t", "@7", "window-size"]);
+    }
+
+    #[test]
+    fn resolves_panel_identity_outside_preview_sessions() {
+        let list = panel_identity_command()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let current = session_current_window_command("$1")
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(pin, ["resize-window", "-t", "@7", "-x", "120", "-y", "17"]);
-        assert_eq!(unset, ["set-option", "-uw", "-t", "@7", "window-size"]);
         assert_eq!(
-            active,
-            ["display-message", "-p", "-t", "%3", "#{window_active}"]
+            list,
+            [
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}",
+            ]
         );
-        assert!(parse_flag("1\n", "window active flag").unwrap());
-        assert!(!parse_flag("0\n", "window active flag").unwrap());
+        assert_eq!(
+            current,
+            ["display-message", "-p", "-t", "$1", "#{window_id}"]
+        );
+        assert_eq!(
+            parse_panel_identity(
+                "gw-preview-42\t$2\t@8\t%3\n\
+                 user\t$1\t@7\t%3\n\
+                 other\t$3\t@9\t%4\n",
+                "%3",
+            )
+            .unwrap(),
+            PanelIdentity {
+                session_id: "$1".into(),
+                window_id: "@7".into(),
+            }
+        );
+        assert!(parse_panel_identity("gw-preview-42\t$2\t@8\t%3\n", "%3").is_err());
     }
 }

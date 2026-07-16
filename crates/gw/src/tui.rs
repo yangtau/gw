@@ -70,14 +70,19 @@ enum Flow {
 
 enum PreviewVisibility {
     Always,
-    Polled { pane_id: String, visible: bool },
+    Polled {
+        session_id: String,
+        window_id: String,
+        visible: bool,
+    },
 }
 
 impl PreviewVisibility {
-    fn new(popup: bool, pane_id: Option<String>) -> Self {
-        match (popup, pane_id) {
-            (false, Some(pane_id)) => Self::Polled {
-                pane_id,
+    fn new(popup: bool, identity: Option<tmux::PanelIdentity>) -> Self {
+        match (popup, identity) {
+            (false, Some(identity)) => Self::Polled {
+                session_id: identity.session_id,
+                window_id: identity.window_id,
                 visible: false,
             },
             _ => Self::Always,
@@ -91,10 +96,14 @@ impl PreviewVisibility {
         }
     }
 
-    fn pane_id(&self) -> Option<&str> {
+    fn identity(&self) -> Option<(&str, &str)> {
         match self {
             Self::Always => None,
-            Self::Polled { pane_id, .. } => Some(pane_id),
+            Self::Polled {
+                session_id,
+                window_id,
+                ..
+            } => Some((session_id, window_id)),
         }
     }
 
@@ -135,8 +144,22 @@ impl App {
         store.sweep(Duration::days(RETENTION_DAYS))?;
         let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
         let exit_after_jump = tmux::inside_popup();
-        let preview_visibility =
-            PreviewVisibility::new(exit_after_jump, std::env::var("TMUX_PANE").ok());
+        let panel_identity = if exit_after_jump {
+            None
+        } else {
+            std::env::var("TMUX_PANE").ok().and_then(|pane_id| {
+                match tmux::panel_identity(&pane_id) {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        gw_core::tui_log::error(&format!(
+                            "live preview panel identity resolution failed: {error:#}"
+                        ));
+                        None
+                    }
+                }
+            })
+        };
+        let preview_visibility = PreviewVisibility::new(exit_after_jump, panel_identity);
         let preview_visible = preview_visibility.is_visible();
         let mut app = Self {
             store,
@@ -343,13 +366,20 @@ impl App {
     }
 
     fn poll_preview_visibility(&mut self) {
-        let Some(pane_id) = self.preview_visibility.pane_id() else {
+        let Some((session_id, window_id)) = self
+            .preview_visibility
+            .identity()
+            .map(|(session_id, window_id)| (session_id.to_owned(), window_id.to_owned()))
+        else {
             return;
         };
-        match tmux::pane_window_active(pane_id) {
-            Ok(visible) => self.set_preview_visible(visible),
+        match tmux::session_current_window(&session_id) {
+            Ok(current_window) => self.set_preview_visible(current_window == window_id),
             Err(error) => {
-                gw_core::tui_log::error(&format!("live preview visibility query failed: {error:#}"))
+                gw_core::tui_log::error(&format!(
+                    "live preview visibility query failed: {error:#}"
+                ));
+                self.set_preview_visible(false);
             }
         }
     }
@@ -990,7 +1020,11 @@ mod tests {
 
     #[test]
     fn gates_dashboard_preview_by_visibility() {
-        let mut popup = PreviewVisibility::new(true, Some("%1".into()));
+        let identity = || tmux::PanelIdentity {
+            session_id: "$1".into(),
+            window_id: "@7".into(),
+        };
+        let mut popup = PreviewVisibility::new(true, Some(identity()));
         assert!(popup.is_visible());
         assert!(!popup.should_poll(true));
         assert!(!popup.set_visible(false));
@@ -1000,10 +1034,11 @@ mod tests {
         assert!(no_pane.is_visible());
         assert!(!no_pane.should_poll(true));
 
-        let mut dashboard = PreviewVisibility::new(false, Some("%2".into()));
+        let mut dashboard = PreviewVisibility::new(false, Some(identity()));
         assert!(!dashboard.is_visible());
         assert!(!dashboard.should_poll(false));
         assert!(dashboard.should_poll(true));
+        assert_eq!(dashboard.identity(), Some(("$1", "@7")));
         assert!(dashboard.set_visible(true));
         assert!(dashboard.is_visible());
         assert!(!dashboard.set_visible(true));
