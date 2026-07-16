@@ -2,9 +2,9 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 
@@ -322,27 +322,40 @@ pub fn inside_popup() -> bool {
     matches!(std::env::var("GW_POPUP").as_deref(), Ok("1"))
 }
 
-pub const TMUX_BINARIES: [&str; 3] = ["tmux", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"];
+const TMUX_BINARIES: [&str; 3] = ["tmux", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"];
+
+pub fn binary() -> &'static str {
+    static BINARY: OnceLock<&'static str> = OnceLock::new();
+
+    BINARY.get_or_init(|| {
+        TMUX_BINARIES
+            .iter()
+            .copied()
+            .find(|candidate| {
+                Command::new(candidate)
+                    .arg("-V")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            })
+            .unwrap_or("tmux")
+    })
+}
 
 fn run_tmux(args: &[OsString]) -> Result<String> {
-    let mut not_found = None;
-    for bin in TMUX_BINARIES {
-        match Command::new(bin).args(args).output() {
-            Ok(output) => {
-                if !output.status.success() {
-                    bail!(
-                        "{bin} failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                return String::from_utf8(output.stdout).context("tmux output was not UTF-8");
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => not_found = Some(error),
-            Err(error) => return Err(error).with_context(|| format!("failed to run {bin}")),
-        }
+    let binary = binary();
+    let output = Command::new(binary)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {binary}"))?;
+    if !output.status.success() {
+        bail!(
+            "{binary} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    Err(not_found.expect("tmux candidates are non-empty"))
-        .context("tmux was not found on PATH or in common locations")
+    String::from_utf8(output.stdout).context("tmux output was not UTF-8")
 }
 
 fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {

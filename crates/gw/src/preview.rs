@@ -145,6 +145,65 @@ struct LiveClient {
     panel_size: PtySize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SizeStep {
+    Pty(u16, u16),
+    PinWindow { cols: u16, rows: u16 },
+}
+
+fn resize_steps(current: (u16, u16), target: (u16, u16)) -> [SizeStep; 3] {
+    let bridge = (current.0.max(target.0), current.1.max(target.1));
+    [
+        SizeStep::Pty(bridge.0, bridge.1),
+        SizeStep::PinWindow {
+            cols: target.0,
+            rows: target.1,
+        },
+        SizeStep::Pty(target.0, target.1),
+    ]
+}
+
+fn acquire_steps(panel: (u16, u16)) -> [SizeStep; 2] {
+    [
+        SizeStep::PinWindow {
+            cols: panel.0,
+            rows: panel.1,
+        },
+        SizeStep::Pty(panel.0, panel.1),
+    ]
+}
+
+fn park_steps() -> [SizeStep; 1] {
+    [SizeStep::Pty(PARKED_COLS, PARKED_ROWS)]
+}
+
+impl LiveClient {
+    fn execute_size_steps<const N: usize>(
+        &mut self,
+        window_id: &str,
+        steps: [SizeStep; N],
+        mut size_pinned_by_us: Option<&mut bool>,
+    ) -> Result<()> {
+        for step in steps {
+            match step {
+                SizeStep::Pty(cols, rows) => self
+                    .master
+                    .resize(pty_size(cols, rows))
+                    .with_context(|| format!("resize preview PTY to {cols}x{rows}"))?,
+                SizeStep::PinWindow { cols, rows } => {
+                    tmux::pin_window_size(window_id, cols, rows).with_context(|| {
+                        format!("pin preview window {window_id} to {cols}x{rows}")
+                    })?;
+                    if let Some(size_pinned_by_us) = size_pinned_by_us.as_mut() {
+                        **size_pinned_by_us = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn reduce_topology(
     visibility: &PreviewVisibility,
     selected_pane_id: Option<&str>,
@@ -424,16 +483,11 @@ impl Preview {
             parser.screen_mut().set_size(rows, cols);
             drop(parser);
             if let Some(selected) = &self.selected {
-                let bridge = pty_size(
-                    live.panel_size.cols.max(cols),
-                    live.panel_size.rows.max(rows),
-                );
-                live.master
-                    .resize(bridge)
-                    .context("grow preview PTY before window resize")?;
-                tmux::pin_window_size(&selected.window_id, cols, rows)
-                    .with_context(|| format!("resize preview window {}", selected.window_id))?;
-                live.master.resize(size).context("resize preview PTY")?;
+                live.execute_size_steps(
+                    &selected.window_id,
+                    resize_steps((live.panel_size.cols, live.panel_size.rows), (cols, rows)),
+                    None,
+                )?;
             }
             Ok(())
         })();
@@ -538,8 +592,7 @@ impl Preview {
         let State::Live(live) = &mut self.state else {
             return Err(anyhow!("preview client is not live"));
         };
-        live.master
-            .resize(parked_size())
+        live.execute_size_steps(&selected.window_id, park_steps(), None)
             .context("park preview PTY before selection release")?;
         release_selection(selected).context("restore previewed window")?;
         self.selected = None;
@@ -556,23 +609,11 @@ impl Preview {
             .try_clone_reader()
             .context("failed to clone preview PTY reader")?;
 
-        let mut last_error = None;
-        let mut child = None;
-        for binary in tmux::TMUX_BINARIES {
-            let command = attach_command(binary, &self.session);
-            match pair.slave.spawn_command(command) {
-                Ok(spawned) => {
-                    child = Some(spawned);
-                    break;
-                }
-                Err(error) => {
-                    last_error = Some(error.context(format!("spawn {binary} preview client")))
-                }
-            }
-        }
-        let child = child.ok_or_else(|| {
-            last_error.unwrap_or_else(|| anyhow!("tmux candidates are non-empty"))
-        })?;
+        let binary = tmux::binary();
+        let child = pair
+            .slave
+            .spawn_command(attach_command(binary, &self.session))
+            .with_context(|| format!("spawn {binary} preview client"))?;
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
@@ -676,20 +717,15 @@ fn acquire_selection(
             .with_context(|| format!("zoom preview pane {}", target.pane_id))?;
         selected.zoomed_by_us = true;
     }
-    tmux::pin_window_size(
-        &target.window_id,
-        live.panel_size.cols,
-        live.panel_size.rows,
-    )
-    .with_context(|| format!("pin preview window {} size", target.window_id))?;
-    selected.size_pinned_by_us = true;
-    let mut parser = live
-        .parser
+    let parser = Arc::clone(&live.parser);
+    let mut parser = parser
         .lock()
         .map_err(|_| anyhow!("preview parser lock was poisoned"))?;
-    live.master
-        .resize(live.panel_size)
-        .context("resize preview PTY to panel size")?;
+    live.execute_size_steps(
+        &target.window_id,
+        acquire_steps((live.panel_size.cols, live.panel_size.rows)),
+        Some(&mut selected.size_pinned_by_us),
+    )?;
     parser.process(b"\x1bc");
     Ok(())
 }
@@ -765,6 +801,25 @@ fn spawn_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply_size_plan(
+        mut pty: (u16, u16),
+        mut window: (u16, u16),
+        steps: impl IntoIterator<Item = SizeStep>,
+    ) -> ((u16, u16), (u16, u16)) {
+        assert!(pty.0 >= window.0 && pty.1 >= window.1);
+        for step in steps {
+            match step {
+                SizeStep::Pty(cols, rows) => pty = (cols, rows),
+                SizeStep::PinWindow { cols, rows } => window = (cols, rows),
+            }
+            assert!(
+                pty.0 >= window.0 && pty.1 >= window.1,
+                "PTY {pty:?} is smaller than window {window:?} after {step:?}"
+            );
+        }
+        (pty, window)
+    }
 
     fn topology_row(
         session_id: &str,
@@ -911,6 +966,66 @@ mod tests {
         assert_eq!(pane_direction(panel, geometry(20, 40)), Direction::Down);
         assert_eq!(pane_direction(panel, geometry(24, 22)), Direction::Right);
         assert_eq!(pane_direction(panel, panel), Direction::Right);
+    }
+
+    #[test]
+    fn resize_plans_keep_pty_at_least_as_large_as_window() {
+        let cases = [
+            ((80, 24), (120, 40), (120, 40)),
+            ((120, 40), (80, 24), (120, 40)),
+            ((80, 40), (120, 24), (120, 40)),
+            ((120, 24), (80, 40), (120, 40)),
+            ((80, 24), (80, 24), (80, 24)),
+        ];
+
+        for (current, target, bridge) in cases {
+            let steps = resize_steps(current, target);
+            assert_eq!(
+                steps,
+                [
+                    SizeStep::Pty(bridge.0, bridge.1),
+                    SizeStep::PinWindow {
+                        cols: target.0,
+                        rows: target.1,
+                    },
+                    SizeStep::Pty(target.0, target.1),
+                ]
+            );
+            assert_eq!(apply_size_plan(current, current, steps), (target, target));
+        }
+    }
+
+    #[test]
+    fn acquire_plan_pins_before_shrinking_parked_pty() {
+        let panel = (120, 40);
+        let steps = acquire_steps(panel);
+
+        assert_eq!(
+            steps,
+            [
+                SizeStep::PinWindow {
+                    cols: panel.0,
+                    rows: panel.1,
+                },
+                SizeStep::Pty(panel.0, panel.1),
+            ]
+        );
+        assert_eq!(
+            apply_size_plan((PARKED_COLS, PARKED_ROWS), (200, 60), steps),
+            (panel, panel)
+        );
+    }
+
+    #[test]
+    fn park_plan_grows_pty_without_changing_window() {
+        let window = (80, 24);
+        let steps = park_steps();
+
+        assert_eq!(steps, [SizeStep::Pty(PARKED_COLS, PARKED_ROWS)]);
+        assert_eq!(
+            apply_size_plan(window, window, steps),
+            ((PARKED_COLS, PARKED_ROWS), window)
+        );
     }
 
     #[test]
