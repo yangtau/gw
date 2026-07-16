@@ -32,11 +32,10 @@ use ratatui::Frame;
 use tui_term::widget::{Cursor, PseudoTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::preview::Preview;
+use crate::preview::{Direction, Preview, PreviewContent, PreviewVisibility};
 
 const STALE_AFTER_MINUTES: i64 = 30;
 const RETENTION_DAYS: i64 = 7;
-const PREVIEW_LINES: u32 = 50;
 const PREVIEW_FRAME_INTERVAL: StdDuration = StdDuration::from_millis(33);
 const MIN_PREVIEW_TERM_HEIGHT: u16 = 16;
 const MARKER_W: usize = 3;
@@ -69,161 +68,49 @@ enum Flow {
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
+#[derive(Clone, Copy)]
+struct FrameLayout {
+    banner: Rect,
+    main: Rect,
+    preview: Rect,
+    footer: Rect,
 }
 
-enum PreviewVisibility {
-    Always,
-    Polled { pane_id: String },
-}
-
-impl PreviewVisibility {
-    fn new(popup: bool, identity: Option<tmux::PanelIdentity>) -> Self {
-        match (popup, identity) {
-            (false, Some(identity)) => Self::Polled {
-                pane_id: identity.pane_id,
-            },
-            _ => Self::Always,
-        }
-    }
-
-    fn pane_id(&self) -> Option<&str> {
-        match self {
-            Self::Always => None,
-            Self::Polled { pane_id } => Some(pane_id),
-        }
-    }
-
-    fn is_always(&self) -> bool {
-        matches!(self, Self::Always)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PanelTopology {
-    session_id: String,
-    window_id: String,
-    visible: bool,
-    geometry: tmux::PaneGeometry,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AgentTopology {
-    pane_id: String,
-    window_id: String,
-    window_panes: u32,
-    window_index: u32,
-    window_name: String,
-    geometry: tmux::PaneGeometry,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PreviewTopology {
-    panel: Option<PanelTopology>,
-    agent: Option<AgentTopology>,
-    visible: bool,
-    colocated: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TopologyAction {
-    Clear,
-    Placard(Direction),
-    Live {
-        agent: AgentTopology,
-        visible: bool,
-        reacquire: bool,
-    },
-}
-
-fn panel_topology(
-    visibility: &PreviewVisibility,
-    rows: &[tmux::TopologyRow],
-) -> Option<PanelTopology> {
-    let pane_id = visibility.pane_id()?;
-    let row = rows
-        .iter()
-        .filter(|row| row.pane_id == pane_id)
-        .max_by_key(|row| (row.session_attached, row.window_active))?;
-    Some(PanelTopology {
-        session_id: row.session_id.clone(),
-        window_id: row.window_id.clone(),
-        visible: row.window_active && row.session_attached,
-        geometry: row.geometry,
-    })
-}
-
-fn reduce_topology(
-    visibility: &PreviewVisibility,
-    selected_pane_id: Option<&str>,
-    rows: &[tmux::TopologyRow],
-    previous: Option<&PreviewTopology>,
-) -> (PreviewTopology, TopologyAction) {
-    let panel = panel_topology(visibility, rows);
-    let preferred_session = panel.as_ref().map(|panel| panel.session_id.as_str());
-    let agent = selected_pane_id.and_then(|pane_id| {
-        let mut candidates = rows.iter().filter(|row| row.pane_id == pane_id);
-        let first = candidates.next()?;
-        let row = preferred_session
-            .and_then(|session_id| {
-                std::iter::once(first)
-                    .chain(candidates)
-                    .find(|row| row.session_id == session_id)
-            })
-            .unwrap_or(first);
-        Some(AgentTopology {
-            pane_id: row.pane_id.clone(),
-            window_id: row.window_id.clone(),
-            window_panes: row.window_panes,
-            window_index: row.window_index,
-            window_name: row.window_name.clone(),
-            geometry: row.geometry,
-        })
-    });
-    let visible = if visibility.is_always() {
-        true
+fn frame_layout(area: Rect, view: &View, show_banner: bool) -> FrameLayout {
+    let banner_height = u16::from(show_banner);
+    let preview_height = if matches!(view, View::Ended) || area.height < MIN_PREVIEW_TERM_HEIGHT {
+        Constraint::Length(0)
     } else {
-        panel.as_ref().is_some_and(|panel| panel.visible)
+        Constraint::Percentage(40)
     };
-    let colocated = !visibility.is_always()
-        && panel
-            .as_ref()
-            .zip(agent.as_ref())
-            .is_some_and(|(panel, agent)| panel.window_id == agent.window_id);
-    let topology = PreviewTopology {
-        panel,
-        agent,
-        visible,
-        colocated,
-    };
-    let action = match topology.agent.as_ref() {
-        None => TopologyAction::Clear,
-        Some(agent) if topology.colocated => {
-            let panel = topology.panel.as_ref().expect("colocated panel exists");
-            TopologyAction::Placard(pane_direction(panel.geometry, agent.geometry))
-        }
-        Some(agent) => {
-            let reacquire = previous.is_none_or(|previous| {
-                previous.colocated
-                    || previous.agent.as_ref().is_none_or(|old| {
-                        old.pane_id != agent.pane_id
-                            || old.window_id != agent.window_id
-                            || old.window_panes != agent.window_panes
-                    })
-            });
-            TopologyAction::Live {
-                agent: agent.clone(),
-                visible,
-                reacquire,
-            }
-        }
-    };
-    (topology, action)
+    let [banner, main, preview, footer] = Layout::vertical([
+        Constraint::Length(banner_height),
+        Constraint::Min(5),
+        preview_height,
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    FrameLayout {
+        banner,
+        main,
+        preview,
+        footer,
+    }
+}
+
+fn preview_viewport(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    )
+}
+
+fn preview_terminal(area: Rect) -> Rect {
+    Block::new()
+        .borders(Borders::ALL)
+        .inner(preview_viewport(area))
 }
 
 struct App {
@@ -233,13 +120,10 @@ struct App {
     view: View,
     selected: usize,
     picker: Option<usize>,
-    snapshot_preview: String,
-    preview_direction: Option<Direction>,
     epoch: Instant,
-    live_preview: Preview,
+    preview: Preview,
     preview_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-    preview_visibility: PreviewVisibility,
-    preview_topology: Option<PreviewTopology>,
+    panel_pane_id: Option<String>,
     fallback_session_id: Option<String>,
     exit_after_jump: bool,
 }
@@ -250,16 +134,13 @@ impl App {
         store.sweep(Duration::days(RETENTION_DAYS))?;
         let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
         let exit_after_jump = tmux::inside_popup();
-        let panel_identity = if exit_after_jump {
+        let panel_pane_id = if exit_after_jump {
             None
         } else {
-            std::env::var("TMUX_PANE")
-                .ok()
-                .map(|pane_id| tmux::PanelIdentity { pane_id })
+            std::env::var("TMUX_PANE").ok()
         };
-        let preview_visibility = PreviewVisibility::new(exit_after_jump, panel_identity);
-        let preview_visible = preview_visibility.is_always();
-        let fallback_session_id = if preview_visibility.is_always() {
+        let preview_visibility = PreviewVisibility::new(exit_after_jump, panel_pane_id.clone());
+        let fallback_session_id = if panel_pane_id.is_none() {
             Some(tmux::current_session_id()?)
         } else {
             None
@@ -275,13 +156,10 @@ impl App {
             view: View::Agents,
             selected: 0,
             picker: None,
-            snapshot_preview: String::new(),
-            preview_direction: None,
             epoch: Instant::now(),
-            live_preview: Preview::new(preview_tx, preview_visible),
+            preview: Preview::new(preview_tx, preview_visibility),
             preview_rx,
-            preview_visibility,
-            preview_topology: None,
+            panel_pane_id,
             fallback_session_id,
             exit_after_jump,
         };
@@ -305,11 +183,16 @@ impl App {
         let mut pulse_tick = tokio::time::interval(PULSE_TICK);
         pulse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let size = terminal.size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            let layout = frame_layout(area, &self.view, !self.snapshot.uninstrumented.is_empty());
+            let preview = preview_terminal(layout.preview);
+            self.preview.set_size(preview.width, preview.height);
             terminal.draw(|f| self.render(f))?;
             let last_draw = Instant::now();
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
-                _ = pulse_tick.tick(), if self.preview_direction.is_some() => {}
+                _ = pulse_tick.tick(), if matches!(self.preview.view().content, PreviewContent::Placard(_)) => {}
                 _ = topology_tick.tick(), if self.selected_agent().is_some() => {
                     self.topology_tick();
                 }
@@ -319,17 +202,13 @@ impl App {
                 }
                 Some(_) = self.preview_rx.recv() => {
                     while self.preview_rx.try_recv().is_ok() {}
-                    if self.live_preview.sync_health() {
-                        self.capture_preview();
-                    }
+                    self.preview.sync();
                     let wait = PREVIEW_FRAME_INTERVAL.saturating_sub(last_draw.elapsed());
                     if !wait.is_zero() {
                         tokio::time::sleep(wait).await;
                     }
                     while self.preview_rx.try_recv().is_ok() {}
-                    if self.live_preview.sync_health() {
-                        self.capture_preview();
-                    }
+                    self.preview.sync();
                 }
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
@@ -349,12 +228,16 @@ impl App {
             Ok(topology) => topology,
             Err(error) => {
                 gw_core::tui_log::error(&format!("topology snapshot failed: {error:#}"));
-                self.apply_topology(&[]);
+                let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
+                self.preview.tick(&[], selected_pane_id.as_deref());
                 return;
             }
         };
         let now = Utc::now();
-        let session_id = panel_topology(&self.preview_visibility, &topology)
+        let session_id = self
+            .panel_pane_id
+            .as_deref()
+            .and_then(|pane_id| tmux::locate_panel(pane_id, &topology))
             .map(|panel| panel.session_id)
             .or_else(|| self.fallback_session_id.clone());
         if let Some(session_id) = session_id {
@@ -371,7 +254,8 @@ impl App {
             }
         }
         self.selected = self.selected.min(self.row_count().saturating_sub(1));
-        self.apply_topology(&topology);
+        let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
+        self.preview.tick(&topology, selected_pane_id.as_deref());
     }
 
     fn row_count(&self) -> usize {
@@ -467,59 +351,16 @@ impl App {
 
     fn topology_tick(&mut self) {
         match tmux::observe_topology() {
-            Ok(topology) => self.apply_topology(&topology),
+            Ok(topology) => {
+                let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
+                self.preview.tick(&topology, selected_pane_id.as_deref());
+            }
             Err(error) => {
                 gw_core::tui_log::error(&format!("topology snapshot failed: {error:#}"));
-                self.apply_topology(&[]);
+                let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
+                self.preview.tick(&[], selected_pane_id.as_deref());
             }
         }
-    }
-
-    fn apply_topology(&mut self, rows: &[tmux::TopologyRow]) {
-        let selected_pane_id = self.selected_agent().map(|agent| agent.pane.id.clone());
-        let (topology, action) = reduce_topology(
-            &self.preview_visibility,
-            selected_pane_id.as_deref(),
-            rows,
-            self.preview_topology.as_ref(),
-        );
-        self.preview_topology = Some(topology);
-        match action {
-            TopologyAction::Clear => {
-                self.live_preview.deselect();
-                self.snapshot_preview.clear();
-                self.preview_direction = None;
-            }
-            TopologyAction::Placard(direction) => {
-                self.live_preview.deselect();
-                self.snapshot_preview.clear();
-                self.preview_direction = Some(direction);
-            }
-            TopologyAction::Live {
-                agent,
-                visible,
-                reacquire,
-            } => {
-                self.preview_direction = None;
-                if reacquire {
-                    self.live_preview.deselect();
-                }
-                self.live_preview.set_visible(visible);
-                if !self.live_preview.select(&agent.window_id, &agent.pane_id) && visible {
-                    self.snapshot_preview =
-                        tmux::capture(&agent.pane_id, PREVIEW_LINES).unwrap_or_default();
-                }
-            }
-        }
-    }
-
-    fn capture_preview(&mut self) {
-        self.snapshot_preview = self
-            .preview_topology
-            .as_ref()
-            .and_then(|topology| topology.agent.as_ref())
-            .and_then(|agent| tmux::capture(&agent.pane_id, PREVIEW_LINES).ok())
-            .unwrap_or_default();
     }
 
     fn activate(&mut self) -> Result<Flow> {
@@ -554,7 +395,7 @@ impl App {
     }
 
     fn jump(&mut self, pane_id: &str) -> Result<Flow> {
-        self.live_preview.deselect();
+        self.preview.tick(&[], None);
         tmux::focus(pane_id)?;
         if self.exit_after_jump {
             return Ok(Flow::Quit);
@@ -563,43 +404,27 @@ impl App {
         Ok(Flow::Refreshed)
     }
 
-    fn render(&mut self, frame: &mut Frame) {
-        let banner_height = if self.snapshot.uninstrumented.is_empty() {
-            0
-        } else {
-            1
-        };
-        let preview_height =
-            if matches!(self.view, View::Ended) || frame.area().height < MIN_PREVIEW_TERM_HEIGHT {
-                Constraint::Length(0)
-            } else {
-                Constraint::Percentage(40)
-            };
-        let [banner, main, preview, footer] = Layout::vertical([
-            Constraint::Length(banner_height),
-            Constraint::Min(5),
-            preview_height,
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+    fn render(&self, frame: &mut Frame) {
+        let show_banner = !self.snapshot.uninstrumented.is_empty();
+        let layout = frame_layout(frame.area(), &self.view, show_banner);
 
-        if banner_height > 0 {
+        if show_banner {
             let msg = format!(
                 " hooks not installed for {} — run `gw setup`",
                 self.snapshot.uninstrumented.join(", ")
             );
             frame.render_widget(
                 Paragraph::new(msg).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
-                banner,
+                layout.banner,
             );
         }
 
         match self.view {
-            View::Agents => self.render_agents(frame, main),
-            View::Ended => self.render_ended(frame, main),
+            View::Agents => self.render_agents(frame, layout.main),
+            View::Ended => self.render_ended(frame, layout.main),
         }
-        self.render_preview(frame, preview);
-        self.render_footer(frame, footer);
+        self.render_preview(frame, layout.preview);
+        self.render_footer(frame, layout.footer);
         if self.picker.is_some() {
             self.render_picker(frame);
         }
@@ -746,23 +571,15 @@ impl App {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_preview(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_preview(&self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
-            self.live_preview.deselect();
             return;
         }
-        let Some(topology) = self.preview_topology.as_ref() else {
+        let view = self.preview.view();
+        let Some(title) = view.title else {
             return;
         };
-        let Some(agent) = topology.agent.clone() else {
-            return;
-        };
-        let viewport = Rect::new(
-            area.x.saturating_add(1),
-            area.y,
-            area.width.saturating_sub(2),
-            area.height,
-        );
+        let viewport = preview_viewport(area);
         let frame_style = Style::new().fg(Color::DarkGray).dim();
         let block = Block::new()
             .borders(Borders::ALL)
@@ -771,12 +588,13 @@ impl App {
             .title_style(frame_style)
             .title_alignment(Alignment::Left)
             .title_position(TitlePosition::Top)
-            .title(format!(" {}:{} ", agent.window_index, agent.window_name));
-        let terminal = block.inner(viewport);
+            .title(format!(" {title} "));
+        let terminal = preview_terminal(area);
         frame.render_widget(block, viewport);
 
-        if topology.colocated {
-            if let Some(direction) = self.preview_direction {
+        match view.content {
+            PreviewContent::Empty => {}
+            PreviewContent::Placard(direction) => {
                 let accent = self
                     .selected_agent()
                     .and_then(|agent| self.plugin(&agent.provider))
@@ -798,33 +616,24 @@ impl App {
                     );
                 }
             }
-            return;
+            PreviewContent::Live(parser) => {
+                let parser = parser.lock().unwrap_or_else(|error| error.into_inner());
+                frame.render_widget(
+                    PseudoTerminal::new(parser.screen())
+                        .cursor(Cursor::default().visibility(false)),
+                    terminal,
+                );
+            }
+            PreviewContent::Snapshot(snapshot) => {
+                let all: Vec<&str> = snapshot.lines().collect();
+                let visible = terminal.height as usize;
+                let lines = all[all.len().saturating_sub(visible)..]
+                    .iter()
+                    .map(|line| Line::styled(*line, Style::new().dim()))
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(lines), terminal);
+            }
         }
-
-        if self.live_preview.sync_health() {
-            self.capture_preview();
-        }
-        let was_live = self.live_preview.is_live();
-        let resized_live = self.live_preview.resize(terminal.width, terminal.height);
-        if was_live && !resized_live {
-            self.capture_preview();
-        }
-        if let Some(parser) = self.live_preview.parser() {
-            let parser = parser.lock().unwrap_or_else(|error| error.into_inner());
-            frame.render_widget(
-                PseudoTerminal::new(parser.screen()).cursor(Cursor::default().visibility(false)),
-                terminal,
-            );
-            return;
-        }
-
-        let all: Vec<&str> = self.snapshot_preview.lines().collect();
-        let visible = terminal.height as usize;
-        let lines = all[all.len().saturating_sub(visible)..]
-            .iter()
-            .map(|line| Line::styled(*line, Style::new().dim()))
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(lines), terminal);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -1162,30 +971,6 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
     mid
 }
 
-fn pane_direction(panel: tmux::PaneGeometry, agent: tmux::PaneGeometry) -> Direction {
-    let center = |pane: tmux::PaneGeometry| {
-        (
-            pane.left as i64 * 2 + pane.cols as i64,
-            pane.top as i64 * 2 + pane.rows as i64,
-        )
-    };
-    let (panel_x, panel_y) = center(panel);
-    let (agent_x, agent_y) = center(agent);
-    let dx = agent_x - panel_x;
-    let dy = agent_y - panel_y;
-    if dx.abs() >= dy.abs() * 2 {
-        if dx < 0 {
-            Direction::Left
-        } else {
-            Direction::Right
-        }
-    } else if dy < 0 {
-        Direction::Up
-    } else {
-        Direction::Down
-    }
-}
-
 const PULSE_TICK: StdDuration = StdDuration::from_millis(90);
 const PULSE_TAIL: u64 = 3;
 const RAIL_MAX: usize = 5;
@@ -1321,162 +1106,6 @@ fn edge_bar(direction: Direction, viewport: Rect) -> Option<(Rect, Vec<Line<'sta
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
-
-    fn topology_row(
-        session_id: &str,
-        window_id: &str,
-        window_active: bool,
-        pane_id: &str,
-        left: u32,
-        top: u32,
-        window_panes: u32,
-    ) -> tmux::TopologyRow {
-        tmux::TopologyRow {
-            session_name: session_id.trim_start_matches('$').into(),
-            session_id: session_id.into(),
-            window_id: window_id.into(),
-            window_active,
-            session_attached: true,
-            pane_id: pane_id.into(),
-            pane_pid: 100,
-            pane_tty: "ttys001".into(),
-            pane_current_path: "/work".into(),
-            window_index: 1,
-            window_name: "agent".into(),
-            geometry: tmux::PaneGeometry {
-                left,
-                top,
-                cols: 20,
-                rows: 10,
-            },
-            window_panes,
-        }
-    }
-
-    fn live_action(action: TopologyAction) -> (String, bool, bool) {
-        match action {
-            TopologyAction::Live {
-                agent,
-                visible,
-                reacquire,
-            } => (agent.window_id, visible, reacquire),
-            action => panic!("expected live action, got {action:?}"),
-        }
-    }
-
-    #[test]
-    fn reduces_topology_changes_from_fresh_rows() {
-        let dashboard = PreviewVisibility::new(
-            false,
-            Some(tmux::PanelIdentity {
-                pane_id: "%panel".into(),
-            }),
-        );
-        let base = vec![
-            topology_row("$1", "@panel", true, "%panel", 0, 0, 1),
-            topology_row("$1", "@agent", false, "%agent", 40, 0, 1),
-        ];
-        let (initial, action) = reduce_topology(&dashboard, Some("%agent"), &base, None);
-        assert_eq!(live_action(action), ("@agent".into(), true, true));
-
-        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &base, Some(&initial));
-        assert_eq!(live_action(action), ("@agent".into(), true, false));
-
-        let hidden = vec![
-            topology_row("$1", "@panel", false, "%panel", 0, 0, 1),
-            base[1].clone(),
-        ];
-        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &hidden, Some(&initial));
-        assert_eq!(live_action(action), ("@agent".into(), false, false));
-
-        let mut detached_panel = topology_row("$1", "@panel", true, "%panel", 0, 0, 1);
-        detached_panel.session_attached = false;
-        let detached = vec![detached_panel, base[1].clone()];
-        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &detached, Some(&initial));
-        assert_eq!(live_action(action), ("@agent".into(), false, false));
-
-        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &base[1..], Some(&initial));
-        assert_eq!(live_action(action), ("@agent".into(), false, false));
-
-        let (gone, action) =
-            reduce_topology(&dashboard, Some("%agent"), &base[..1], Some(&initial));
-        assert_eq!(action, TopologyAction::Clear);
-        assert!(gone.agent.is_none());
-
-        let moved_agent = vec![
-            base[0].clone(),
-            topology_row("$1", "@other", false, "%agent", 40, 0, 1),
-        ];
-        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &moved_agent, Some(&initial));
-        assert_eq!(live_action(action), ("@other".into(), true, true));
-
-        let more_panes = vec![
-            base[0].clone(),
-            topology_row("$1", "@agent", false, "%agent", 40, 0, 2),
-        ];
-        let (_, action) = reduce_topology(&dashboard, Some("%agent"), &more_panes, Some(&initial));
-        assert_eq!(live_action(action), ("@agent".into(), true, true));
-
-        let colocated = vec![
-            topology_row("$1", "@shared", true, "%panel", 0, 0, 2),
-            topology_row("$1", "@shared", true, "%agent", 40, 0, 2),
-        ];
-        let (placard, action) =
-            reduce_topology(&dashboard, Some("%agent"), &colocated, Some(&initial));
-        assert_eq!(action, TopologyAction::Placard(Direction::Right));
-
-        let shifted_placard = vec![
-            topology_row("$1", "@shared", true, "%panel", 0, 0, 2),
-            topology_row("$1", "@shared", true, "%agent", 0, 30, 2),
-        ];
-        let (_, action) =
-            reduce_topology(&dashboard, Some("%agent"), &shifted_placard, Some(&placard));
-        assert_eq!(action, TopologyAction::Placard(Direction::Down));
-
-        let moved_out = vec![
-            topology_row("$2", "@panel2", true, "%panel", 0, 0, 1),
-            topology_row("$2", "@agent2", false, "%agent", 0, 30, 1),
-        ];
-        let (moved, action) =
-            reduce_topology(&dashboard, Some("%agent"), &moved_out, Some(&placard));
-        assert_eq!(live_action(action), ("@agent2".into(), true, true));
-        assert_eq!(moved.panel.as_ref().unwrap().session_id, "$2");
-
-        let popup = PreviewVisibility::new(true, None);
-        let (_, action) = reduce_topology(&popup, Some("%agent"), &colocated, None);
-        assert_eq!(live_action(action), ("@shared".into(), true, true));
-
-        let mut old_panel = topology_row("$1", "@old", true, "%panel", 0, 0, 1);
-        old_panel.session_attached = false;
-        let grouped_panel = vec![
-            old_panel,
-            topology_row("$2", "@fresh", false, "%panel", 0, 0, 1),
-        ];
-        assert_eq!(
-            panel_topology(&dashboard, &grouped_panel)
-                .unwrap()
-                .session_id,
-            "$2"
-        );
-    }
-
-    #[test]
-    fn points_from_panel_center_toward_agent_center() {
-        let geometry = |left, top| tmux::PaneGeometry {
-            left,
-            top,
-            cols: 10,
-            rows: 10,
-        };
-        let panel = geometry(20, 20);
-
-        assert_eq!(pane_direction(panel, geometry(40, 20)), Direction::Right);
-        assert_eq!(pane_direction(panel, geometry(0, 20)), Direction::Left);
-        assert_eq!(pane_direction(panel, geometry(20, 0)), Direction::Up);
-        assert_eq!(pane_direction(panel, geometry(20, 40)), Direction::Down);
-        assert_eq!(pane_direction(panel, geometry(24, 22)), Direction::Right);
-        assert_eq!(pane_direction(panel, panel), Direction::Right);
-    }
 
     #[test]
     fn pulse_comet_travels_toward_the_tip_and_fades_behind() {

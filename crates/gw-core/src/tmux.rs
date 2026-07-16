@@ -26,11 +26,6 @@ pub struct PreviewWindowState {
     pub zoomed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PanelIdentity {
-    pub pane_id: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneGeometry {
     pub left: u32,
@@ -56,6 +51,14 @@ pub struct TopologyRow {
     pub window_panes: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelLocation {
+    pub session_id: String,
+    pub window_id: String,
+    pub visible: bool,
+    pub geometry: PaneGeometry,
+}
+
 impl TopologyRow {
     pub fn pane(&self) -> Pane {
         Pane {
@@ -68,6 +71,19 @@ impl TopologyRow {
             window_name: self.window_name.clone(),
         }
     }
+}
+
+pub fn locate_panel(pane_id: &str, rows: &[TopologyRow]) -> Option<PanelLocation> {
+    let row = rows
+        .iter()
+        .filter(|row| row.pane_id == pane_id)
+        .max_by_key(|row| (row.session_attached, row.window_active))?;
+    Some(PanelLocation {
+        session_id: row.session_id.clone(),
+        window_id: row.window_id.clone(),
+        visible: row.window_active && row.session_attached,
+        geometry: row.geometry,
+    })
 }
 
 /// Panes across non-preview sessions, deduplicated by pane id.
@@ -503,6 +519,38 @@ mod tests {
         assert_eq!(rows[0].geometry.rows, 24);
         assert_eq!(rows[0].window_panes, 3);
         assert!(!rows[1].window_active);
+    }
+
+    #[test]
+    fn locates_panel_in_the_attached_active_group_row() {
+        let rows = parse_topology(
+            "old\t$1\t@old\t1\t0\t%panel\t123\tttys001\t/tmp\t1\told\t0\t0\t80\t24\t1\n\
+             attached\t$2\t@attached\t0\t1\t%panel\t123\tttys001\t/tmp\t2\tattached\t4\t6\t90\t30\t1\n\
+             visible\t$3\t@visible\t1\t1\t%panel\t123\tttys001\t/tmp\t3\tvisible\t8\t10\t100\t40\t1\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            locate_panel("%panel", &rows[..2])
+                .as_ref()
+                .map(|panel| (panel.window_id.as_str(), panel.visible)),
+            Some(("@attached", false))
+        );
+        assert_eq!(
+            locate_panel("%panel", &rows),
+            Some(PanelLocation {
+                session_id: "$3".into(),
+                window_id: "@visible".into(),
+                visible: true,
+                geometry: PaneGeometry {
+                    left: 8,
+                    top: 10,
+                    cols: 100,
+                    rows: 40,
+                },
+            })
+        );
+        assert_eq!(locate_panel("%missing", &rows), None);
     }
 
     #[test]
