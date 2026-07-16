@@ -262,7 +262,7 @@ impl App {
             .map(|agent| (agent.pane.id.clone(), agent.pane.window_id.clone()));
         match selected {
             Some((pane_id, window_id)) => {
-                if !self.live_preview.select(&window_id) {
+                if !self.live_preview.select(&window_id, &pane_id) {
                     self.snapshot_preview =
                         tmux::capture(&pane_id, PREVIEW_LINES).unwrap_or_default();
                 }
@@ -313,6 +313,7 @@ impl App {
     }
 
     fn jump(&mut self, pane_id: &str) -> Result<Flow> {
+        self.live_preview.deselect();
         tmux::focus(pane_id)?;
         if self.exit_after_jump {
             return Ok(Flow::Quit);
@@ -512,12 +513,13 @@ impl App {
         let width = area.width as usize;
         let selected = self.selected_agent().map(|agent| {
             (
+                agent.pane.id.clone(),
                 agent.pane.window_id.clone(),
                 agent.pane.window_index,
                 agent.pane.window_name.clone(),
             )
         });
-        let Some((window_id, window_index, window_name)) = selected else {
+        let Some((pane_id, window_id, window_index, window_name)) = selected else {
             self.live_preview.deselect();
             return;
         };
@@ -539,7 +541,7 @@ impl App {
             self.capture_preview();
         }
         let was_live = self.live_preview.is_live();
-        let selected_live = self.live_preview.select(&window_id);
+        let selected_live = self.live_preview.select(&window_id, &pane_id);
         let resized_live = self.live_preview.resize(terminal.width, terminal.height);
         if was_live && !(selected_live && resized_live) {
             self.capture_preview();

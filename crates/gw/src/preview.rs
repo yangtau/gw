@@ -10,8 +10,25 @@ use tokio::sync::mpsc::UnboundedSender;
 pub struct Preview {
     session: String,
     state: State,
-    selected: Option<String>,
+    selected: Option<Selection>,
     notifications: UnboundedSender<()>,
+}
+
+#[derive(Clone)]
+struct Selection {
+    window_id: String,
+    pane_id: String,
+    zoomed_by_us: bool,
+}
+
+impl Selection {
+    fn new(window_id: &str, pane_id: &str) -> Self {
+        Self {
+            window_id: window_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            zoomed_by_us: false,
+        }
+    }
 }
 
 enum State {
@@ -38,30 +55,45 @@ impl Preview {
         }
     }
 
-    pub fn select(&mut self, window_id: &str) -> bool {
+    pub fn select(&mut self, window_id: &str, pane_id: &str) -> bool {
         self.sync_health();
         if matches!(self.state, State::Dead) {
             return false;
         }
-        if self.selected.as_deref() == Some(window_id) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected.window_id == window_id && selected.pane_id == pane_id)
+        {
             return self.is_live();
         }
         if matches!(self.state, State::Uninitialized) {
-            self.selected = Some(window_id.to_owned());
+            self.selected = Some(Selection::new(window_id, pane_id));
             return false;
         }
 
         let result: Result<()> = (|| {
             if let Some(previous) = self.selected.clone() {
-                release_window(&previous)
-                    .with_context(|| format!("release previous preview window {previous}"))?;
+                release_selection(&previous).with_context(|| {
+                    format!("release previous preview window {}", previous.window_id)
+                })?;
                 self.selected = None;
             }
             tmux::set_window_aggressive_resize(window_id, true)
                 .with_context(|| format!("enable preview resize for window {window_id}"))?;
-            self.selected = Some(window_id.to_owned());
+            self.selected = Some(Selection::new(window_id, pane_id));
             tmux::preview_select_window(&self.session, window_id)
                 .with_context(|| format!("select preview window {window_id}"))?;
+            let window = tmux::preview_window_state(window_id)
+                .with_context(|| format!("query preview window {window_id}"))?;
+            if window.pane_count > 1 && !window.zoomed {
+                tmux::toggle_pane_zoom(pane_id)
+                    .with_context(|| format!("zoom preview pane {pane_id}"))?;
+                self.selected
+                    .as_mut()
+                    .expect("preview selection was set")
+                    .zoomed_by_us = true;
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -72,11 +104,11 @@ impl Preview {
     }
 
     pub fn deselect(&mut self) {
-        let Some(window_id) = self.selected.clone() else {
+        let Some(selected) = self.selected.clone() else {
             return;
         };
         if matches!(self.state, State::Live(_)) {
-            if let Err(error) = release_window(&window_id) {
+            if let Err(error) = release_selection(&selected) {
                 tui_log::error(&format!("live preview deselect failed: {error:#}"));
                 self.fail();
                 return;
@@ -177,8 +209,8 @@ impl Preview {
             }
         };
         self.state = State::Live(live);
-        if let Some(window_id) = self.selected.take() {
-            self.select(&window_id);
+        if let Some(selected) = self.selected.take() {
+            self.select(&selected.window_id, &selected.pane_id);
         }
     }
 
@@ -229,8 +261,10 @@ impl Preview {
     }
 
     fn fail(&mut self) {
-        if let Some(window_id) = self.selected.take() {
-            let _ = release_window(&window_id);
+        if let Some(selected) = self.selected.take() {
+            if let Err(error) = release_selection(&selected) {
+                tui_log::error(&format!("live preview release failed: {error:#}"));
+            }
         }
         if let State::Live(live) = &self.state {
             live.alive.store(false, Ordering::Release);
@@ -264,8 +298,10 @@ fn attach_command(binary: &str, session: &str) -> CommandBuilder {
 impl Drop for Preview {
     fn drop(&mut self) {
         if let State::Live(live) = &self.state {
-            if let Some(window_id) = self.selected.take() {
-                let _ = release_window(&window_id);
+            if let Some(selected) = self.selected.take() {
+                if let Err(error) = release_selection(&selected) {
+                    tui_log::error(&format!("live preview release failed: {error:#}"));
+                }
             }
             live.alive.store(false, Ordering::Release);
             let _ = tmux::kill_session(&self.session);
@@ -282,9 +318,24 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-fn release_window(window_id: &str) -> Result<()> {
-    tmux::set_window_aggressive_resize(window_id, false)?;
-    let _ = tmux::resize_window_to_available(window_id);
+fn release_selection(selected: &Selection) -> Result<()> {
+    if selected.zoomed_by_us {
+        match tmux::preview_window_state(&selected.window_id) {
+            Ok(window) if window.zoomed => {
+                if let Err(error) = tmux::toggle_pane_zoom(&selected.pane_id) {
+                    tui_log::error(&format!("live preview zoom restore failed: {error:#}"));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tui_log::error(&format!("live preview zoom state query failed: {error:#}"))
+            }
+        }
+    }
+    tmux::set_window_aggressive_resize(&selected.window_id, false)?;
+    if let Err(error) = tmux::resize_window_to_available(&selected.window_id) {
+        tui_log::error(&format!("live preview window restore failed: {error:#}"));
+    }
     Ok(())
 }
 

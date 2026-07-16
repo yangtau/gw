@@ -19,6 +19,12 @@ pub struct Pane {
     pub window_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewWindowState {
+    pub pane_count: u32,
+    pub zoomed: bool,
+}
+
 /// Panes of the current session (`list-panes -s`).
 pub fn list_panes() -> Result<Vec<Pane>> {
     let stdout = run_tmux(&[
@@ -158,6 +164,36 @@ pub fn resize_window_to_available(window_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn preview_window_state(window_id: &str) -> Result<PreviewWindowState> {
+    let args = preview_window_state_command(window_id);
+    parse_preview_window_state(&run_tmux(&args)?)
+}
+
+fn preview_window_state_command(window_id: &str) -> Vec<OsString> {
+    vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        window_id.into(),
+        "#{window_panes}\t#{window_zoomed_flag}".into(),
+    ]
+}
+
+pub fn toggle_pane_zoom(pane_id: &str) -> Result<()> {
+    let args = toggle_pane_zoom_command(pane_id);
+    run_tmux(&args)?;
+    Ok(())
+}
+
+fn toggle_pane_zoom_command(pane_id: &str) -> Vec<OsString> {
+    vec![
+        "resize-pane".into(),
+        "-Z".into(),
+        "-t".into(),
+        pane_id.into(),
+    ]
+}
+
 pub fn kill_session(name: &str) -> Result<()> {
     run_tmux(&["kill-session".into(), "-t".into(), name.into()])?;
     Ok(())
@@ -247,6 +283,20 @@ fn preview_session_pid(name: &str) -> Option<u32> {
     name.strip_prefix("gw-preview-")?.parse().ok()
 }
 
+fn parse_preview_window_state(stdout: &str) -> Result<PreviewWindowState> {
+    let (pane_count, zoomed) = stdout
+        .trim()
+        .split_once('\t')
+        .context("missing preview window state fields")?;
+    let pane_count = pane_count.parse().context("invalid window pane count")?;
+    let zoomed = match zoomed {
+        "0" => false,
+        "1" => true,
+        _ => bail!("invalid window zoomed flag"),
+    };
+    Ok(PreviewWindowState { pane_count, zoomed })
+}
+
 fn process_is_alive(pid: u32) -> Result<bool> {
     let status = Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -318,5 +368,48 @@ mod tests {
             commands[1],
             ["set-option", "-t", "gw-preview-42", "status", "off"]
         );
+    }
+
+    #[test]
+    fn constructs_zoom_state_and_toggle_commands() {
+        let state = preview_window_state_command("@7")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let toggle = toggle_pane_zoom_command("%9")
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            state,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "@7",
+                "#{window_panes}\t#{window_zoomed_flag}",
+            ]
+        );
+        assert_eq!(toggle, ["resize-pane", "-Z", "-t", "%9"]);
+    }
+
+    #[test]
+    fn parses_zoom_state() {
+        assert_eq!(
+            parse_preview_window_state("3\t1\n").unwrap(),
+            PreviewWindowState {
+                pane_count: 3,
+                zoomed: true,
+            }
+        );
+        assert_eq!(
+            parse_preview_window_state("1\t0\n").unwrap(),
+            PreviewWindowState {
+                pane_count: 1,
+                zoomed: false,
+            }
+        );
+        assert!(parse_preview_window_state("1\tmaybe\n").is_err());
     }
 }

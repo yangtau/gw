@@ -27,8 +27,12 @@ Environment facts (verified):
   keystroke — so per-window `aggressive-resize on` during preview is required,
   not an optimization.
 - copy-mode is pane-level shared state → the preview must never enter it.
-- zoom (`resize-pane -Z`) is window-level shared state → the preview never zooms;
-  it shows the whole window (gw-launched agent windows are single-pane anyway).
+- zoom (`resize-pane -Z`) is window-level shared state, but manageable with the same
+  set/restore discipline as aggressive-resize. Verified: zoom works from a plain
+  command (no client context); it survives the aggressive-resize window resize (the
+  zoomed pane tracks the new window size); `select-pane` onto the zoomed pane itself
+  keeps zoom (jump lands there), selecting another pane auto-unzooms; restore must be
+  conditional on `#{window_zoomed_flag}` (toggle only if still zoomed).
 
 ## Decisions (settled, do not relitigate)
 
@@ -45,6 +49,12 @@ Environment facts (verified):
    PTY. No in-preview scrolling. Enter still jumps to the pane (existing behavior).
 5. **Fallback:** if the live client cannot be established or dies, fall back to the
    existing `tmux::capture` snapshot path (keep that code).
+6. **Zoom for pane-level fidelity** (supersedes the original "never zoom" stance):
+   while previewing a multi-pane window that is not already zoomed, zoom the Agent's
+   pane; restore on release (select-away, deselect, jump, exit, failure) only if the
+   window is still zoomed. Windows the user zoomed themselves are left untouched.
+   Jump releases the preview first, so dashboard mode never holds zoom on a window
+   the user is working in. A `kill -9` may leak zoom state — accepted (`prefix+z`).
 
 ## Implementation plan
 
