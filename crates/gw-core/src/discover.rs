@@ -14,7 +14,7 @@ use crate::procs::{self, Proc};
 use crate::protocol::{AttentionKind, Manifest};
 use crate::status::{self, Derived, SessionStatus, Subagent};
 use crate::store::{SessionRecord, Store};
-use crate::tmux::{Pane, TopologyRow};
+use crate::tmux::{self, Pane, TmuxSessionPane, TopologyRow};
 
 const AGENT_EVENT_TAIL: usize = 64;
 
@@ -31,11 +31,13 @@ pub enum AgentStatus {
     Unknown,
 }
 
-/// A live agent: a provider process in a pane of the current session.
+/// A live agent: a provider process in a pane of a tmux session.
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub provider: String,
     pub pane: Pane,
+    pub tmux_session_name: String,
+    pub tmux_session_id: String,
     pub pid: i32,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
@@ -66,7 +68,7 @@ pub struct Snapshot {
     pub uninstrumented: Vec<String>,
 }
 
-/// One full scan: list panes, find provider processes under each pane,
+/// One full global scan: list panes, find provider processes under each pane,
 /// correlate with session logs (by recorded pane id / pid, falling back to
 /// unique provider+cwd match), derive statuses. Agents sort Attention first,
 /// then by window index; ended sessions sort most recent first.
@@ -76,9 +78,8 @@ pub fn snapshot(
     now: DateTime<Utc>,
     stale_after: Duration,
     topology: &[TopologyRow],
-    session_id: &str,
 ) -> Result<Snapshot> {
-    let panes = panes_in_session(topology, session_id);
+    let panes = tmux::panes_from_topology(topology);
     let procs = procs::snapshot()?;
     let sessions = store.sessions()?;
     let manifests: Vec<_> = plugins
@@ -96,24 +97,18 @@ pub fn snapshot(
     ))
 }
 
-fn panes_in_session(topology: &[TopologyRow], session_id: &str) -> Vec<Pane> {
-    topology
-        .iter()
-        .filter(|row| row.session_id == session_id)
-        .map(TopologyRow::pane)
-        .collect()
-}
-
 #[derive(Debug)]
 struct LiveCandidate {
     provider: String,
     pane: Pane,
+    tmux_session_name: String,
+    tmux_session_id: String,
     pid: i32,
     cwd: PathBuf,
 }
 
 fn join(
-    panes: &[Pane],
+    panes: &[TmuxSessionPane],
     procs: &[Proc],
     sessions: &[SessionRecord],
     manifests: &[Manifest],
@@ -122,13 +117,15 @@ fn join(
     cwd_of: impl Fn(i32) -> Option<PathBuf>,
 ) -> Snapshot {
     let mut live = Vec::new();
-    for pane in panes {
-        for (provider, proc_) in procs::provider_procs_under(pane.pid, procs, manifests) {
+    for located in panes {
+        for (provider, proc_) in procs::provider_procs_under(located.pane.pid, procs, manifests) {
             live.push(LiveCandidate {
                 provider,
-                pane: pane.clone(),
+                pane: located.pane.clone(),
+                tmux_session_name: located.tmux_session_name.clone(),
+                tmux_session_id: located.tmux_session_id.clone(),
                 pid: proc_.pid,
-                cwd: cwd_of(proc_.pid).unwrap_or_else(|| pane.cwd.clone()),
+                cwd: cwd_of(proc_.pid).unwrap_or_else(|| located.pane.cwd.clone()),
             });
         }
     }
@@ -180,6 +177,8 @@ fn join(
         agents.push(Agent {
             provider: candidate.provider.clone(),
             pane: candidate.pane.clone(),
+            tmux_session_name: candidate.tmux_session_name.clone(),
+            tmux_session_id: candidate.tmux_session_id.clone(),
             pid: candidate.pid,
             cwd: candidate.cwd.clone(),
             session_id,
@@ -326,13 +325,13 @@ mod tests {
         }
     }
 
-    fn topology_row(session_id: &str, pane: Pane) -> TopologyRow {
+    fn topology_row(tmux_session_name: &str, tmux_session_id: &str, pane: Pane) -> TopologyRow {
         TopologyRow {
-            session_name: session_id.trim_start_matches('$').into(),
-            session_id: session_id.into(),
+            tmux_session_name: tmux_session_name.into(),
+            tmux_session_id: tmux_session_id.into(),
             window_id: pane.window_id.clone(),
             window_active: true,
-            session_attached: true,
+            tmux_session_attached: true,
             pane_id: pane.id.clone(),
             pane_pid: pane.pid,
             pane_tty: pane.tty.clone(),
@@ -349,6 +348,14 @@ mod tests {
         }
     }
 
+    fn tmux_pane(tmux_session_name: &str, tmux_session_id: &str, pane: Pane) -> TmuxSessionPane {
+        TmuxSessionPane {
+            pane,
+            tmux_session_name: tmux_session_name.into(),
+            tmux_session_id: tmux_session_id.into(),
+        }
+    }
+
     fn proc_(pid: i32, ppid: i32, command: &str) -> Proc {
         Proc {
             pid,
@@ -359,17 +366,19 @@ mod tests {
     }
 
     #[test]
-    fn scopes_topology_rows_to_the_fresh_panel_session() {
+    fn discovers_panes_across_all_tmux_sessions() {
         let rows = [
-            topology_row("$1", pane("%1", 100, 1, "/one")),
-            topology_row("$2", pane("%2", 200, 2, "/two")),
+            topology_row("one", "$1", pane("%1", 100, 1, "/one")),
+            topology_row("two", "$2", pane("%2", 200, 2, "/two")),
         ];
 
-        let panes = panes_in_session(&rows, "$2");
+        let panes = tmux::panes_from_topology(&rows);
 
-        assert_eq!(panes.len(), 1);
-        assert_eq!(panes[0].id, "%2");
-        assert_eq!(panes[0].cwd, PathBuf::from("/two"));
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].pane.id, "%1");
+        assert_eq!(panes[0].tmux_session_name, "one");
+        assert_eq!(panes[1].pane.id, "%2");
+        assert_eq!(panes[1].tmux_session_id, "$2");
     }
 
     fn manifest(id: &str, hooks: bool) -> Manifest {
@@ -426,10 +435,10 @@ mod tests {
     #[test]
     fn joins_live_agents_sessions_and_ended_records() {
         let panes = [
-            pane("%1", 100, 2, "/pane-claude"),
-            pane("%2", 200, 1, "/pane-codex"),
-            pane("%3", 300, 3, "/shared"),
-            pane("%4", 400, 0, "/unknown"),
+            tmux_pane("main", "$1", pane("%1", 100, 2, "/pane-claude")),
+            tmux_pane("other", "$2", pane("%2", 200, 1, "/pane-codex")),
+            tmux_pane("main", "$1", pane("%3", 300, 3, "/shared")),
+            tmux_pane("main", "$1", pane("%4", 400, 0, "/unknown")),
         ];
         let procs = [
             proc_(100, 1, "zsh"),
@@ -528,6 +537,8 @@ mod tests {
         );
         assert_eq!(snapshot.agents[1].status, AgentStatus::Working);
         assert_eq!(snapshot.agents[1].cwd, PathBuf::from("/pane-codex"));
+        assert_eq!(snapshot.agents[1].tmux_session_name, "other");
+        assert_eq!(snapshot.agents[1].tmux_session_id, "$2");
         assert_eq!(snapshot.agents[2].status, AgentStatus::Done);
         assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("agy-live"));
         assert_eq!(snapshot.agents[3].status, AgentStatus::Unknown);
@@ -545,7 +556,7 @@ mod tests {
 
     #[test]
     fn matched_agent_keeps_the_latest_event_tail() {
-        let panes = [pane("%1", 100, 1, "/work")];
+        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
         let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
         let manifests = [manifest("claude", true)];
         let mut sessions = [session(
@@ -585,7 +596,7 @@ mod tests {
 
     #[test]
     fn live_process_outliving_ended_session_is_idle_not_resumable() {
-        let panes = [pane("%1", 100, 1, "/work")];
+        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
         let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
         let manifests = [manifest("claude", true)];
         let sessions = [session(
@@ -614,8 +625,49 @@ mod tests {
     }
 
     #[test]
+    fn live_agent_in_another_tmux_session_is_not_ended() {
+        let panes = [
+            tmux_pane("current", "$1", pane("%1", 100, 1, "/current")),
+            tmux_pane("elsewhere", "$2", pane("%2", 200, 1, "/work")),
+        ];
+        let procs = [
+            proc_(100, 1, "zsh"),
+            proc_(200, 1, "zsh"),
+            proc_(201, 200, "claude"),
+        ];
+        let manifests = [manifest("claude", true)];
+        let sessions = [session(
+            "claude",
+            "live-elsewhere",
+            Some("%2"),
+            Some(201),
+            Some("/work"),
+            10,
+            EventKind::TurnStart { summary: None },
+        )];
+
+        let snapshot = join(
+            &panes,
+            &procs,
+            &sessions,
+            &manifests,
+            at(20),
+            Duration::minutes(30),
+            |_| None,
+        );
+
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].tmux_session_id, "$2");
+        assert_eq!(
+            snapshot.agents[0].session_id.as_deref(),
+            Some("live-elsewhere")
+        );
+        assert!(snapshot.ended.is_empty());
+    }
+
+    #[test]
     fn matched_session_with_no_readable_events_is_unknown() {
-        let panes = [pane("%1", 100, 1, "/work")];
+        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
         let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
         let manifests = [manifest("claude", true)];
         // A log whose every line is retired vocabulary reads back empty.

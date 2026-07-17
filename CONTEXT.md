@@ -5,7 +5,7 @@ Glossary for `gw`, a tmux-native coding agent status panel (Rust TUI).
 ## Terms
 
 ### Agent
-A tmux pane in the current session running a known coding agent CLI. Identity is **discovery-based**: the tool finds Agents by scanning panes, regardless of how they were started; tmux panes are the single source of truth and the tool keeps no registry of its own.
+A tmux pane in any tmux session running a known coding agent CLI. Identity is **discovery-based**: the tool finds Agents by scanning panes, regardless of how they were started; tmux panes are the single source of truth and the tool keeps no registry of its own.
 
 ### Provider
 A kind of coding agent CLI (e.g. claude, codex, agy). Defines how to recognize, launch, and interpret the state of Agents of that kind.
@@ -14,7 +14,7 @@ A kind of coding agent CLI (e.g. claude, codex, agy). Defines how to recognize, 
 The implementation vehicle of a Provider: a standalone executable, discovered by naming convention, implementing a uniform plugin protocol. A plugin is a pure translator with no side effects: `manifest` describes the provider statically (process match rules, launch command, hook install spec); `normalize` turns a provider hook payload (stdin) into unified events (stdout). Hook commands installed into provider configs invoke the core (`<tool> hook <provider>`), which delegates payload translation to the plugin and owns all event-log writing itself. Every provider — including official ones shipped with the tool — goes through the same protocol; there is no built-in fast path. Private providers (e.g. agy) live in separate repositories.
 
 ### Session
-A provider-native conversation session, identified by the provider's native session id, recorded in the Event Log. A Session whose process is alive and bound to a pane is an Agent; a Session whose pane is gone is *ended* but may still be resumable (`--resume <id>`). The panel's main list shows Agents; a secondary view lists recently ended, resumable Sessions.
+A provider-native conversation session, identified by the provider's native session id, recorded in the Event Log. The bare word "session" always means this; a tmux session is never abbreviated — it is written "tmux session" in full everywhere (UI copy, code identifiers: `tmux_session_*`). A Session whose process is alive and bound to a pane is an Agent; a Session is *ended* only when no pane in any tmux session hosts it — ended Sessions may still be resumable (`--resume <id>`). The panel's main list shows Agents; a secondary view lists recently ended, resumable Sessions, unscoped by tmux session (an ended Session belongs to no tmux session).
 
 ### Status
 An Agent's runtime state. Its **only source is provider hook events**: hooks installed into the provider's config report key moments (turn start, stop, approval requests); the panel derives Status from the event stream. The tool never scrapes pane content or injects keys. Statuses are **eventually consistent**: attention is cleared by subsequent activity events, never by explicit acknowledgement.
@@ -37,7 +37,10 @@ Statuses a provider can reach depend on which hook events it emits; the model is
 A child agent running inside a Session, reported by the provider's subagent hooks (`subagent_start`/`subagent_end` events on the parent's session id). Subagents are display-only context — the panel lists them under their Agent's row (type, model, task) — and are **status-neutral**: they never clear Attention, revive Done, or affect staleness. The running set is replayed from start/end pairs and cleared at session boundaries.
 
 ### Panel
-The TUI itself. Runs equally in a persistent pane (dashboard mode) or a tmux `display-popup` (switcher mode — the primary posture: summon, pick, jump, gone). The only behavioral difference is whether the panel exits after a jump. Scope is always the current tmux session.
+The TUI itself. Runs equally in a persistent pane (dashboard mode) or a tmux `display-popup` (switcher mode — the primary posture: summon, pick, jump, gone). The only behavioral difference is whether the panel exits after a jump. The Panel has two Views; discovery itself is always global — a View only filters what is displayed.
+
+### View
+Which Agents the Panel displays. The **current view** shows Agents in the current tmux session, with a passive hint when Agents elsewhere need attention. The **global view** shows all Agents grouped by tmux session — current tmux session first, others by name; groups are plain headers (not selectable, not collapsible); tmux sessions with no Agents do not appear. One key toggles between the two; the starting view is configurable. Views never change behavior — Launch always targets the current tmux session regardless of view.
 
 ### Launch
 Creating a new Agent from the panel: pick a provider → a new tmux window opens running that provider's CLI in the panel's current working directory → focus jumps there. No further prompts; anything unusual is started by hand and picked up by discovery.

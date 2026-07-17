@@ -11,6 +11,8 @@ pub struct Config {
     #[serde(default = "default_notify")]
     notify: Vec<NotifyEvent>,
     #[serde(default)]
+    pub panel: PanelConfig,
+    #[serde(default)]
     pub debug: DebugConfig,
 }
 
@@ -29,6 +31,37 @@ enum NotifyEvent {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct PanelConfig {
+    #[serde(default)]
+    pub default_view: PanelView,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelView {
+    #[default]
+    Current,
+    Global,
+}
+
+impl PanelView {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "current" => Some(Self::Current),
+            "global" => Some(Self::Global),
+            _ => None,
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Current => Self::Global,
+            Self::Global => Self::Current,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct DebugConfig {
     #[serde(default)]
     pub hooks: bool,
@@ -38,6 +71,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             notify: default_notify(),
+            panel: PanelConfig::default(),
             debug: DebugConfig::default(),
         }
     }
@@ -78,6 +112,14 @@ impl Config {
 
         Config {
             notify: parse_notify(document.get("notify")),
+            panel: PanelConfig {
+                default_view: document
+                    .get("panel")
+                    .and_then(|panel| panel.get("default_view"))
+                    .and_then(toml_edit::Item::as_str)
+                    .and_then(PanelView::parse)
+                    .unwrap_or_default(),
+            },
             debug: DebugConfig {
                 hooks: document
                     .get("debug")
@@ -180,6 +222,7 @@ mod tests {
 
         let config = Config::load();
         assert!(config.should_notify(&attention()));
+        assert_eq!(config.panel.default_view, PanelView::Current);
         assert!(!config.debug.hooks);
     }
 
@@ -244,7 +287,46 @@ mod tests {
 
         let config = Config::load();
         assert!(config.should_notify(&attention()));
+        assert_eq!(config.panel.default_view, PanelView::Current);
         assert!(!config.debug.hooks);
+    }
+
+    #[test]
+    fn loads_panel_default_view() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[panel]\ndefault_view = \"global\"\n",
+        )
+        .unwrap();
+        let _env = ConfigDirGuard::set(temp.path());
+
+        assert_eq!(Config::load().panel.default_view, PanelView::Global);
+    }
+
+    #[test]
+    fn missing_panel_default_view_uses_current() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("config.toml"), "[panel]\n").unwrap();
+        let _env = ConfigDirGuard::set(temp.path());
+
+        assert_eq!(Config::load().panel.default_view, PanelView::Current);
+    }
+
+    #[test]
+    fn invalid_panel_default_view_uses_current() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[panel]\ndefault_view = \"nearby\"\n",
+        )
+        .unwrap();
+        let _env = ConfigDirGuard::set(temp.path());
+
+        assert_eq!(Config::load().panel.default_view, PanelView::Current);
     }
 
     fn attention() -> EventKind {

@@ -1,6 +1,6 @@
 //! Thin wrapper over the tmux CLI.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,11 +30,11 @@ pub struct PaneGeometry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyRow {
-    pub session_name: String,
-    pub session_id: String,
+    pub tmux_session_name: String,
+    pub tmux_session_id: String,
     pub window_id: String,
     pub window_active: bool,
-    pub session_attached: bool,
+    pub tmux_session_attached: bool,
     pub pane_id: String,
     pub pane_pid: i32,
     pub pane_tty: String,
@@ -47,10 +47,17 @@ pub struct TopologyRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelLocation {
-    pub session_id: String,
+    pub tmux_session_id: String,
     pub window_id: String,
     pub visible: bool,
     pub geometry: PaneGeometry,
+}
+
+#[derive(Debug, Clone)]
+pub struct TmuxSessionPane {
+    pub pane: Pane,
+    pub tmux_session_name: String,
+    pub tmux_session_id: String,
 }
 
 impl TopologyRow {
@@ -71,23 +78,50 @@ pub fn locate_panel(pane_id: &str, rows: &[TopologyRow]) -> Option<PanelLocation
     let row = rows
         .iter()
         .filter(|row| row.pane_id == pane_id)
-        .max_by_key(|row| (row.session_attached, row.window_active))?;
+        .max_by_key(|row| (row.tmux_session_attached, row.window_active))?;
     Some(PanelLocation {
-        session_id: row.session_id.clone(),
+        tmux_session_id: row.tmux_session_id.clone(),
         window_id: row.window_id.clone(),
-        visible: row.window_active && row.session_attached,
+        visible: row.window_active && row.tmux_session_attached,
         geometry: row.geometry,
     })
 }
 
-/// Panes across all sessions, deduplicated by pane id because grouped sessions
-/// can report the same pane more than once.
-pub fn list_panes() -> Result<Vec<Pane>> {
-    let mut seen = HashSet::new();
-    Ok(observe_topology()?
+/// Panes across all tmux sessions, deduplicated by pane id. A pane shared by
+/// grouped tmux sessions belongs to the attached row, preferring its active
+/// window when more than one candidate has the same attachment state.
+pub fn panes_from_topology(rows: &[TopologyRow]) -> Vec<TmuxSessionPane> {
+    let mut indices: HashMap<String, usize> = HashMap::new();
+    let mut selected: Vec<&TopologyRow> = Vec::new();
+    for row in rows {
+        if let Some(&index) = indices.get(&row.pane_id) {
+            let current = selected[index];
+            if (row.tmux_session_attached, row.window_active)
+                > (current.tmux_session_attached, current.window_active)
+            {
+                selected[index] = row;
+            }
+        } else {
+            indices.insert(row.pane_id.clone(), selected.len());
+            selected.push(row);
+        }
+    }
+    selected
         .into_iter()
-        .filter(|row| seen.insert(row.pane_id.clone()))
-        .map(|row| row.pane())
+        .map(|row| TmuxSessionPane {
+            pane: row.pane(),
+            tmux_session_name: row.tmux_session_name.clone(),
+            tmux_session_id: row.tmux_session_id.clone(),
+        })
+        .collect()
+}
+
+/// Panes across all tmux sessions, deduplicated by pane id because grouped
+/// tmux sessions can report the same pane more than once.
+pub fn list_panes() -> Result<Vec<Pane>> {
+    Ok(panes_from_topology(&observe_topology()?)
+        .into_iter()
+        .map(|located| located.pane)
         .collect())
 }
 
@@ -119,12 +153,13 @@ pub fn new_window(name: &str, cwd: &Path, argv: &[String]) -> Result<String> {
 
 /// Focus the window/pane containing `pane_id`.
 pub fn focus(pane_id: &str) -> Result<()> {
+    run_tmux(&["switch-client".into(), "-t".into(), pane_id.into()])?;
     run_tmux(&["select-window".into(), "-t".into(), pane_id.into()])?;
     run_tmux(&["select-pane".into(), "-t".into(), pane_id.into()])?;
     Ok(())
 }
 
-pub fn current_session_name() -> Result<String> {
+pub fn current_tmux_session_name() -> Result<String> {
     Ok(run_tmux(&[
         "display-message".into(),
         "-p".into(),
@@ -134,7 +169,7 @@ pub fn current_session_name() -> Result<String> {
     .to_owned())
 }
 
-pub fn current_session_id() -> Result<String> {
+pub fn current_tmux_session_id() -> Result<String> {
     Ok(run_tmux(&[
         "display-message".into(),
         "-p".into(),
@@ -206,14 +241,14 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
         .filter(|line| !line.is_empty())
         .map(|line| {
             let mut fields = line.splitn(16, '\t');
-            let session_name = fields.next().context("missing session name")?;
-            let session_id = fields.next().context("missing session id")?;
+            let tmux_session_name = fields.next().context("missing tmux session name")?;
+            let tmux_session_id = fields.next().context("missing tmux session id")?;
             let window_id = fields.next().context("missing window id")?;
             let window_active = parse_flag(
                 fields.next().context("missing window active flag")?,
                 "window active flag",
             )?;
-            let session_attached = fields
+            let tmux_session_attached = fields
                 .next()
                 .context("missing session attached count")?
                 .parse::<u32>()
@@ -259,11 +294,11 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
                 .parse()
                 .context("invalid window pane count")?;
             Ok(TopologyRow {
-                session_name: session_name.into(),
-                session_id: session_id.into(),
+                tmux_session_name: tmux_session_name.into(),
+                tmux_session_id: tmux_session_id.into(),
                 window_id: window_id.into(),
                 window_active,
-                session_attached,
+                tmux_session_attached,
                 pane_id: pane_id.into(),
                 pane_pid,
                 pane_tty: pane_tty.into(),
@@ -326,11 +361,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].session_name, "main");
-        assert_eq!(rows[0].session_id, "$1");
+        assert_eq!(rows[0].tmux_session_name, "main");
+        assert_eq!(rows[0].tmux_session_id, "$1");
         assert_eq!(rows[0].window_id, "@7");
         assert!(rows[0].window_active);
-        assert!(rows[0].session_attached);
+        assert!(rows[0].tmux_session_attached);
         assert_eq!(rows[0].pane_id, "%3");
         assert_eq!(rows[0].pane_pid, 123);
         assert_eq!(rows[0].pane_tty, "/dev/ttys001");
@@ -366,7 +401,7 @@ mod tests {
         assert_eq!(
             locate_panel("%panel", &rows),
             Some(PanelLocation {
-                session_id: "$3".into(),
+                tmux_session_id: "$3".into(),
                 window_id: "@visible".into(),
                 visible: true,
                 geometry: PaneGeometry {
@@ -378,6 +413,24 @@ mod tests {
             })
         );
         assert_eq!(locate_panel("%missing", &rows), None);
+    }
+
+    #[test]
+    fn grouped_pane_belongs_to_the_attached_tmux_session() {
+        let rows = parse_topology(
+            "detached\t$1\t@7\t1\t0\t%3\t123\tttys001\t/tmp\t2\tagent\t0\t0\t80\t24\t1\n\
+             attached\t$2\t@7\t0\t1\t%3\t123\tttys001\t/tmp\t2\tagent\t0\t0\t80\t24\t1\n\
+             other\t$3\t@9\t1\t1\t%4\t456\tttys002\t/work\t3\tother\t0\t0\t80\t24\t1\n",
+        )
+        .unwrap();
+
+        let panes = panes_from_topology(&rows);
+
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].pane.id, "%3");
+        assert_eq!(panes[0].tmux_session_name, "attached");
+        assert_eq!(panes[0].tmux_session_id, "$2");
+        assert_eq!(panes[1].pane.id, "%4");
     }
 
     #[test]
