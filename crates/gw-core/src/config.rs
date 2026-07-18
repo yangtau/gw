@@ -4,16 +4,47 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
-#[derive(Debug, Default, Deserialize)]
+use crate::protocol::EventKind;
+
+#[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_notify")]
+    notify: Vec<NotifyEvent>,
     #[serde(default)]
     pub debug: DebugConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NotifyEvent {
+    SessionStart,
+    TurnStart,
+    TurnEnd,
+    TurnError,
+    Attention,
+    Heartbeat,
+    SubagentStart,
+    SubagentEnd,
+    SessionEnd,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DebugConfig {
     #[serde(default)]
     pub hooks: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            notify: default_notify(),
+            debug: DebugConfig::default(),
+        }
+    }
+}
+
+fn default_notify() -> Vec<NotifyEvent> {
+    vec![NotifyEvent::Attention]
 }
 
 impl Config {
@@ -46,6 +77,7 @@ impl Config {
         };
 
         Config {
+            notify: parse_notify(document.get("notify")),
             debug: DebugConfig {
                 hooks: document
                     .get("debug")
@@ -55,6 +87,54 @@ impl Config {
             },
         }
     }
+
+    pub fn should_notify(&self, event: &EventKind) -> bool {
+        let event = match event {
+            EventKind::SessionStart { .. } => NotifyEvent::SessionStart,
+            EventKind::TurnStart { .. } => NotifyEvent::TurnStart,
+            EventKind::TurnEnd { .. } => NotifyEvent::TurnEnd,
+            EventKind::TurnError { .. } => NotifyEvent::TurnError,
+            EventKind::Attention { .. } => NotifyEvent::Attention,
+            EventKind::Heartbeat { .. } => NotifyEvent::Heartbeat,
+            EventKind::SubagentStart { .. } => NotifyEvent::SubagentStart,
+            EventKind::SubagentEnd { .. } => NotifyEvent::SubagentEnd,
+            EventKind::SessionEnd => NotifyEvent::SessionEnd,
+        };
+        self.notify.contains(&event)
+    }
+}
+
+fn parse_notify(item: Option<&toml_edit::Item>) -> Vec<NotifyEvent> {
+    let Some(item) = item else {
+        return default_notify();
+    };
+    if let Some(enabled) = item.as_bool() {
+        return if enabled {
+            default_notify()
+        } else {
+            Vec::new()
+        };
+    }
+    let Some(events) = item.as_array() else {
+        return default_notify();
+    };
+
+    events
+        .iter()
+        .filter_map(|value| value.as_str())
+        .filter_map(|name| match name {
+            "session_start" => Some(NotifyEvent::SessionStart),
+            "turn_start" => Some(NotifyEvent::TurnStart),
+            "turn_end" => Some(NotifyEvent::TurnEnd),
+            "turn_error" => Some(NotifyEvent::TurnError),
+            "attention" => Some(NotifyEvent::Attention),
+            "heartbeat" => Some(NotifyEvent::Heartbeat),
+            "subagent_start" => Some(NotifyEvent::SubagentStart),
+            "subagent_end" => Some(NotifyEvent::SubagentEnd),
+            "session_end" => Some(NotifyEvent::SessionEnd),
+            _ => None,
+        })
+        .collect()
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -67,6 +147,7 @@ fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::AttentionKind;
     use std::ffi::OsString;
     use std::sync::Mutex;
 
@@ -97,7 +178,39 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _env = ConfigDirGuard::set(temp.path());
 
-        assert!(!Config::load().debug.hooks);
+        let config = Config::load();
+        assert!(config.should_notify(&attention()));
+        assert!(!config.debug.hooks);
+    }
+
+    #[test]
+    fn notify_false_disables_notifications() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("config.toml"), "notify = false\n").unwrap();
+        let _env = ConfigDirGuard::set(temp.path());
+
+        assert!(!Config::load().should_notify(&attention()));
+    }
+
+    #[test]
+    fn loads_notify_event_list() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "notify = [\"turn_end\", \"turn_error\"]\n",
+        )
+        .unwrap();
+        let _env = ConfigDirGuard::set(temp.path());
+
+        let config = Config::load();
+        assert!(config.should_notify(&EventKind::TurnEnd { summary: None }));
+        assert!(config.should_notify(&EventKind::TurnError {
+            reason: None,
+            summary: None,
+        }));
+        assert!(!config.should_notify(&attention()));
     }
 
     #[test]
@@ -117,7 +230,9 @@ mod tests {
         fs::write(temp.path().join("config.toml"), "[debug]\n").unwrap();
         let _env = ConfigDirGuard::set(temp.path());
 
-        assert!(!Config::load().debug.hooks);
+        let config = Config::load();
+        assert!(config.should_notify(&attention()));
+        assert!(!config.debug.hooks);
     }
 
     #[test]
@@ -127,6 +242,15 @@ mod tests {
         fs::write(temp.path().join("config.toml"), "[debug\nhooks = true\n").unwrap();
         let _env = ConfigDirGuard::set(temp.path());
 
-        assert!(!Config::load().debug.hooks);
+        let config = Config::load();
+        assert!(config.should_notify(&attention()));
+        assert!(!config.debug.hooks);
+    }
+
+    fn attention() -> EventKind {
+        EventKind::Attention {
+            attention: AttentionKind::Approval,
+            summary: None,
+        }
     }
 }

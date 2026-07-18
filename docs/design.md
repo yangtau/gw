@@ -33,7 +33,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 ## Storage
 
 - Event logs: `~/.local/state/gw/sessions/<sha256(provider:native_session_id)>.jsonl`, append-only, `O_APPEND` single-write per event; retention sweep on panel start (drop logs of dead sessions older than N days).
-- Config (optional, TOML): `~/.config/gw/config.toml` — currently `[debug] hooks` (see `config.md`); stale threshold, plugin dir overrides, keybindings later.
+- Config (optional, TOML): `~/.config/gw/config.toml` — currently `notify` and `[debug] hooks` (see `config.md`); stale threshold, plugin dir overrides, keybindings later.
 
 ## Crate layout
 

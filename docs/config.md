@@ -7,9 +7,23 @@ to defaults. A malformed file is reported on stderr and then treated as absent â
 config never blocks a hook or a panel launch.
 
 ```toml
+notify = ["attention", "turn_end", "turn_error"]
+
 [debug]
 hooks = true
 ```
+
+## General
+
+| Key      | Type            | Default         | Effect                                      |
+| -------- | --------------- | --------------- | ------------------------------------------- |
+| `notify` | bool or string[] | `["attention"]` | Choose which events send desktop notifications. |
+
+The event names are `session_start`, `turn_start`, `turn_end`, `turn_error`,
+`attention`, `heartbeat`, `subagent_start`, `subagent_end`, and `session_end`.
+Use an empty list (or `false`) to disable all notifications. `true` is retained as
+shorthand for the default `["attention"]`. Notification settings do not affect the
+panel or event log.
 
 ## `[debug]`
 

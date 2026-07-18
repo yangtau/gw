@@ -45,7 +45,9 @@ bind g popup -E 'GW_POPUP=1 gw'
 | `j`/`k` | move |
 | `q` | quit |
 
-Attention events also fire a desktop notification, panel open or not.
+Attention events also fire a desktop notification, panel open or not. Configure
+which events notify with `notify = ["attention", "turn_end"]`, or disable them with
+`notify = false`, in `~/.config/gw/config.toml`.
 
 ## Layout
 

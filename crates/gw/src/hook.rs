@@ -3,7 +3,7 @@
 //! stderr, always exit 0 once the payload was read).
 //!
 //! Flow: read stdin → plugin normalize → locate agent (ppid walk from our
-//! own parent) → store append → desktop notification on attention events.
+//! own parent) → store append → desktop notification on configured events.
 
 use std::io::{self, Read};
 use std::process::Command;
@@ -55,20 +55,33 @@ fn ingest(provider: &str, payload: &[u8]) -> Result<()> {
         if let Err(error) = store.append(provider, &event, location.as_ref()) {
             eprintln!("gw hook {provider}: could not append event: {error:#}");
         }
-        notify_attention(provider, &event);
+        if cfg.should_notify(&event.kind) {
+            notify(provider, &event);
+        }
     }
     Ok(())
 }
 
-fn notify_attention(provider: &str, event: &Event) {
-    let EventKind::Attention { summary, .. } = &event.kind else {
-        return;
+fn notify(provider: &str, event: &Event) {
+    let (kind, summary) = match &event.kind {
+        EventKind::SessionStart { model } => ("session_start", model.as_deref()),
+        EventKind::TurnStart { summary } => ("turn_start", summary.as_deref()),
+        EventKind::TurnEnd { summary } => ("turn_end", summary.as_deref()),
+        EventKind::TurnError { reason, summary } => {
+            ("turn_error", summary.as_deref().or(reason.as_deref()))
+        }
+        EventKind::Attention { summary, .. } => ("attention", summary.as_deref()),
+        EventKind::Heartbeat { activity } => ("heartbeat", activity.as_deref()),
+        EventKind::SubagentStart { summary, .. } => ("subagent_start", summary.as_deref()),
+        EventKind::SubagentEnd { agent } => ("subagent_end", Some(agent.as_str())),
+        EventKind::SessionEnd => ("session_end", None),
     };
-    let summary = summary.as_deref().unwrap_or("");
+    let summary = summary.unwrap_or(kind);
     let script = format!(
-        "display notification \"{}\" with title \"gw: {}\"",
+        "display notification \"{}\" with title \"gw: {} ({})\"",
         escape_applescript(summary),
-        escape_applescript(provider)
+        escape_applescript(provider),
+        kind
     );
     match Command::new("osascript").args(["-e", &script]).status() {
         Ok(status) if !status.success() => {
