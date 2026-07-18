@@ -220,7 +220,7 @@ fn join(
     let uninstrumented = manifests
         .iter()
         .filter(|manifest| {
-            !manifest.hooks.is_empty()
+            (!manifest.hooks.is_empty() || !manifest.managed_files.is_empty())
                 && !sessions
                     .iter()
                     .any(|session| session.meta.provider == manifest.id)
@@ -389,6 +389,7 @@ mod tests {
             color: None,
             process: ProcessMatch {
                 argv0: vec![id.into()],
+                exclude_args: Vec::new(),
             },
             launch: ProviderCommand {
                 argv: vec![id.into()],
@@ -402,6 +403,7 @@ mod tests {
                 })
                 .into_iter()
                 .collect(),
+            managed_files: Vec::new(),
         }
     }
 

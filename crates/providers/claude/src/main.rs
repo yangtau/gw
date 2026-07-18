@@ -40,6 +40,7 @@ fn manifest() -> Manifest {
         label: "Claude".into(),
         color: Some("#D97757".into()),
         process: ProcessMatch {
+            exclude_args: Vec::new(),
             argv0: vec!["claude".into()],
         },
         launch: Command {
@@ -53,6 +54,7 @@ fn manifest() -> Manifest {
             format: FileFormat::Json,
             patches,
         }],
+        managed_files: Vec::new(),
     }
 }
 

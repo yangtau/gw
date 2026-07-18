@@ -14,7 +14,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value as JsonValue;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value as TomlValue};
 
-use crate::protocol::{FileFormat, Manifest, Patch, PatchMode};
+use crate::protocol::{FileFormat, ManagedFile, Manifest, Patch, PatchMode};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -66,14 +67,97 @@ fn apply(manifests: &[Manifest], removing: bool) -> Result<Vec<(PathBuf, Outcome
         }
     }
 
-    targets
+    let mut managed = Vec::new();
+    for manifest in manifests {
+        for file in &manifest.managed_files {
+            let path = expand_path(&file.path)?;
+            if targets.iter().any(|target| target.path == path)
+                || managed
+                    .iter()
+                    .any(|(existing, _, _): &(PathBuf, &str, &ManagedFile)| *existing == path)
+            {
+                bail!("duplicate or colliding setup target {}", path.display());
+            }
+            managed.push((path, manifest.id.as_str(), file));
+        }
+    }
+
+    let mut outcomes: Vec<_> = targets
         .into_iter()
         .map(|target| {
             let outcome = apply_target(&target, removing)
                 .with_context(|| format!("update {}", target.path.display()))?;
             Ok((target.path, outcome))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    for (path, provider, file) in managed {
+        let outcome = apply_managed_file(&path, provider, file, removing)
+            .with_context(|| format!("update {}", path.display()))?;
+        outcomes.push((path, outcome));
+    }
+    Ok(outcomes)
+}
+
+fn apply_managed_file(
+    path: &Path,
+    provider: &str,
+    file: &ManagedFile,
+    removing: bool,
+) -> Result<Outcome> {
+    if file.comment_prefix.is_empty() || file.comment_prefix.contains(['\n', '\r']) {
+        bail!("managed file comment_prefix must be nonempty and single-line");
+    }
+    let existed = path.exists();
+    if !existed && removing {
+        return Ok(Outcome::AlreadyApplied);
+    }
+    let desired = render_managed(provider, file);
+    if !existed {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(path, desired.as_bytes(), false)?;
+        return Ok(Outcome::Changed);
+    }
+    let current = fs::read_to_string(path)?;
+    if !removing && current == desired {
+        return Ok(Outcome::AlreadyApplied);
+    }
+    validate_managed(&current, provider, &file.comment_prefix)?;
+    let backup = backup_path(path);
+    if !backup.exists() {
+        fs::copy(path, backup)?;
+    }
+    if removing {
+        fs::remove_file(path)?;
+    } else {
+        atomic_write(path, desired.as_bytes(), true)?;
+    }
+    Ok(Outcome::Changed)
+}
+
+fn render_managed(provider: &str, file: &ManagedFile) -> String {
+    let hash = format!("{:x}", Sha256::digest(file.content.as_bytes()));
+    format!(
+        "{} Managed by gw for provider {}; content-sha256={}\n{}",
+        file.comment_prefix, provider, hash, file.content
+    )
+}
+
+fn validate_managed(input: &str, provider: &str, comment_prefix: &str) -> Result<()> {
+    let (header, body) = input.split_once('\n').context("file is not gw-managed")?;
+    let marker = format!("{comment_prefix} Managed by gw for provider {provider}; content-sha256=");
+    let stored = header
+        .strip_prefix(&marker)
+        .context("file belongs to another owner or provider")?;
+    if stored.len() != 64 || !stored.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("gw-managed file has an invalid content hash");
+    }
+    let actual = format!("{:x}", Sha256::digest(body.as_bytes()));
+    if stored != actual {
+        bail!("gw-managed file was modified");
+    }
+    Ok(())
 }
 
 fn apply_target(target: &Target<'_>, removing: bool) -> Result<Outcome> {
@@ -625,7 +709,7 @@ fn atomic_write(path: &Path, contents: &[u8], existed: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::protocol::{
-        Command, HookFile, Manifest, Patch, PatchMode, ProcessMatch, PROTOCOL_VERSION,
+        Command, HookFile, ManagedFile, Manifest, Patch, PatchMode, ProcessMatch, PROTOCOL_VERSION,
     };
     use serde_json::json;
 
@@ -637,6 +721,7 @@ mod tests {
             color: None,
             process: ProcessMatch {
                 argv0: vec!["fixture".to_owned()],
+                exclude_args: Vec::new(),
             },
             launch: Command {
                 argv: vec!["fixture".to_owned()],
@@ -647,6 +732,7 @@ mod tests {
                 format,
                 patches,
             }],
+            managed_files: Vec::new(),
         }
     }
 
@@ -656,6 +742,58 @@ mod tests {
             mode: PatchMode::Ensure,
             value,
         }
+    }
+
+    fn managed(path: &Path, content: &str) -> Manifest {
+        let mut result = manifest(path, FileFormat::Json, Vec::new());
+        result.hooks.clear();
+        result.managed_files.push(ManagedFile {
+            path: path.to_string_lossy().into_owned(),
+            content: content.into(),
+            comment_prefix: "//".into(),
+        });
+        result
+    }
+
+    #[test]
+    fn managed_file_create_upgrade_conflicts_and_remove() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gw.ts");
+        let old = managed(&path, "old\n");
+        assert_eq!(
+            install(std::slice::from_ref(&old)).unwrap()[0].1,
+            Outcome::Changed
+        );
+        assert_eq!(
+            install(std::slice::from_ref(&old)).unwrap()[0].1,
+            Outcome::AlreadyApplied
+        );
+        let new = managed(&path, "new\n");
+        assert_eq!(
+            install(std::slice::from_ref(&new)).unwrap()[0].1,
+            Outcome::Changed
+        );
+        assert!(backup_path(&path).exists());
+        fs::write(&path, "unrelated").unwrap();
+        assert!(install(std::slice::from_ref(&new)).is_err());
+        fs::write(
+            &path,
+            render_managed("fixture", &new.managed_files[0]).replacen("//", "#", 1),
+        )
+        .unwrap();
+        assert!(install(std::slice::from_ref(&new)).is_err());
+        fs::write(
+            &path,
+            render_managed("fixture", &new.managed_files[0]) + "modified",
+        )
+        .unwrap();
+        assert!(remove(std::slice::from_ref(&new)).is_err());
+        fs::write(&path, render_managed("fixture", &new.managed_files[0])).unwrap();
+        assert_eq!(
+            remove(std::slice::from_ref(&new)).unwrap()[0].1,
+            Outcome::Changed
+        );
+        assert_eq!(remove(&[new]).unwrap()[0].1, Outcome::AlreadyApplied);
     }
 
     fn set(pointer: &str, value: JsonValue) -> Patch {

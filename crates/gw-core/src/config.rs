@@ -132,6 +132,7 @@ impl Config {
 
     pub fn should_notify(&self, event: &EventKind) -> bool {
         let event = match event {
+            EventKind::SessionFocus => return false,
             EventKind::SessionStart { .. } => NotifyEvent::SessionStart,
             EventKind::TurnStart { .. } => NotifyEvent::TurnStart,
             EventKind::TurnEnd { .. } => NotifyEvent::TurnEnd,
@@ -254,6 +255,7 @@ mod tests {
             summary: None,
         }));
         assert!(!config.should_notify(&attention()));
+        assert!(!config.should_notify(&EventKind::SessionFocus));
     }
 
     #[test]

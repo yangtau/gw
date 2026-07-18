@@ -21,12 +21,25 @@ pub struct Manifest {
     pub resume: Option<Command>,
     #[serde(default)]
     pub hooks: Vec<HookFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_files: Vec<ManagedFile>,
 }
 
 /// An agent process is recognized when its argv[0] basename matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessMatch {
     pub argv0: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedFile {
+    /// `~` is expanded by the core.
+    pub path: String,
+    pub content: String,
+    /// Single-line prefix used for the ownership header (for example `//`).
+    pub comment_prefix: String,
 }
 
 /// Command template; the core expands `{session_id}` and `{cwd}`.
@@ -87,6 +100,8 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
+    /// The provider's foreground session changed. Status-neutral.
+    SessionFocus,
     SessionStart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,

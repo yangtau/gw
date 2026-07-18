@@ -1,6 +1,6 @@
 # gw
 
-A tmux-native status panel for coding agents. One popup shows every claude / codex / (your own) agent running in the current tmux session, what state it's in, and jumps you to the one that needs you.
+A tmux-native status panel for coding agents. One popup shows every Claude / Codex / Amp / (your own) agent running in tmux, what state it's in, and jumps you to the one that needs you.
 
 - **Discovery-based** — any pane running a known agent CLI shows up, however it was started.
 - **Hook-driven status** — Attention / Working / Idle / Stale, derived purely from provider hook events. No pane scraping, no key injection, no daemon.
@@ -20,6 +20,7 @@ Or with cargo:
 cargo install --path crates/gw
 cargo install --path crates/providers/claude
 cargo install --path crates/providers/codex
+cargo install --path crates/providers/amp
 ```
 
 Then install the provider hooks (backed up, surgical, reversible):
@@ -54,6 +55,12 @@ which events notify with `notify = ["attention", "turn_end"]`, or disable them w
 - `crates/gw` — the binary: panel TUI, `gw hook` ingest, `gw setup`.
 - `crates/gw-core` — domain: discovery, correlation, status derivation, event store, tmux/ps wrappers.
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust plugin authors.
-- `crates/providers/claude`, `crates/providers/codex` — official provider plugins.
+- `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp` — official provider plugins.
+
+Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
+tracking that TUI's foreground thread; runner/execute modes and background
+threads are intentionally excluded. `gw setup` installs the observer plugin at
+`~/.config/amp/plugins/gw.ts`; restart Amp or run `plugins: reload` in an
+already-running TUI after setup.
 
 Design notes live in [docs/design.md](docs/design.md); vocabulary in [CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).

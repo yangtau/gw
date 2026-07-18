@@ -985,6 +985,7 @@ fn activity_rows(events: &[Event], now: DateTime<Utc>) -> Vec<ActivityRow> {
         .map(|event| {
             let age = event.ts.map(|ts| ago(ts, now)).unwrap_or_default();
             let (label, color, text) = match &event.kind {
+                EventKind::SessionFocus => ("focus", Color::DarkGray, "foreground".into()),
                 EventKind::SessionStart { model } => (
                     "session",
                     Color::DarkGray,
@@ -1234,6 +1235,7 @@ mod tests {
     fn maps_every_event_kind_to_activity_rows() {
         let now = DateTime::from_timestamp(7_200, 0).unwrap();
         let events = vec![
+            event(Some(now - Duration::minutes(2)), EventKind::SessionFocus),
             event(
                 Some(now - Duration::minutes(1)),
                 EventKind::SessionStart {
@@ -1303,6 +1305,7 @@ mod tests {
                 .map(|row| (row.age.as_str(), row.label, row.color, row.text.as_str()))
                 .collect::<Vec<_>>(),
             [
+                ("2m", "focus", Color::DarkGray, "foreground"),
                 ("1m", "session", Color::DarkGray, "opus"),
                 ("1h0m", "turn", Color::Green, "implement activity"),
                 ("", "tool", Color::DarkGray, "cargo test"),

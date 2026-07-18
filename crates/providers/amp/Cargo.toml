@@ -1,0 +1,9 @@
+[package]
+name = "gw-provider-amp"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+gw-plugin-protocol.workspace = true
+gw-provider-sdk.workspace = true
+serde_json.workspace = true

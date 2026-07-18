@@ -7,7 +7,9 @@ pub fn run(remove: bool) -> Result<()> {
     let plugins = gw_core::plugins::discover()?;
     let without_hooks = plugins
         .iter()
-        .filter(|plugin| plugin.manifest.hooks.is_empty())
+        .filter(|plugin| {
+            plugin.manifest.hooks.is_empty() && plugin.manifest.managed_files.is_empty()
+        })
         .map(|plugin| plugin.manifest.id.as_str())
         .collect::<Vec<_>>();
     if !without_hooks.is_empty() {

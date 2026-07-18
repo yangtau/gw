@@ -45,6 +45,7 @@ fn manifest() -> Manifest {
         label: "Antigravity".into(),
         color: Some("#4285F4".into()),
         process: ProcessMatch {
+            exclude_args: Vec::new(),
             argv0: vec!["agy".into()],
         },
         launch: Command {
@@ -58,6 +59,7 @@ fn manifest() -> Manifest {
             format: FileFormat::Json,
             patches,
         }],
+        managed_files: Vec::new(),
     }
 }
 

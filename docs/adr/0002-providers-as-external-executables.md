@@ -12,14 +12,14 @@ A second axis: who writes the event log. If hook configs invoke the plugin direc
 
 ## Decision
 
-A provider is a standalone executable named `gw-provider-<id>`, discovered on PATH / in the plugin directory. **All** providers go through this protocol — the claude and codex plugins ship with `gw` and are built in the same workspace, but get no private fast path.
+A provider is a standalone executable named `gw-provider-<id>`, discovered on PATH / in the plugin directory. **All** providers go through this protocol — the claude, codex, and amp plugins ship with `gw` and are built in the same workspace, but get no private fast path.
 
 Plugins are pure translators with no side effects:
 
-- `manifest` — prints static description: process match rules, launch command, hook install spec.
+- `manifest` — prints static description: process match rules, launch command, hook/config and managed-file install specs.
 - `normalize` — reads one provider hook payload on stdin, prints unified events on stdout.
 
-Hook commands installed into provider configs invoke the **core** (`gw hook <provider>`); the core spawns the plugin's `normalize` and owns all event-log writing, notification side effects, and storage layout.
+Hook commands installed into provider configs—or observer bridges installed as hash-protected managed files—invoke the **core** (`gw hook <provider>`); the core spawns the plugin's `normalize` and owns all integration-file I/O, event-log writing, notification side effects, and storage layout.
 
 ## Consequences
 

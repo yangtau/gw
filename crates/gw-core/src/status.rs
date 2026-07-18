@@ -41,12 +41,26 @@ pub struct Subagent {
 /// is a function of the last event (plus `now` for staleness). An idle agent
 /// never goes stale; only an apparently-working one does.
 ///
-/// Subagent events are status-neutral and skipped entirely: a subagent
-/// finishing must not clear the parent's Attention or revive a Done session.
+/// Subagent and focus events are status-neutral and skipped entirely: a
+/// subagent finishing or foreground-session change must not clear the
+/// parent's Attention or revive a Done session.
 pub fn derive(events: &[Event], now: DateTime<Utc>, stale_after: Duration) -> Option<Derived> {
-    let events: Vec<&Event> = events.iter().filter(|e| !is_subagent(e)).collect();
+    let focus = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind, EventKind::SessionFocus));
+    let events: Vec<&Event> = events
+        .iter()
+        .filter(|e| !is_subagent(e) && !matches!(e.kind, EventKind::SessionFocus))
+        .collect();
     let ts = |e: &Event| e.ts.expect("stored events carry ts");
-    let last = *events.last()?;
+    let Some(last) = events.last().copied() else {
+        return focus.map(|event| Derived {
+            status: SessionStatus::Idle,
+            since: ts(event),
+            detail: None,
+        });
+    };
     let derived = |status, detail| {
         Some(Derived {
             status,
@@ -55,6 +69,7 @@ pub fn derive(events: &[Event], now: DateTime<Utc>, stale_after: Duration) -> Op
         })
     };
     match &last.kind {
+        EventKind::SessionFocus => unreachable!("focus events are filtered above"),
         EventKind::SessionEnd => derived(SessionStatus::Ended, None),
         EventKind::SessionStart { .. } => derived(SessionStatus::Idle, None),
         EventKind::Attention { attention, summary } => {
@@ -211,6 +226,39 @@ mod tests {
     #[test]
     fn empty_log_is_none() {
         assert_eq!(derive(&[], at(0), STALE), None);
+    }
+
+    #[test]
+    fn focus_is_status_neutral_and_focus_only_is_idle() {
+        let focus = ev(20, EventKind::SessionFocus);
+        for (kind, expected) in [
+            (
+                EventKind::TurnEnd {
+                    summary: Some("done".into()),
+                },
+                SessionStatus::Done,
+            ),
+            (
+                EventKind::TurnError {
+                    reason: Some("bad".into()),
+                    summary: None,
+                },
+                SessionStatus::Error,
+            ),
+            (turn_start(Some("work")), SessionStatus::Working),
+            (
+                attention(),
+                SessionStatus::Attention(AttentionKind::Approval),
+            ),
+        ] {
+            let events = [ev(10, kind), focus.clone()];
+            let derived = derive(&events, at(21), STALE).unwrap();
+            assert_eq!(derived.status, expected);
+            assert_eq!(derived.since, at(10));
+        }
+        let derived = derive(&[focus], at(21), STALE).unwrap();
+        assert_eq!(derived.status, SessionStatus::Idle);
+        assert_eq!(derived.since, at(20));
     }
 
     #[test]

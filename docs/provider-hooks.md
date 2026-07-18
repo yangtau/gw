@@ -1,6 +1,6 @@
 # Provider hook reference
 
-Authoritative reference for the hook systems of the three providers gw integrates
+Authoritative reference for the hook systems of the four providers gw integrates
 with: what events exist, how hooks are configured, how the hook process is invoked,
 and the exact payload each event delivers. This is the factual basis for the unified
 event vocabulary in `protocol.md`.
@@ -11,16 +11,77 @@ Sources and confidence:
 - **codex**: generated JSON schemas in the codex repo
   (`codex-rs/hooks/schema/generated/*.input.schema.json`) — the authoritative
   contract. Verified against source.
+- **amp**: official manual and `@ampcode/plugin` type reference
+  (ampcode.com/manual and ampcode.com/manual/plugin-api). Verified against the
+  2026-07-18 public API.
 - **agy**: binary inspection (proto type names, format strings). Directionally
   reliable; exact payload JSON marked UNVERIFIED until confirmed from the internal
   repo.
 
 ## Shared model
 
-All three providers run hooks the same way: an external command receives one JSON
-object on **stdin** and communicates back via **exit code** (and optionally stdout
-JSON for decision-making hooks). gw only ever observes: exit 0, no stdout, so no
-hook can ever block or alter the agent's behavior.
+Claude, codex, and agy run external hook commands that receive one JSON object on
+**stdin** and communicate back via exit code (and optionally stdout JSON for
+decision-making hooks). Amp instead delivers typed events to a TypeScript plugin;
+gw installs a small system observer plugin that forwards compact JSON to
+`gw hook amp` on stdin. Every integration is observer-only: gw never returns a
+permission decision or modifies provider behavior.
+
+---
+
+## amp
+
+### Configuration and invocation
+
+- Amp system plugins live at `~/.config/amp/plugins/*.ts` and run under Bun.
+- `gw setup` installs `~/.config/amp/plugins/gw.ts` as a hash-protected managed
+  file. An already-running Amp TUI must run `plugins: reload` or restart.
+- The bridge invokes `gw hook amp` with compact JSON on stdin. It serializes
+  invocations to preserve event order and swallows/logs all failures so gw can
+  never fail an Amp turn.
+- One Amp TUI can host several threads. The bridge uses
+  `amp.activeThread.current` and forwards only the foreground thread; a
+  foreground change emits `session_focus`, which changes pane correlation but
+  preserves the thread's previous status.
+- `amp --no-tui` and `amp -x`/`--execute` have no focused TUI thread and are not
+  forwarded. Process discovery also excludes those argv flags.
+
+### Public lifecycle surface
+
+| Signal | Fields relevant to gw | Notes |
+|---|---|---|
+| `session.start` | `thread.id` | fires for a new thread and when an existing thread is opened/switched; not equivalent to a new native session |
+| `agent.start` | `thread.id`, `message`, `id` | user turn began |
+| `agent.end` | `thread.id`, `status`, `messages` | status is `done`, `error`, or `cancelled`; messages contain the final assistant text |
+| `tool.call` | `thread.id`, `tool`, `input` | decision hook: every handler must return allow/reject/modify/synthesize/error |
+| `tool.result` | `thread.id`, `tool`, `input`, `status` | read-only post-tool activity signal |
+| `PluginThread.state` | `idle`, `running`, `awaiting-approval`, `error` | observable state plus an immediate `get()` snapshot |
+
+gw deliberately does **not** subscribe to `tool.call`: the API has no neutral
+observer result, and returning `allow` would participate in the permission
+decision. Tool heartbeats therefore come from `tool.result`. An approval is
+observed from `PluginThread.state == "awaiting-approval"`; its tool detail may be
+absent.
+
+There is no `session.end`, explicit question-waiting event, or public subagent
+lifecycle event. Amp normally does not ask for tool approval; Attention/approval
+is reachable only when the user has independently enabled an Amp permission
+policy. A textual question in the final assistant response is `Done`, not a
+mid-turn Attention/question.
+
+### Bridge payload
+
+The managed TypeScript bridge intentionally narrows Amp's large event objects
+before invoking the provider normalizer:
+
+```json
+{"thread_id":"T-…","event":"agent_start","message":"fix the tests"}
+{"thread_id":"T-…","event":"tool_result","tool":"shell: cargo test"}
+{"thread_id":"T-…","event":"agent_end","status":"done","summary":"all green"}
+```
+
+`cancelled` maps to the same terminal `turn_end`/Done state as `done`, by product
+decision. `error` maps to `turn_error`.
 
 ---
 
@@ -260,26 +321,27 @@ live-captured payloads (gw stores it as the attention summary today). Treat
 
 ## Cross-provider comparison
 
-| Capability          | claude                                              | codex                                            | agy                                 |
-| ------------------- | --------------------------------------------------- | ------------------------------------------------ | ----------------------------------- |
-| Session begin       | `SessionStart` (source)                             | `SessionStart` (source)                          | `SessionStart`                      |
-| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                   |
-| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `PreInvocation`                     |
-| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `PostInvocation`, `Stop`            |
-| Turn failed         | `StopFailure` (error_type)                          | —                                                | —                                   |
-| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | —                                   |
-| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `PreToolUse` / `PostToolUse`        |
-| Typed notifications | `Notification` (notification_type matcher)          | —                                                | —                                   |
-| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                   |
-| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                   |
-| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `trajectory_id` / `conversation_id` |
-| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + config.toml feature flag | plugin `hooks.json`                 |
+| Capability          | claude                                              | codex                                            | amp                                      | agy                                 |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------ | ---------------------------------------- | ----------------------------------- |
+| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus)         | `SessionStart`                      |
+| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                        | —                                   |
+| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                            | `PreInvocation`                     |
+| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end` (`done` / `cancelled`)       | `PostInvocation`, `Stop`            |
+| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)                    | —                                   |
+| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | thread state `awaiting-approval`         | —                                   |
+| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                            | `PreToolUse` / `PostToolUse`        |
+| Typed notifications | `Notification` (notification_type matcher)          | —                                                | —                                        | —                                   |
+| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                        | —                                   |
+| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                        | —                                   |
+| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                              | `trajectory_id` / `conversation_id` |
+| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + config.toml feature flag | `~/.config/amp/plugins/gw.ts`            | plugin `hooks.json`                 |
 
 Consequences for gw:
 
-- Only claude reports turn failures — the only source for an Error-like status.
-  A codex/agy agent killed by a rate limit just goes quiet (Working → Stale).
-- Only claude/codex expose approval dialogs; agy agents cannot show
+- Claude and Amp report turn failures. A codex/agy agent killed by a rate limit
+  emits nothing and decays through Working → Stale.
+- Claude and codex expose dedicated approval events. Amp exposes approval as a
+  thread state when a user permission policy is active; agy cannot show
   Attention/approval until its hook surface grows.
 - claude fires both `PermissionRequest` and `Notification(permission_prompt)`
   for the same dialog; a provider plugin must subscribe exactly one.
@@ -291,6 +353,12 @@ What the shipped plugins subscribe and how they map to unified events
 
 | Provider | Hook (matcher)                                       | Unified event                                 |
 | -------- | ---------------------------------------------------- | --------------------------------------------- |
+| amp      | foreground change / `session.start`                   | `session_focus`                               |
+| amp      | `agent.start`                                        | `turn_start` {message}                        |
+| amp      | `tool.result`                                        | `heartbeat` {tool summary}                    |
+| amp      | thread state `awaiting-approval`                      | `attention` approval                          |
+| amp      | `agent.end` (`done` / `cancelled`)                    | `turn_end` {last assistant text}              |
+| amp      | `agent.end` (`error`) / focused error state           | `turn_error` {last assistant text}            |
 | claude   | `SessionStart`                                       | `session_start` {model}                       |
 | claude   | `UserPromptSubmit`                                   | `turn_start` {prompt}                         |
 | claude   | `PermissionRequest`                                  | `attention` approval {tool: argument}         |
@@ -316,3 +384,8 @@ Deliberately unsubscribed on claude: `Notification` types `permission_prompt`
 (duplicate of `PermissionRequest`), `idle_prompt` (Done already expresses it),
 `auth_success` and elicitation lifecycle types (noise); task events (subagent
 tool activity already heartbeats through the parent's `PostToolUse`).
+
+Deliberately unsubscribed on Amp: `tool.call`, because it is a decision hook
+with no observer-only return; all background-thread events, because one pane is
+one foreground Agent row; and runner/execute modes, because they have no
+interactive foreground thread to jump to.

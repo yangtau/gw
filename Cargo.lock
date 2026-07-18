@@ -775,6 +775,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-provider-amp"
+version = "0.1.0"
+dependencies = [
+ "gw-plugin-protocol",
+ "gw-provider-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "gw-provider-claude"
 version = "0.1.0"
 dependencies = [

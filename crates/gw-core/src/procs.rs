@@ -45,7 +45,13 @@ pub fn snapshot() -> Result<Vec<Proc>> {
 /// any of the first few argv tokens has a basename matching `process.argv0`
 /// (first few, not just argv[0], to survive wrappers like `node /path/claude`).
 pub fn matches_provider(proc_: &Proc, manifest: &Manifest) -> bool {
-    proc_.argv.iter().take(4).any(|arg| {
+    !proc_.argv.iter().any(|arg| {
+        manifest
+            .process
+            .exclude_args
+            .iter()
+            .any(|excluded| excluded == arg)
+    }) && proc_.argv.iter().take(4).any(|arg| {
         Path::new(arg)
             .file_name()
             .and_then(|name| name.to_str())
@@ -197,12 +203,14 @@ mod tests {
             color: None,
             process: ProcessMatch {
                 argv0: names.iter().map(|name| (*name).into()).collect(),
+                exclude_args: Vec::new(),
             },
             launch: ProviderCommand {
                 argv: vec![id.into()],
             },
             resume: None,
             hooks: Vec::new(),
+            managed_files: Vec::new(),
         }
     }
 
@@ -247,6 +255,24 @@ mod tests {
         assert!(!matches_provider(
             &proc_(2, 1, &["a", "b", "c", "d", "claude"]),
             &claude
+        ));
+    }
+
+    #[test]
+    fn excludes_exact_runner_arguments() {
+        let mut amp = manifest("amp", &["amp"]);
+        amp.process.exclude_args = ["--no-tui", "-x", "--execute"].map(str::to_owned).to_vec();
+        assert!(matches_provider(&proc_(2, 1, &["amp"]), &amp));
+        assert!(matches_provider(
+            &proc_(2, 1, &["amp", "threads", "continue", "T-id"]),
+            &amp
+        ));
+        for arg in ["--no-tui", "-x", "--execute"] {
+            assert!(!matches_provider(&proc_(2, 1, &["amp", arg]), &amp));
+        }
+        assert!(matches_provider(
+            &proc_(2, 1, &["amp", "--execute-now"]),
+            &amp
         ));
     }
 

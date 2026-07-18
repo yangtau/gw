@@ -32,6 +32,7 @@ fn manifest() -> Manifest {
         label: "Codex".into(),
         color: Some("#74AA9C".into()),
         process: ProcessMatch {
+            exclude_args: Vec::new(),
             argv0: vec!["codex".into()],
         },
         launch: Command {
@@ -56,6 +57,7 @@ fn manifest() -> Manifest {
                 }],
             },
         ],
+        managed_files: Vec::new(),
     }
 }
 

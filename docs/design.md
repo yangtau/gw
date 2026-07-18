@@ -5,6 +5,7 @@ A tmux-native TUI panel that shows every coding agent running in the current tmu
 ## Model
 
 - **Discovery-based identity** — an Agent is any pane in the current session whose process tree matches a provider's process rules. No registry; panes are the source of truth. ([CONTEXT.md](../CONTEXT.md))
+- **One row per pane** — providers may host more than one native Session, but the panel still renders one Agent per pane. Amp's row follows its interactive TUI's foreground thread; background threads and non-TUI runner/execute modes are outside the integration boundary.
 - **Hook-only status, no daemon** — plugins normalize provider hook payloads into unified events; the core appends them to per-session JSONL logs; the TUI derives status by pure replay + fs watch. (ADR 0001)
 - **Providers as external executables** — `gw-provider-<id>` binaries speaking a pure-translator protocol (`manifest` / `normalize`); the core owns all I/O. (ADR 0002)
 - **Statuses** (sort order = priority): Attention (approval > question) / Error / Stale / Working / Done / Idle / Unknown. Done means the turn ended; it never decays. ([CONTEXT.md](../CONTEXT.md))
@@ -21,14 +22,14 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 - **Activity**: compact event timeline of the selected agent (recent turns, tool activity, attention, subagents from its Event Log; display only — the panel never touches the agent's window).
 - **Keys (v1)**: `j/k` move, `Enter` jump, `n` launch (pick provider → new window in the panel's cwd → jump), `r` resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` jump to next Attention agent, `q` quit.
 - **Notifications**: `gw hook` itself fires a desktop notification (macOS `osascript`) + terminal bell when writing an attention event — global notifications without a daemon.
-- **Setup**: `gw setup` installs hooks into provider global configs for every discovered plugin. Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. The panel banners providers that are discovered but uninstrumented.
+- **Setup**: `gw setup` installs hooks into provider global configs for every discovered plugin. Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. Providers may also declare a whole managed integration file: the core creates, hashes, upgrades, and removes it only while its ownership marker and body hash prove it remains unmodified. Amp uses this for `~/.config/amp/plugins/gw.ts`. The panel banners providers that are discovered but uninstrumented.
 
 ## Plugin protocol (v1 sketch)
 
 - Discovery: `gw-provider-*` on PATH and in `~/.config/gw/providers/bin/`.
-- `manifest` → JSON: protocol version, provider id, display label/color, process match rules (argv basename patterns), launch command, resume command template (`{session_id}`, `{cwd}`), hook install spec (target files, entries to merge).
-- `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `subagent_start`, `subagent_end`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields.
-- Official plugins: `gw-provider-claude`, `gw-provider-codex` (same workspace, same protocol, no fast path).
+- `manifest` → JSON: protocol version, provider id, display label/color, process match rules (argv basename patterns plus exact excluded args), launch command, resume command template (`{session_id}`, `{cwd}`), hook install specs (target files, entries to merge), and optional managed integration files.
+- `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_focus`, `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `subagent_start`, `subagent_end`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields. `session_focus` changes correlation without changing status.
+- Official plugins: `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp` (same workspace, same protocol, no fast path).
 
 ## Storage
 
@@ -42,7 +43,7 @@ Cargo workspace:
 - `gw-core` — domain: discovery, event model, status derivation (pure), correlation, log store, plugin client, tmux shell-out wrapper.
 - `gw` — the binary: CLI (`panel`, `hook`, `setup`), ratatui TUI (fullscreen alt-screen; `TuiEvent`/`AppEvent` split, single `tokio::select!` loop, frame coalescing — patterned after codex-rs's tui architecture).
 - `gw-plugin-protocol` — serde types for manifest/events, published for Rust plugin authors (the protocol itself is JSON-over-CLI; non-Rust plugins just follow the spec).
-- `gw-provider-claude`, `gw-provider-codex` — official plugin binaries.
+- `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp` — official plugin binaries.
 
 ## Backlog
 

@@ -16,7 +16,7 @@ Prints a single JSON object describing the provider statically:
   "id": "claude",
   "label": "Claude",
   "color": "#D97757",
-  "process": { "argv0": ["claude"] },
+  "process": { "argv0": ["claude"], "exclude_args": [] },
   "launch": { "argv": ["claude"] },
   "resume": { "argv": ["claude", "--resume", "{session_id}"] },
   "hooks": [
@@ -31,18 +31,21 @@ Prints a single JSON object describing the provider statically:
         }
       ]
     }
-  ]
+  ],
+  "managed_files": []
 }
 ```
 
 - `protocol` — protocol version; the core rejects manifests with a version it doesn't support.
-- `process.argv0` — an agent process is recognized when its argv[0] **basename** equals one of these.
+- `process.argv0` — an agent process is recognized when the basename of one of its first few argv tokens equals one of these (the wider window tolerates wrappers such as `node /path/to/claude`).
+- `process.exclude_args` — optional exact argv tokens that disqualify a process after its executable matches. Amp uses this to exclude `--no-tui`, `-x`, and `--execute`.
 - `launch.argv` / `resume.argv` — command templates. Placeholders expanded by the core: `{session_id}`, `{cwd}`.
 - `hooks` — declarative install spec, applied by `gw setup`:
   - `pointer` is a JSON-Pointer-style path (for TOML it addresses nested tables).
   - `mode: "ensure"` — the pointer addresses an array; setup guarantees it contains `value` (deep equality, no duplicates) and removes exactly that element on uninstall.
   - `mode: "set"` — setup writes `value` at the pointer (e.g. a feature flag) and leaves it in place on uninstall.
   - Setup edits are surgical: unrelated keys, ordering, and (for TOML) formatting are preserved; the target file is backed up before the first write; the operation is idempotent.
+- `managed_files` — optional whole files needed to connect a provider that has no JSON/TOML hook config. Each entry has `path`, `content`, and a single-line `comment_prefix`. The core prepends an ownership header containing a hash of `content`; setup upgrades or removes the file only when that header belongs to the same provider and the body still matches its hash. Unrelated or user-modified files are rejected, never overwritten. Amp uses this to install its system TypeScript observer plugin.
 
 ### `normalize`
 
@@ -59,6 +62,7 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 
 | kind | extra fields | meaning |
 |---|---|---|
+| `session_focus` | | this provider-native session became the pane's foreground session; updates correlation but is status-neutral |
 | `session_start` | `model?` | a native session began |
 | `turn_start` | `summary?` (prompt excerpt) | the agent started working on a turn |
 | `heartbeat` | `activity?` (e.g. tool name) | still working (e.g. after each tool use); emit sparingly |
@@ -77,7 +81,7 @@ Unknown payloads must produce zero events and exit 0 — never fail the provider
 
 ## How the core drives plugins
 
-- Provider hook configs invoke `gw hook <id>`; the core pipes the payload to the plugin's `normalize`, stamps missing timestamps, correlates the event to a tmux pane (ppid-chain walk from the hook process to the provider process, tty → pane), and appends to its event log.
+- Provider hook configs or managed observer plugins invoke `gw hook <id>`; the core pipes the payload to the plugin's `normalize`, stamps missing timestamps, correlates the event to a tmux pane (ppid-chain walk from the hook process to the provider process, tty → pane), and appends to its event log.
 - Manifests are consulted for discovery (pane scanning), `n`/launch, resume, and `gw setup`.
 
 ## Versioning
