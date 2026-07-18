@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This repository has no persistent local services to repair after an orb wakes.
+echo "No services need to be resumed."

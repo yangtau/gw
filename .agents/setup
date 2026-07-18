@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Installing system dependencies..."
+packages=(build-essential ca-certificates curl lsof pkg-config procps tmux)
+missing=()
+for package in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+        missing+=("$package")
+    fi
+done
+
+if ((${#missing[@]})); then
+    if [[ $EUID -eq 0 ]]; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    else
+        sudo -n apt-get update
+        sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    fi
+fi
+
+echo "Installing the stable Rust toolchain..."
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none
+fi
+
+source "$HOME/.cargo/env"
+rustup toolchain install stable --profile minimal --component clippy,rustfmt
+rustup default stable
+
+echo "Fetching locked Cargo dependencies..."
+cargo fetch --locked
+
+echo "Orb setup complete."
