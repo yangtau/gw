@@ -12,6 +12,7 @@ type ThreadCache = {
   tool?: string;
   terminal?: Wire;
   state?: ThreadState;
+  working?: boolean;
 };
 
 function compact(value: unknown): string | undefined {
@@ -104,13 +105,21 @@ export default function gw(amp: PluginAPI) {
       // The focus path replays the initial state. Only transitions observed
       // after subscription belong here.
       if (previous === undefined || !current(id)) return;
-      if (state === "awaiting-approval" && previous !== state) {
-        void emit({
-          thread_id: id,
-          event: "approval",
-        });
-      } else if (state === "running" && previous === "awaiting-approval") {
-        void emit({ thread_id: id, event: "tool_result", tool: cache.tool });
+      if (state === "awaiting-approval") {
+        if (previous !== state) void emit({ thread_id: id, event: "approval" });
+      } else if (state === "running") {
+        if (previous === "awaiting-approval") {
+          void emit({ thread_id: id, event: "tool_result", tool: cache.tool });
+        } else if (!cache.working) {
+          // Amp does not dispatch agent.start for a thread's first turn, so the
+          // idle→running transition is the authoritative Working signal. The
+          // flag suppresses a duplicate when agent.start also fires (turn 2+).
+          cache.working = true;
+          void emit({ thread_id: id, event: "agent_start", message: cache.prompt });
+        }
+      } else {
+        // idle or error: the turn is over; agent.end reports the outcome.
+        cache.working = false;
       }
     });
   }
@@ -141,6 +150,7 @@ export default function gw(amp: PluginAPI) {
         if (cache.terminal === terminal) cache.terminal = undefined;
       }
     } else if (cache.state === "running") {
+      cache.working = true;
       void emit({
         thread_id: id,
         event: "agent_start",
@@ -180,6 +190,7 @@ export default function gw(amp: PluginAPI) {
     cache.prompt = compact(event.message);
     cache.terminal = undefined;
     if (current(event.thread.id)) {
+      cache.working = true;
       await emit({
         thread_id: event.thread.id,
         event: "agent_start",
@@ -207,6 +218,7 @@ export default function gw(amp: PluginAPI) {
   amp.on("agent.end", async (event, ctx) => {
     watch(ctx.thread);
     const cache = cacheFor(event.thread.id);
+    cache.working = false;
     const payload: Wire = {
       thread_id: event.thread.id,
       event: "agent_end",
