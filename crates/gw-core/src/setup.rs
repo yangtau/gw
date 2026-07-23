@@ -670,7 +670,7 @@ fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
-fn atomic_write(path: &Path, contents: &[u8], existed: bool) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8], existed: bool) -> Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     let permissions = if existed {

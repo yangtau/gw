@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::procs::AgentLocation;
 use crate::protocol::{Event, EventKind};
+use crate::setup::atomic_write;
 
 pub struct Store {
     root: PathBuf,
@@ -122,7 +123,11 @@ impl Store {
             cwd,
             updated_at: now,
         };
-        write_private(&meta_path, &serde_json::to_vec_pretty(&meta)?)?;
+        atomic_write(
+            &meta_path,
+            &serde_json::to_vec_pretty(&meta)?,
+            meta_path.exists(),
+        )?;
         Ok(())
     }
 
@@ -327,19 +332,6 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents)?;
-    Ok(())
-}
-
 fn last_complete_event(path: &Path) -> Result<Option<Event>> {
     if !path.exists() {
         return Ok(None);
@@ -379,6 +371,7 @@ fn meta_stem(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration as StdDuration;
 
@@ -473,9 +466,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
         let sid = session_id("test", "s1");
-        write_private(
+        atomic_write(
             &store.sessions_dir().join(format!("{sid}.jsonl")),
             b"{\"v\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"session\":\"s1\",\"kind\":\"turn_start\"}\n",
+            false,
         )
         .unwrap();
 
@@ -619,6 +613,45 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_appends_keep_meta_parseable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path().join("state")).unwrap());
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let loc = AgentLocation {
+                        pid: index,
+                        pane_id: if index % 2 == 0 {
+                            None
+                        } else {
+                            Some("%a-much-longer-pane-id".to_owned())
+                        },
+                        cwd: Some(PathBuf::from("/")),
+                    };
+                    barrier.wait();
+                    for _ in 0..10 {
+                        store
+                            .append(
+                                "test",
+                                &event("shared", EventKind::TurnStart { summary: None }),
+                                Some(&loc),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.sessions().unwrap().len(), 1);
+    }
+
+    #[test]
     fn sweep_removes_stale_session_files() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
@@ -640,7 +673,12 @@ mod tests {
         let mut old_meta: SessionMeta =
             serde_json::from_slice(&fs::read(&old_meta_path).unwrap()).unwrap();
         old_meta.updated_at = Utc::now() - Duration::days(2);
-        write_private(&old_meta_path, &serde_json::to_vec(&old_meta).unwrap()).unwrap();
+        atomic_write(
+            &old_meta_path,
+            &serde_json::to_vec(&old_meta).unwrap(),
+            true,
+        )
+        .unwrap();
 
         store.sweep(Duration::days(1)).unwrap();
 
