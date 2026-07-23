@@ -75,7 +75,7 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 
 Excerpt fields (`summary`, `activity`) are display one-liners; plugins truncate them (~120 chars) — the core stores what it is given. Every field beyond `session` and `kind` is optional (exception: `subagent_start`/`subagent_end` require `agent` — without an id there is nothing to correlate): emit what the provider knows, omit what it doesn't.
 
-Subagent events use the **parent's** native session id and are status-neutral: they never clear Attention, revive Done, or affect staleness. The panel replays start/end pairs into the running-subagent list shown under the agent's row; a `session_start`/`session_end` clears the list.
+Subagent events use the **parent's** native session id and are status-neutral: they never clear Attention, revive Done, or affect staleness. The panel replays start/end pairs into the running-subagent list shown under the agent's row; a turn boundary (`turn_start`/`turn_end`/`turn_error`) or session boundary (`session_start`/`session_end`) clears the list — a subagent cannot outlive the turn that spawned it, so a Done agent shows no subagents even when an end event is missed or carries a mismatched id.
 
 Unknown payloads must produce zero events and exit 0 — never fail the provider's hook.
 

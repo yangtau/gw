@@ -121,8 +121,10 @@ fn is_subagent(event: &Event) -> bool {
 }
 
 /// Replay subagent start/end pairs into the currently running set, in start
-/// order. A session boundary clears the set: subagents cannot outlive their
-/// session, and this bounds ghosts from a missed end event.
+/// order. A turn or session boundary clears the set: subagents cannot outlive
+/// the turn that spawned them, so a turn ending (or the next one starting)
+/// bounds ghosts left by a missed end event — otherwise a Done agent keeps
+/// showing subagents forever.
 pub fn subagents(events: &[Event]) -> Vec<Subagent> {
     let mut running: Vec<(&str, Subagent)> = Vec::new();
     for event in events {
@@ -145,7 +147,11 @@ pub fn subagents(events: &[Event]) -> Vec<Subagent> {
                 ));
             }
             EventKind::SubagentEnd { agent } => running.retain(|(id, _)| id != agent),
-            EventKind::SessionStart { .. } | EventKind::SessionEnd => running.clear(),
+            EventKind::TurnStart { .. }
+            | EventKind::TurnEnd { .. }
+            | EventKind::TurnError { .. }
+            | EventKind::SessionStart { .. }
+            | EventKind::SessionEnd => running.clear(),
             _ => {}
         }
     }
@@ -447,6 +453,70 @@ mod tests {
         let running = subagents(&events);
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].since, at(30));
+    }
+
+    #[test]
+    fn turn_boundaries_clear_subagents() {
+        // A subagent cannot outlive its turn: a missed end event must not keep
+        // a Done agent showing subagents forever.
+        let done = [
+            ev(0, turn_start(None)),
+            ev(10, subagent_start("a1", Some("Explore"), None)),
+            ev(20, EventKind::TurnEnd { summary: None }),
+        ];
+        assert!(subagents(&done).is_empty());
+
+        // A turn erroring clears them too.
+        let errored = [
+            ev(0, subagent_start("a1", None, None)),
+            ev(
+                10,
+                EventKind::TurnError {
+                    reason: None,
+                    summary: None,
+                },
+            ),
+        ];
+        assert!(subagents(&errored).is_empty());
+
+        // The next turn starting bounds a ghost from a missed TurnEnd.
+        let next_turn = [
+            ev(0, subagent_start("a1", None, None)),
+            ev(10, turn_start(None)),
+            ev(20, subagent_start("a2", Some("Plan"), None)),
+        ];
+        let running = subagents(&next_turn);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].agent_type.as_deref(), Some("Plan"));
+        assert_eq!(running[0].since, at(20));
+
+        // A subagent running mid-turn still shows while the turn works.
+        let working = [
+            ev(0, turn_start(None)),
+            ev(10, subagent_start("a1", Some("Explore"), None)),
+            ev(20, heartbeat(Some("Bash"))),
+        ];
+        assert_eq!(subagents(&working).len(), 1);
+    }
+
+    #[test]
+    fn mismatched_late_end_does_not_ghost_a_done_agent() {
+        // The real bug: Claude's SubagentStop carried a different agent_id than
+        // SubagentStart AND arrived turns later, so id-based removal never
+        // fired. Turn-boundary clearing must still leave a Done agent clean.
+        let events = [
+            ev(0, turn_start(None)),
+            ev(10, subagent_start("a57", Some("Explore"), None)),
+            ev(20, EventKind::TurnEnd { summary: None }),
+            ev(30, turn_start(None)),
+            ev(40, EventKind::TurnEnd { summary: None }),
+            ev(50, subagent_end("a170")), // wrong id, three turns late
+        ];
+        assert_eq!(
+            derive(&events, at(60), STALE).unwrap().status,
+            SessionStatus::Done
+        );
+        assert!(subagents(&events).is_empty());
     }
 
     #[test]
