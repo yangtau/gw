@@ -42,9 +42,12 @@ bind g popup -E 'GW_POPUP=1 gw'
 | `enter` | jump to the selected agent (popup closes) |
 | `n` | launch a new agent in a new window |
 | `r` | recently ended sessions — `enter` resumes |
-| `tab` | select the next agent needing attention |
-| `j`/`k` | move |
-| `q` | quit |
+| `tab` | toggle between the current and global tmux-session views |
+| `a` | select the next agent needing attention |
+| `j`/`k`, arrows | move |
+| `?` | open the full keyboard-shortcuts page; press `?`, `esc`, or backspace to return |
+| `esc` | return/cancel, or quit from the main panel |
+| `ctrl-c` | quit from anywhere |
 
 Attention events also fire a desktop notification, panel open or not. Configure
 which events notify with `notify = ["attention", "turn_end"]`, or disable them with

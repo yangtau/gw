@@ -198,6 +198,7 @@ struct App {
     plugins: Vec<Plugin>,
     snapshot: Snapshot,
     screen: Screen,
+    show_shortcuts: bool,
     agent_view: PanelView,
     selected: usize,
     picker: Option<usize>,
@@ -231,6 +232,7 @@ impl App {
                 uninstrumented: vec![],
             },
             screen: Screen::Agents,
+            show_shortcuts: false,
             agent_view: initial_view,
             selected: 0,
             picker: None,
@@ -336,11 +338,24 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(Flow::Quit);
         }
+        if self.show_shortcuts {
+            return match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Backspace => {
+                    self.show_shortcuts = false;
+                    Ok(Flow::Continue)
+                }
+                _ => Ok(Flow::Continue),
+            };
+        }
+        if key.code == KeyCode::Char('?') {
+            self.show_shortcuts = true;
+            return Ok(Flow::Continue);
+        }
         if self.picker.is_some() {
             return self.on_picker_key(key);
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(Flow::Quit),
+            KeyCode::Esc => return Ok(Flow::Quit),
             KeyCode::Char('j') | KeyCode::Down => self.select(1),
             KeyCode::Char('k') | KeyCode::Up => self.select(-1),
             KeyCode::Tab => {
@@ -457,6 +472,10 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame) {
+        if self.show_shortcuts {
+            self.render_shortcuts(frame);
+            return;
+        }
         let show_banner = !self.snapshot.uninstrumented.is_empty();
         let layout = frame_layout(frame.area(), &self.screen, show_banner);
 
@@ -671,8 +690,9 @@ impl App {
             .title_alignment(Alignment::Left)
             .title_position(TitlePosition::Top)
             .title(format!(
-                " {}:{} ",
-                agent.pane.window_index, agent.pane.window_name
+                " {}: {} ",
+                project_name(&agent.cwd),
+                agent.provider
             ));
         let inner = block.inner(viewport);
         frame.render_widget(block, viewport);
@@ -700,16 +720,7 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let toggle = match self.agent_view {
-            PanelView::Current => "global",
-            PanelView::Global => "current",
-        };
-        let mut hints = match self.screen {
-            Screen::Agents => {
-                format!(" enter jump · n new · r ended · tab {toggle} · a attention · q quit")
-            }
-            Screen::Ended => format!(" enter resume · r agents · tab {toggle} · q quit"),
-        };
+        let mut hints = " ?".to_owned();
         if matches!(self.screen, Screen::Agents) && self.agent_view == PanelView::Current {
             if let Some(elsewhere) = elsewhere_hint(
                 &self.snapshot.agents,
@@ -719,6 +730,42 @@ impl App {
             }
         }
         frame.render_widget(Paragraph::new(hints).dim(), area);
+    }
+
+    fn render_shortcuts(&self, frame: &mut Frame) {
+        let [main, footer] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+        let section = |title| Line::styled(format!("   {title}"), Style::new().bold().dim());
+        let shortcut = |key, action| {
+            Line::from(vec![
+                Span::raw("   "),
+                Span::styled(pad(key, 14), Style::new().bold()),
+                Span::styled(action, Style::new().dim()),
+            ])
+        };
+        let lines = vec![
+            Line::default(),
+            Line::styled("   keyboard shortcuts", Style::new().bold()),
+            Line::default(),
+            section("navigation"),
+            shortcut("↑ / k", "select previous item"),
+            shortcut("↓ / j", "select next item"),
+            shortcut("enter", "jump, resume, or launch the selected item"),
+            shortcut("a", "select the next agent needing attention"),
+            Line::default(),
+            section("views"),
+            shortcut("tab", "toggle current / all tmux sessions"),
+            shortcut("r", "toggle agents / recently ended sessions"),
+            Line::default(),
+            section("actions"),
+            shortcut("n", "open the new-agent picker"),
+            shortcut("?", "open or close this page"),
+            shortcut("esc", "go back, cancel the picker, or quit the panel"),
+            shortcut("backspace", "go back from this page"),
+            shortcut("ctrl-c", "quit from anywhere"),
+        ];
+        frame.render_widget(Paragraph::new(lines), main);
+        frame.render_widget(Paragraph::new(" ? / esc / backspace back").dim(), footer);
     }
 
     fn render_picker(&self, frame: &mut Frame) {
@@ -887,7 +934,7 @@ fn elsewhere_hint(agents: &[Agent], current_tmux_session_id: Option<&str>) -> Op
         let label = if errors == 1 { "error" } else { "errors" };
         parts.push(format!("{errors} {label}"));
     }
-    Some(format!("{} (tab)", parts.join(SEP)))
+    Some(parts.join(SEP))
 }
 
 fn agent_line(
@@ -1146,6 +1193,14 @@ fn basename(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn project_name(cwd: &std::path::Path) -> String {
+    let root = cwd
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(cwd);
+    basename(root)
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -1390,7 +1445,7 @@ mod tests {
 
         assert_eq!(
             elsewhere_hint(&agents, Some("$1")).as_deref(),
-            Some("2 elsewhere · 1 attention · 1 error (tab)")
+            Some("2 elsewhere · 1 attention · 1 error")
         );
         assert_eq!(elsewhere_hint(&agents[..1], Some("$1")), None);
     }
@@ -1543,6 +1598,22 @@ mod tests {
     fn tail_truncate_keeps_tail() {
         assert_eq!(tail_truncate("~/Workspaces/gw2", 8), "…ces/gw2");
         assert_eq!(tail_truncate("short", 8), "short");
+    }
+
+    #[test]
+    fn project_name_uses_git_root_and_falls_back_to_cwd() {
+        let sandbox = std::env::temp_dir().join(format!("gw-tui-{}", std::process::id()));
+        let project = sandbox.join("gw");
+        let nested = project.join("crates/gw");
+        let standalone = sandbox.join("standalone");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&standalone).unwrap();
+
+        assert_eq!(project_name(&nested), "gw");
+        assert_eq!(project_name(&standalone), "standalone");
+
+        std::fs::remove_dir_all(sandbox).unwrap();
     }
 
     #[test]
