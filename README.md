@@ -45,7 +45,7 @@ bind g popup -E 'GW_POPUP=1 gw'
 | `tab` | toggle between the current and global tmux-session views |
 | `a` | select the next agent needing attention |
 | `j`/`k`, arrows | move |
-| `?` | open the full keyboard-shortcuts page; press `?`, `esc`, or backspace to return |
+| `?` | open the full keyboard-shortcuts page; press `?` or `esc` to return |
 | `esc` | return/cancel, or quit from the main panel |
 | `ctrl-c` | quit from anywhere |
 

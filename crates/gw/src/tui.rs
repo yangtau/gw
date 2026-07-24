@@ -340,7 +340,7 @@ impl App {
         }
         if self.show_shortcuts {
             return match key.code {
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Backspace => {
+                KeyCode::Char('?') | KeyCode::Esc => {
                     self.show_shortcuts = false;
                     Ok(Flow::Continue)
                 }
@@ -761,11 +761,10 @@ impl App {
             shortcut("n", "open the new-agent picker"),
             shortcut("?", "open or close this page"),
             shortcut("esc", "go back, cancel the picker, or quit the panel"),
-            shortcut("backspace", "go back from this page"),
             shortcut("ctrl-c", "quit from anywhere"),
         ];
         frame.render_widget(Paragraph::new(lines), main);
-        frame.render_widget(Paragraph::new(" ? / esc / backspace back").dim(), footer);
+        frame.render_widget(Paragraph::new(" ? / esc back").dim(), footer);
     }
 
     fn render_picker(&self, frame: &mut Frame) {
