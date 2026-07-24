@@ -13,7 +13,7 @@ A tmux-native TUI panel that shows every coding agent running in the current tmu
 
 ## Event ↔ pane correlation
 
-The hook process is a child of the agent process. The core walks the ppid chain to the provider process (matching via the plugin's process rules), resolves its tty to a pane id, and records pane id + pid + native session id + cwd with the events. The panel joins live pane scans against the log from both directions. Jumping resolves strongest-to-weakest: recorded pid alive and still a provider process → its tty's pane; recorded pane still hosting a provider process; heuristics (unique provider pane with same cwd).
+The hook process is a child of the agent process. The core walks the ppid chain to the provider process (matching via the plugin's process rules), resolves its tty to a pane id, and records pane id + pid + native session id + cwd with the events. The panel joins live pane scans to the log by provider pid. If the pid does not match, the Agent remains Unknown until the current process emits a hook event; pane id and cwd describe location but never transfer Session state between processes.
 
 ## UX
 

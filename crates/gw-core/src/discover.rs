@@ -69,9 +69,9 @@ pub struct Snapshot {
 }
 
 /// One full global scan: list panes, find provider processes under each pane,
-/// correlate with session logs (by recorded pane id / pid, falling back to
-/// unique provider+cwd match), derive statuses. Agents sort Attention first,
-/// then by window index; ended sessions sort most recent first.
+/// correlate with session logs by recorded provider pid, derive statuses.
+/// Agents sort Attention first, then by window index; ended sessions sort most
+/// recent first.
 pub fn snapshot(
     store: &Store,
     plugins: &[Plugin],
@@ -137,7 +137,9 @@ fn join(
     let mut matched = HashSet::new();
     let mut agents = Vec::new();
     for candidate in &live {
-        let session_index = match_session(candidate, sessions, &derived, &matched);
+        let session_index = latest_match(sessions, &matched, |session| {
+            session.meta.provider == candidate.provider && session.meta.pid == Some(candidate.pid)
+        });
         let (session_id, agent_status, since, detail, subagents, events) = match session_index {
             // A matched session can still derive nothing: a log whose every
             // line is retired vocabulary reads back empty.
@@ -200,9 +202,7 @@ fn join(
             Some(SessionStatus::Ended)
         );
         let still_live = live.iter().any(|candidate| {
-            candidate.provider == session.meta.provider
-                && (session.meta.pane_id.as_deref() == Some(candidate.pane.id.as_str())
-                    || session.meta.pid == Some(candidate.pid))
+            candidate.provider == session.meta.provider && session.meta.pid == Some(candidate.pid)
         });
         if explicitly_ended || !still_live {
             let Some(ended_at) = session.events.last().and_then(|event| event.ts) else {
@@ -239,41 +239,6 @@ fn join(
         ended,
         uninstrumented,
     }
-}
-
-fn match_session(
-    candidate: &LiveCandidate,
-    sessions: &[SessionRecord],
-    derived: &[Option<Derived>],
-    matched: &HashSet<usize>,
-) -> Option<usize> {
-    let pane_match = latest_match(sessions, matched, |session| {
-        session.meta.provider == candidate.provider
-            && session.meta.pane_id.as_deref() == Some(candidate.pane.id.as_str())
-    });
-    if pane_match.is_some() {
-        return pane_match;
-    }
-
-    let pid_match = latest_match(sessions, matched, |session| {
-        session.meta.provider == candidate.provider && session.meta.pid == Some(candidate.pid)
-    });
-    if pid_match.is_some() {
-        return pid_match;
-    }
-
-    let mut cwd_matches = sessions
-        .iter()
-        .enumerate()
-        .filter(|(index, session)| {
-            !matched.contains(index)
-                && session.meta.provider == candidate.provider
-                && session.meta.cwd.as_ref() == Some(&candidate.cwd)
-                && matches!(derived[*index].as_ref().map(|value| value.status), Some(status) if status != SessionStatus::Ended)
-        })
-        .map(|(index, _)| index);
-    let first = cwd_matches.next()?;
-    cwd_matches.next().is_none().then_some(first)
 }
 
 fn latest_match(
@@ -463,7 +428,7 @@ mod tests {
                 "claude",
                 "claude-live",
                 Some("%1"),
-                None,
+                Some(101),
                 None,
                 10,
                 EventKind::Attention {
@@ -483,8 +448,8 @@ mod tests {
             session(
                 "agy",
                 "agy-live",
-                None,
-                None,
+                Some("%3"),
+                Some(301),
                 Some("/shared"),
                 30,
                 EventKind::TurnEnd { summary: None },
@@ -554,6 +519,74 @@ mod tests {
             ["claude-ended", "codex-old",]
         );
         assert_eq!(snapshot.uninstrumented, ["other"]);
+    }
+
+    #[test]
+    fn blank_agent_does_not_inherit_an_old_session_from_the_same_cwd() {
+        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
+        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
+        let manifests = [manifest("claude", true)];
+        let sessions = [session(
+            "claude",
+            "old",
+            Some("%gone"),
+            Some(999),
+            Some("/work"),
+            10,
+            EventKind::TurnEnd {
+                summary: Some("old result".into()),
+            },
+        )];
+
+        let snapshot = join(
+            &panes,
+            &procs,
+            &sessions,
+            &manifests,
+            at(20),
+            Duration::minutes(30),
+            |_| None,
+        );
+
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Unknown);
+        assert!(snapshot.agents[0].session_id.is_none());
+        assert!(snapshot.agents[0].events.is_empty());
+        assert_eq!(snapshot.ended[0].session_id, "old");
+    }
+
+    #[test]
+    fn blank_agent_does_not_inherit_an_old_session_from_a_reused_pane() {
+        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
+        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
+        let manifests = [manifest("claude", true)];
+        let sessions = [session(
+            "claude",
+            "old",
+            Some("%1"),
+            Some(999),
+            Some("/work"),
+            10,
+            EventKind::TurnEnd {
+                summary: Some("old result".into()),
+            },
+        )];
+
+        let snapshot = join(
+            &panes,
+            &procs,
+            &sessions,
+            &manifests,
+            at(20),
+            Duration::minutes(30),
+            |_| None,
+        );
+
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Unknown);
+        assert!(snapshot.agents[0].session_id.is_none());
+        assert!(snapshot.agents[0].events.is_empty());
+        assert_eq!(snapshot.ended[0].session_id, "old");
     }
 
     #[test]
