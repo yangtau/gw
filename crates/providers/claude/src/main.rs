@@ -1,9 +1,9 @@
 use gw_plugin_protocol::{
-    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
-    ProcessMatch, PROTOCOL_VERSION,
+    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, ProcessMatch,
+    PROTOCOL_VERSION,
 };
-use gw_provider_sdk::{excerpt, one_liner, text};
-use serde_json::{json, Map, Value};
+use gw_provider_sdk::{command_hook_patch, excerpt, one_liner, text};
+use serde_json::{Map, Value};
 
 fn main() {
     gw_provider_sdk::run(manifest(), "session_id", map_kind);
@@ -31,7 +31,7 @@ const SUBSCRIPTIONS: [(&str, Option<&str>); 13] = [
 fn manifest() -> Manifest {
     let patches = SUBSCRIPTIONS
         .into_iter()
-        .map(|(event, matcher)| hook_patch(event, matcher))
+        .map(|(event, matcher)| command_hook_patch("claude", event, matcher))
         .collect();
 
     Manifest {
@@ -55,22 +55,6 @@ fn manifest() -> Manifest {
             patches,
         }],
         managed_files: Vec::new(),
-    }
-}
-
-fn hook_patch(event: &str, matcher: Option<&str>) -> Patch {
-    let mut value = Map::new();
-    if let Some(matcher) = matcher {
-        value.insert("matcher".into(), json!(matcher));
-    }
-    value.insert(
-        "hooks".into(),
-        json!([{"type": "command", "command": "gw hook claude"}]),
-    );
-    Patch {
-        pointer: format!("/hooks/{event}"),
-        mode: PatchMode::Ensure,
-        value: Value::Object(value),
     }
 }
 

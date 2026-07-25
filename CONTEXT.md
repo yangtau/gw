@@ -21,7 +21,7 @@ one pane is one Agent row. For Amp, that row follows only the interactive TUI's
 foreground thread; background threads do not take ownership of the row.
 
 ### Status
-An Agent's runtime state. Its **only source is provider hook events**: hooks installed into the provider's config report key moments (turn start, stop, approval requests); the panel derives Status from the event stream. The tool never scrapes pane content or injects keys. Statuses are **eventually consistent**: attention is cleared by subsequent activity events, never by explicit acknowledgement.
+An Agent's runtime state. Dynamic states come from provider hook events: hooks installed into the provider's config report key moments (turn start, stop, approval requests), and the panel derives Status from that event stream. A discovered process with no attributable events defaults to **Idle**. The tool never scrapes pane content or injects keys. Statuses are **eventually consistent**: attention is cleared by subsequent activity events, never by explicit acknowledgement.
 
 Table order is sort order (most urgent first):
 
@@ -32,8 +32,7 @@ Table order is sort order (most urgent first):
 | **Stale** | Working, but silent past a threshold — a suspected silent failure (hung process, provider without failure events dying quietly). |
 | **Working** | A turn is in progress. |
 | **Done** | The last turn finished normally; its result awaits the user. Cleared only by the next turn — never by being looked at. |
-| **Idle** | Session alive but no turn has run yet. |
-| **Unknown** | Agent process discovered but no hook events attributable to it. |
+| **Idle** | Agent alive with no active turn, including a newly discovered process that has not emitted an attributable event yet. |
 
 Statuses a provider can reach depend on which hook events it emits; the model is sized to the richest provider and degrades per-provider. Existence is not a Status: when the pane/process disappears, the Agent leaves the panel (hence no "exited" state — Done is about the turn, not the process).
 

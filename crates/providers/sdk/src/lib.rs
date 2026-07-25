@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use gw_plugin_protocol::{Event, EventKind, Manifest, PROTOCOL_VERSION};
-use serde_json::{Map, Value};
+use gw_plugin_protocol::{Event, EventKind, Manifest, Patch, PatchMode, PROTOCOL_VERSION};
+use serde_json::{json, Map, Value};
 
 pub fn run(
     manifest: Manifest,
@@ -89,6 +89,28 @@ pub fn normalize(
     }]
 }
 
+/// Build the command-hook patch shared by providers using the Claude-style
+/// hook config shape. Providers retain ownership of which events and matchers
+/// they subscribe to; the SDK owns the protocol pointer and command encoding.
+pub fn command_hook_patch(provider: &str, event: &str, matcher: Option<&str>) -> Patch {
+    let mut value = Map::new();
+    if let Some(matcher) = matcher {
+        value.insert("matcher".into(), json!(matcher));
+    }
+    value.insert(
+        "hooks".into(),
+        json!([{
+            "type": "command",
+            "command": format!("gw hook {provider}")
+        }]),
+    );
+    Patch {
+        pointer: format!("/hooks/{event}"),
+        mode: PatchMode::Ensure,
+        value: Value::Object(value),
+    }
+}
+
 pub fn text(payload: &Map<String, Value>, field: &str) -> Option<String> {
     payload
         .get(field)
@@ -158,6 +180,32 @@ mod tests {
         assert_eq!(event.ts, None);
         assert_eq!(event.session, "s1");
         assert_eq!(event.kind, EventKind::SessionEnd);
+    }
+
+    #[test]
+    fn command_hook_patch_hides_config_and_command_encoding() {
+        let patch = command_hook_patch(
+            "claude",
+            "Notification",
+            Some("elicitation_dialog|agent_needs_input"),
+        );
+
+        assert_eq!(patch.pointer, "/hooks/Notification");
+        assert_eq!(patch.mode, PatchMode::Ensure);
+        assert_eq!(
+            patch.value,
+            json!({
+                "matcher": "elicitation_dialog|agent_needs_input",
+                "hooks": [{
+                    "type": "command",
+                    "command": "gw hook claude"
+                }]
+            })
+        );
+
+        let unmatched = command_hook_patch("codex", "Stop", None);
+        assert!(unmatched.value.get("matcher").is_none());
+        assert_eq!(unmatched.value["hooks"][0]["command"], "gw hook codex");
     }
 
     #[test]

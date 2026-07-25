@@ -33,6 +33,57 @@ pub fn remove(manifests: &[Manifest]) -> Result<Vec<(PathBuf, Outcome)>> {
     apply(manifests, true)
 }
 
+/// Whether every integration target declared by a provider is currently
+/// installed. Missing, unreadable, malformed, or drifted targets all count as
+/// not installed so the panel can recommend `gw setup` without inferring
+/// setup health from the event log.
+pub fn integration_is_installed(manifest: &Manifest) -> bool {
+    integration_is_installed_result(manifest).unwrap_or(false)
+}
+
+fn integration_is_installed_result(manifest: &Manifest) -> Result<bool> {
+    for hook in &manifest.hooks {
+        if hook.patches.is_empty() {
+            continue;
+        }
+        let path = expand_path(&hook.path)?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let input = fs::read_to_string(path)?;
+        match hook.format {
+            FileFormat::Json => {
+                let document: JsonValue = serde_json::from_str(&input)?;
+                for patch in &hook.patches {
+                    if !json_patch_is_applied(&document, patch)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            FileFormat::Toml => {
+                let document = input.parse::<DocumentMut>()?;
+                for patch in &hook.patches {
+                    if !toml_patch_is_applied(document.as_table(), patch)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    for file in &manifest.managed_files {
+        if file.comment_prefix.is_empty() || file.comment_prefix.contains(['\n', '\r']) {
+            return Ok(false);
+        }
+        let path = expand_path(&file.path)?;
+        if !path.exists() || fs::read_to_string(path)? != render_managed(&manifest.id, file) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
 struct Target<'a> {
     path: PathBuf,
     format: FileFormat,
@@ -277,6 +328,19 @@ fn apply_json_patch(document: &mut JsonValue, patch: &Patch, removing: bool) -> 
     }
 }
 
+fn json_patch_is_applied(document: &JsonValue, patch: &Patch) -> Result<bool> {
+    let tokens = pointer_tokens(&patch.pointer)?;
+    let Some(target) = json_lookup(document, &tokens) else {
+        return Ok(false);
+    };
+    Ok(match patch.mode {
+        PatchMode::Ensure => target
+            .as_array()
+            .is_some_and(|array| array.iter().any(|value| value == &patch.value)),
+        PatchMode::Set => target == &patch.value,
+    })
+}
+
 fn json_get_or_create<'a>(
     current: &'a mut JsonValue,
     tokens: &[String],
@@ -457,6 +521,34 @@ fn apply_toml_patch(
     }
 }
 
+fn toml_patch_is_applied(document: &Table, patch: &Patch) -> Result<bool> {
+    let tokens = pointer_tokens(&patch.pointer)?;
+    let Some((key, parents)) = tokens.split_last() else {
+        bail!("TOML patch pointer must not be empty");
+    };
+    let mut table: &dyn TableLike = document;
+    for parent in parents {
+        let Some(child) = table.get(parent).and_then(Item::as_table_like) else {
+            return Ok(false);
+        };
+        table = child;
+    }
+    let Some(target) = table.get(key) else {
+        return Ok(false);
+    };
+    Ok(match patch.mode {
+        PatchMode::Ensure => target
+            .as_value()
+            .and_then(TomlValue::as_array)
+            .is_some_and(|array| {
+                array
+                    .iter()
+                    .any(|value| toml_value_matches_json(value, &patch.value))
+            }),
+        PatchMode::Set => toml_item_matches_json(target, &patch.value),
+    })
+}
+
 /// In every array directly under the object at `parent`, remove elements
 /// that mention a gw ownership marker but are not the value `keep` ensures
 /// at that exact pointer — the same value ensured under a sibling key does
@@ -518,6 +610,17 @@ fn json_lookup_mut<'a>(
         current = match current {
             JsonValue::Object(object) => object.get_mut(token)?,
             JsonValue::Array(array) => array.get_mut(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn json_lookup<'a>(mut current: &'a JsonValue, tokens: &[String]) -> Option<&'a JsonValue> {
+    for token in tokens {
+        current = match current {
+            JsonValue::Object(object) => object.get(token)?,
+            JsonValue::Array(array) => array.get(token.parse::<usize>().ok()?)?,
             _ => return None,
         };
     }
@@ -760,21 +863,26 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("gw.ts");
         let old = managed(&path, "old\n");
+        assert!(!integration_is_installed(&old));
         assert_eq!(
             install(std::slice::from_ref(&old)).unwrap()[0].1,
             Outcome::Changed
         );
+        assert!(integration_is_installed(&old));
         assert_eq!(
             install(std::slice::from_ref(&old)).unwrap()[0].1,
             Outcome::AlreadyApplied
         );
         let new = managed(&path, "new\n");
+        assert!(!integration_is_installed(&new));
         assert_eq!(
             install(std::slice::from_ref(&new)).unwrap()[0].1,
             Outcome::Changed
         );
+        assert!(integration_is_installed(&new));
         assert!(backup_path(&path).exists());
         fs::write(&path, "unrelated").unwrap();
+        assert!(!integration_is_installed(&new));
         assert!(install(std::slice::from_ref(&new)).is_err());
         fs::write(
             &path,
@@ -822,10 +930,12 @@ mod tests {
             vec![ensure("/hooks/Stop", value.clone())],
         );
 
+        assert!(!integration_is_installed(&manifest));
         assert_eq!(
             install(std::slice::from_ref(&manifest)).unwrap()[0].1,
             Outcome::Changed
         );
+        assert!(integration_is_installed(&manifest));
         let installed = fs::read_to_string(&path).unwrap();
         let document: JsonValue = serde_json::from_str(&installed).unwrap();
         assert_eq!(document["z-odd/key"]["nested"]["keep"], json!([3, 2, 1]));
@@ -849,7 +959,11 @@ mod tests {
         let document: JsonValue = serde_json::from_str(&removed).unwrap();
         assert!(document["hooks"].get("Stop").is_none());
         assert_eq!(document["hooks"]["Other"], json!([{"command": "keep"}]));
-        assert_eq!(remove(&[manifest]).unwrap()[0].1, Outcome::AlreadyApplied);
+        assert_eq!(
+            remove(std::slice::from_ref(&manifest)).unwrap()[0].1,
+            Outcome::AlreadyApplied
+        );
+        assert!(!integration_is_installed(&manifest));
         assert_eq!(fs::read_to_string(&path).unwrap(), removed);
     }
 
@@ -957,10 +1071,12 @@ mod tests {
             ],
         );
 
+        assert!(!integration_is_installed(&manifest));
         assert_eq!(
             install(std::slice::from_ref(&manifest)).unwrap()[0].1,
             Outcome::Changed
         );
+        assert!(integration_is_installed(&manifest));
         let installed = fs::read_to_string(&path).unwrap();
         assert!(installed.contains("# top comment"));
         assert!(installed.contains("# inline comment"));
@@ -980,7 +1096,11 @@ mod tests {
         let document = removed.parse::<DocumentMut>().unwrap();
         assert!(document["hooks"].get("Stop").is_none());
         assert_eq!(document["features"]["gw"].as_bool(), Some(true));
-        assert_eq!(remove(&[manifest]).unwrap()[0].1, Outcome::AlreadyApplied);
+        assert_eq!(
+            remove(std::slice::from_ref(&manifest)).unwrap()[0].1,
+            Outcome::AlreadyApplied
+        );
+        assert!(!integration_is_installed(&manifest));
         assert_eq!(fs::read_to_string(&path).unwrap(), removed);
     }
 

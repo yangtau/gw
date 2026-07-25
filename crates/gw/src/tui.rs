@@ -229,7 +229,7 @@ impl App {
             snapshot: Snapshot {
                 agents: vec![],
                 ended: vec![],
-                uninstrumented: vec![],
+                setup_required: vec![],
             },
             screen: Screen::Agents,
             show_shortcuts: false,
@@ -476,13 +476,13 @@ impl App {
             self.render_shortcuts(frame);
             return;
         }
-        let show_banner = !self.snapshot.uninstrumented.is_empty();
+        let show_banner = !self.snapshot.setup_required.is_empty();
         let layout = frame_layout(frame.area(), &self.screen, show_banner);
 
         if show_banner {
             let msg = format!(
-                " hooks not installed for {} — run `gw setup`",
-                self.snapshot.uninstrumented.join(", ")
+                " setup required for {} — run `gw setup`",
+                self.snapshot.setup_required.join(", ")
             );
             frame.render_widget(
                 Paragraph::new(msg).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
@@ -1013,7 +1013,6 @@ fn status_cell(status: AgentStatus) -> (&'static str, &'static str, Color) {
         AgentStatus::Working => ("●", "working", Color::Green),
         AgentStatus::Done => ("●", "done", Color::Cyan),
         AgentStatus::Idle => ("○", "idle", Color::Blue),
-        AgentStatus::Unknown => ("?", "unknown", Color::DarkGray),
     }
 }
 

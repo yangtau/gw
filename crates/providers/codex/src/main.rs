@@ -2,7 +2,7 @@ use gw_plugin_protocol::{
     AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
     ProcessMatch, PROTOCOL_VERSION,
 };
-use gw_provider_sdk::{excerpt, one_liner, text};
+use gw_provider_sdk::{command_hook_patch, excerpt, one_liner, text};
 use serde_json::{json, Map, Value};
 
 fn main() {
@@ -23,7 +23,7 @@ fn manifest() -> Manifest {
         "Stop",
     ]
     .into_iter()
-    .map(hook_patch)
+    .map(|event| command_hook_patch("codex", event, None))
     .collect();
 
     Manifest {
@@ -58,19 +58,6 @@ fn manifest() -> Manifest {
             },
         ],
         managed_files: Vec::new(),
-    }
-}
-
-fn hook_patch(event: &str) -> Patch {
-    Patch {
-        pointer: format!("/hooks/{event}"),
-        mode: PatchMode::Ensure,
-        value: json!({
-            "hooks": [{
-                "type": "command",
-                "command": "gw hook codex"
-            }]
-        }),
     }
 }
 

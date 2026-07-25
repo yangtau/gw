@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-07-13)
+Accepted (2026-07-13); amended (2026-07-25)
 
 ## Context
 
@@ -10,11 +10,11 @@ The panel must show what each agent is doing (working / waiting for approval / i
 
 ## Decision
 
-Status is derived **exclusively from provider hook events**. The tool never captures pane content for state and never injects keys. (An earlier allowance of capture-pane for the human-facing preview ended with ADR-0004; the tool no longer reads pane content at all.)
+Dynamic status is derived **exclusively from provider hook events**; the sole fallback is that a discovered process with no attributable event is Idle. The tool never captures pane content for state and never injects keys. (An earlier allowance of capture-pane for the human-facing preview ended with ADR-0004; the tool no longer reads pane content at all.)
 
 There is **no daemon**. Each hook invocation appends normalized events to a per-session append-only JSONL log. The TUI replays the log to derive status (`fn derive(events) -> Status` is pure) and follows it live via filesystem watch. Statuses are eventually consistent: attention clears when later activity events arrive, never by explicit acknowledgement.
 
-Agents without hooks installed show as **Unknown**; the fix is a one-time global `gw setup` that installs hooks into provider configs (surgical merge: preserve unrelated content, back up before writing, idempotent).
+A discovered Agent with no attributable events is **Idle**. Event absence is not an installation-health signal: a provider can legitimately be alive before its first event. For live providers, the panel checks the hook/config or managed-file targets declared by the provider manifest and recommends `gw setup` only when those targets are missing, unreadable, malformed, or drifted.
 
 ## Consequences
 
@@ -22,5 +22,5 @@ Agents without hooks installed show as **Unknown**; the fix is a one-time global
 - No daemon lifecycle problems; logs survive crashes; `cat` is the debugger.
 - Status derivation is trivially golden-testable (event log fixture → expected status).
 - A hung agent would show Working forever, so a Stale status (no events past a threshold while the process lives) is part of the model.
-- Requires the setup step; an uninstrumented provider degrades to Unknown rather than a rough guess.
+- Requires the setup step; an uninstrumented provider remains Idle without events, while a separate setup-health banner reports the broken integration.
 - Log files need a retention sweep (delete logs of long-gone sessions on startup).

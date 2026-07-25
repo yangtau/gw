@@ -6,14 +6,14 @@ A tmux-native TUI panel that shows every coding agent running in the current tmu
 
 - **Discovery-based identity** — an Agent is any pane in the current session whose process tree matches a provider's process rules. No registry; panes are the source of truth. ([CONTEXT.md](../CONTEXT.md))
 - **One row per pane** — providers may host more than one native Session, but the panel still renders one Agent per pane. Amp's row follows its interactive TUI's foreground thread; background threads and non-TUI runner/execute modes are outside the integration boundary.
-- **Hook-only status, no daemon** — plugins normalize provider hook payloads into unified events; the core appends them to per-session JSONL logs; the TUI derives status by pure replay + fs watch. (ADR 0001)
+- **Hook-driven status, no daemon** — plugins normalize provider hook payloads into unified events; the core appends them to per-session JSONL logs; the TUI derives dynamic status by pure replay + fs watch, with Idle as the fallback before a discovered process emits its first event. (ADR 0001)
 - **Providers as external executables** — `gw-provider-<id>` binaries speaking a pure-translator protocol (`manifest` / `normalize`); the core owns all I/O. (ADR 0002)
-- **Statuses** (sort order = priority): Attention (approval > question) / Error / Stale / Working / Done / Idle / Unknown. Done means the turn ended; it never decays. ([CONTEXT.md](../CONTEXT.md))
+- **Statuses** (sort order = priority): Attention (approval > question) / Error / Stale / Working / Done / Idle. Done means the turn ended; it never decays. ([CONTEXT.md](../CONTEXT.md))
 - **Session vs Agent**: an ended Session (pane gone, native session id in the log) is resumable from a secondary view.
 
 ## Event ↔ pane correlation
 
-The hook process is a child of the agent process. The core walks the ppid chain to the provider process (matching via the plugin's process rules), resolves its tty to a pane id, and records pane id + pid + native session id + cwd with the events. The panel joins live pane scans to the log by provider pid. If the pid does not match, the Agent remains Unknown until the current process emits a hook event; pane id and cwd describe location but never transfer Session state between processes.
+The hook process is a child of the agent process. The core walks the ppid chain to the provider process (matching via the plugin's process rules), resolves its tty to a pane id, and records pane id + pid + native session id + cwd with the events. The panel joins live pane scans to the log by provider pid. If the pid does not match, the Agent is Idle until the current process emits a hook event; pane id and cwd describe location but never transfer Session state between processes.
 
 ## UX
 
@@ -22,7 +22,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 - **Activity**: compact event timeline of the selected agent (recent turns, tool activity, attention, subagents from its Event Log; display only — the panel never touches the agent's window).
 - **Keys (v1)**: `j/k` or arrows move, `Enter` jumps, `n` launches (pick provider → new window in the panel's cwd → jump), `r` toggles the resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` toggles current/global views, `a` selects the next Attention agent, `?` opens the keyboard-shortcuts page, and `Esc`/`Ctrl-C` quit.
 - **Notifications**: `gw hook` itself fires a desktop notification (macOS `osascript`) + terminal bell when writing an attention event — global notifications without a daemon.
-- **Setup**: `gw setup` installs hooks into provider global configs for every discovered plugin. Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. Providers may also declare a whole managed integration file: the core creates, hashes, upgrades, and removes it only while its ownership marker and body hash prove it remains unmodified. Amp uses this for `~/.config/amp/plugins/gw.ts`. The panel banners providers that are discovered but uninstrumented.
+- **Setup**: `gw setup` installs hooks into provider global configs for every discovered plugin. Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. Providers may also declare a whole managed integration file: the core creates, hashes, upgrades, and removes it only while its ownership marker and body hash prove it remains unmodified. Amp uses this for `~/.config/amp/plugins/gw.ts`. For live providers, the panel checks these declared targets directly and banners only when setup is missing or drifted; event presence is not evidence of setup health.
 
 ## Plugin protocol (v1 sketch)
 

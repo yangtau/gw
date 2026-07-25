@@ -12,6 +12,7 @@ use gw_plugin_protocol::Event;
 use crate::plugins::Plugin;
 use crate::procs::{self, Proc};
 use crate::protocol::{AttentionKind, Manifest};
+use crate::setup;
 use crate::status::{self, Derived, SessionStatus, Subagent};
 use crate::store::{SessionRecord, Store};
 use crate::tmux::{self, Pane, TmuxSessionPane, TopologyRow};
@@ -27,8 +28,6 @@ pub enum AgentStatus {
     Working,
     Done,
     Idle,
-    /// Agent process discovered but no hook events attributable to it.
-    Unknown,
 }
 
 /// A live agent: a provider process in a pane of a tmux session.
@@ -42,7 +41,7 @@ pub struct Agent {
     pub cwd: PathBuf,
     pub session_id: Option<String>,
     pub status: AgentStatus,
-    /// When the current status was established; None for Unknown.
+    /// When the current status was established; None before the first event.
     pub since: Option<DateTime<Utc>>,
     /// One-line context for the status (task, activity, result, reason).
     pub detail: Option<String>,
@@ -64,8 +63,8 @@ pub struct EndedSession {
 pub struct Snapshot {
     pub agents: Vec<Agent>,
     pub ended: Vec<EndedSession>,
-    /// Provider ids discovered as plugins but with no hooks installed.
-    pub uninstrumented: Vec<String>,
+    /// Live providers whose declared hook/config integration is not installed.
+    pub setup_required: Vec<String>,
 }
 
 /// One full global scan: list panes, find provider processes under each pane,
@@ -86,7 +85,7 @@ pub fn snapshot(
         .iter()
         .map(|plugin| plugin.manifest.clone())
         .collect();
-    Ok(join(
+    let mut snapshot = join(
         &panes,
         &procs,
         &sessions,
@@ -94,7 +93,9 @@ pub fn snapshot(
         now,
         stale_after,
         procs::cwd_of,
-    ))
+    );
+    snapshot.setup_required = providers_requiring_setup(&snapshot.agents, &manifests);
+    Ok(snapshot)
 }
 
 #[derive(Debug)]
@@ -152,7 +153,7 @@ fn join(
                         Some(derived.since),
                         derived.detail.clone(),
                     ),
-                    None => (AgentStatus::Unknown, None, None),
+                    None => (AgentStatus::Idle, None, None),
                 };
                 let subagents = status::subagents(&session.events);
                 let events = session.events
@@ -167,14 +168,7 @@ fn join(
                     events,
                 )
             }
-            None => (
-                None,
-                AgentStatus::Unknown,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-            ),
+            None => (None, AgentStatus::Idle, None, None, Vec::new(), Vec::new()),
         };
         agents.push(Agent {
             provider: candidate.provider.clone(),
@@ -217,28 +211,26 @@ fn join(
         }
     }
 
-    let uninstrumented = manifests
-        .iter()
-        .filter(|manifest| {
-            (!manifest.hooks.is_empty() || !manifest.managed_files.is_empty())
-                && !sessions
-                    .iter()
-                    .any(|session| session.meta.provider == manifest.id)
-                && agents.iter().any(|agent| {
-                    agent.provider == manifest.id && agent.status == AgentStatus::Unknown
-                })
-        })
-        .map(|manifest| manifest.id.clone())
-        .collect();
-
     agents.sort_by_key(|agent| (agent.status, agent.pane.window_index));
     ended.sort_by_key(|session| std::cmp::Reverse(session.ended_at));
 
     Snapshot {
         agents,
         ended,
-        uninstrumented,
+        setup_required: Vec::new(),
     }
+}
+
+fn providers_requiring_setup(agents: &[Agent], manifests: &[Manifest]) -> Vec<String> {
+    manifests
+        .iter()
+        .filter(|manifest| {
+            (!manifest.hooks.is_empty() || !manifest.managed_files.is_empty())
+                && agents.iter().any(|agent| agent.provider == manifest.id)
+                && !setup::integration_is_installed(manifest)
+        })
+        .map(|manifest| manifest.id.clone())
+        .collect()
 }
 
 fn latest_match(
@@ -267,8 +259,11 @@ fn map_status(status: SessionStatus) -> AgentStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::protocol::{
-        Command as ProviderCommand, Event, EventKind, FileFormat, HookFile, Manifest, ProcessMatch,
+        Command as ProviderCommand, Event, EventKind, FileFormat, HookFile, ManagedFile, Manifest,
+        ProcessMatch,
     };
     use crate::store::SessionMeta;
 
@@ -370,6 +365,16 @@ mod tests {
                 .collect(),
             managed_files: Vec::new(),
         }
+    }
+
+    fn managed_manifest(id: &str, path: &Path) -> Manifest {
+        let mut manifest = manifest(id, false);
+        manifest.managed_files.push(ManagedFile {
+            path: path.to_string_lossy().into_owned(),
+            content: "bridge\n".into(),
+            comment_prefix: "//".into(),
+        });
+        manifest
     }
 
     fn session(
@@ -508,7 +513,7 @@ mod tests {
         assert_eq!(snapshot.agents[1].tmux_session_id, "$2");
         assert_eq!(snapshot.agents[2].status, AgentStatus::Done);
         assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("agy-live"));
-        assert_eq!(snapshot.agents[3].status, AgentStatus::Unknown);
+        assert_eq!(snapshot.agents[3].status, AgentStatus::Idle);
         assert!(snapshot.agents[3].events.is_empty());
         assert_eq!(
             snapshot
@@ -518,7 +523,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["claude-ended", "codex-old",]
         );
-        assert_eq!(snapshot.uninstrumented, ["other"]);
+        assert!(snapshot.setup_required.is_empty());
+    }
+
+    #[test]
+    fn idle_agent_setup_warning_follows_integration_file_not_event_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gw.ts");
+        let manifests = [managed_manifest("amp", &path)];
+        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
+        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "amp")];
+        let snapshot = join(
+            &panes,
+            &procs,
+            &[],
+            &manifests,
+            at(20),
+            Duration::minutes(30),
+            |_| None,
+        );
+
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
+        assert_eq!(
+            providers_requiring_setup(&snapshot.agents, &manifests),
+            ["amp"]
+        );
+
+        setup::install(&manifests).unwrap();
+        assert!(providers_requiring_setup(&snapshot.agents, &manifests).is_empty());
+
+        std::fs::write(path, "modified").unwrap();
+        assert_eq!(
+            providers_requiring_setup(&snapshot.agents, &manifests),
+            ["amp"]
+        );
     }
 
     #[test]
@@ -549,7 +587,7 @@ mod tests {
         );
 
         assert_eq!(snapshot.agents.len(), 1);
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Unknown);
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
         assert!(snapshot.agents[0].session_id.is_none());
         assert!(snapshot.agents[0].events.is_empty());
         assert_eq!(snapshot.ended[0].session_id, "old");
@@ -583,7 +621,7 @@ mod tests {
         );
 
         assert_eq!(snapshot.agents.len(), 1);
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Unknown);
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
         assert!(snapshot.agents[0].session_id.is_none());
         assert!(snapshot.agents[0].events.is_empty());
         assert_eq!(snapshot.ended[0].session_id, "old");
@@ -701,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_session_with_no_readable_events_is_unknown() {
+    fn matched_session_with_no_readable_events_is_idle() {
         let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
         let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
         let manifests = [manifest("claude", true)];
@@ -728,7 +766,7 @@ mod tests {
             |_| None,
         );
 
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Unknown);
+        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
         assert_eq!(snapshot.agents[0].session_id.as_deref(), Some("old"));
     }
 }
