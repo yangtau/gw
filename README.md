@@ -1,10 +1,67 @@
 # gw
 
-A tmux-native status panel for coding agents. One popup shows every Claude / Codex / Amp / (your own) agent running in tmux, what state it's in, and jumps you to the one that needs you.
+A tmux-native status panel for coding agents. Summon one popup and see every
+Claude / Codex / Amp / (your own) agent running across your tmux sessions — what
+each is doing, which one is blocked on you — then press `enter` to jump straight
+to it.
 
-- **Discovery-based** — any pane running a known agent CLI shows up, however it was started.
-- **Hook-driven status** — Attention / Working / Idle / Stale, derived purely from provider hook events. No pane scraping, no key injection, no daemon.
-- **Pluggable providers** — a provider is a standalone `gw-provider-<id>` executable speaking a small pure-translator protocol; private CLIs plug in from their own repositories. See [docs/protocol.md](docs/protocol.md).
+```
+   Claude  ● approval  Run: kubectl apply -f deplo…  ~/code/api-gateway    · feat/rate-limiter      · 1:api    · 4m
+   Amp     ✗ error     rate_limit: provider thrott…  ~/code/infra          · chore/staging-cluster  · 4:infra  · 5m
+ ❯ Claude  ● working   Edit · Migrate dashboard to…  ~/code/web-dashboard  · feat/server-components · 2:web    · 6m
+   ↳ Explore · haiku · map component tree · 6m
+   ↳ Plan · sequence the migration · 5m
+   Codex   ● done      Added idempotency keys + te…  ~/code/billing-worker · main                   · 3:worker · 4m
+
+ ╭ web-dashboard: claude ─────────────────────────────────────────────────────────────────────────────────────────╮
+ │  7m session    claude-sonnet-4                                                                                 │
+ │  6m turn       Migrate dashboard to server components                                                          │
+ │  6m subagent+  Explore · map component tree                                                                    │
+ │  5m subagent+  Plan · sequence the migration                                                                   │
+ │  3m tool       Edit                                                                                            │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+Each row is one agent: provider, status, one-line detail, and a dim right cluster
+(working directory · git branch · tmux window · age). The most urgent agents sort
+to the top. Selecting a row opens its **Activity** timeline below — the same event
+stream that drives status — so you can tell what an agent has been up to without
+leaving the panel.
+
+## Why
+
+Running several agents at once, the hard question is never "what are they all
+doing" — it's "which one needs me right now". `gw` answers that in one keystroke:
+
+- **Discovery-based** — any pane running a known agent CLI shows up, however it
+  was started. tmux panes are the single source of truth; `gw` keeps no registry.
+- **Hook-driven status** — Attention / Error / Stale / Working / Done / Idle,
+  derived purely from provider hook events. No pane scraping, no key injection,
+  no daemon. The event log is the only persistent state, and status is a pure
+  function of replaying it.
+- **Attention routing** — `a` jumps to the next agent blocked on you (a pending
+  approval or question); attention also fires a desktop notification whether the
+  panel is open or not.
+- **Pluggable providers** — a provider is a standalone `gw-provider-<id>`
+  executable speaking a small pure-translator protocol; private CLIs plug in from
+  their own repositories. See [docs/protocol.md](docs/protocol.md).
+
+## Status model
+
+Statuses are **eventually consistent**: attention is cleared by later activity,
+never by being acknowledged. Rows sort most-urgent-first in this order:
+
+| Status | Meaning |
+|---|---|
+| **Attention** | Blocked mid-turn on you: a pending **approval** or a **question** the agent asked. |
+| **Error** | The last turn aborted with a provider-reported failure (rate limit, billing, auth). |
+| **Stale** | Working, but silent past a threshold — a suspected hang or quiet death. |
+| **Working** | A turn is in progress. |
+| **Done** | The last turn finished; its result awaits you. Cleared only by the next turn. |
+| **Idle** | Alive with no active turn, or newly discovered with no events yet. |
+
+Which statuses a provider can reach depends on the hook events it emits; the
+model is sized to the richest provider and degrades gracefully per-provider.
 
 ## Setup
 
@@ -29,11 +86,14 @@ Then install the provider hooks (backed up, surgical, reversible):
 gw setup
 ```
 
-Bind a key in `~/.tmux.conf` for the switcher posture:
+Bind a key in `~/.tmux.conf` for the switcher posture — summon, pick, jump, gone:
 
 ```tmux
 bind g popup -E 'GW_POPUP=1 gw'
 ```
+
+`gw` runs equally well in a persistent pane (dashboard mode) or a `display-popup`
+(switcher mode); the only difference is whether it exits after a jump.
 
 ## Keys
 
@@ -49,16 +109,19 @@ bind g popup -E 'GW_POPUP=1 gw'
 | `esc` | return/cancel, or quit from the main panel |
 | `ctrl-c` | quit from anywhere |
 
-Attention events also fire a desktop notification, panel open or not. Configure
-which events notify with `notify = ["attention", "turn_end"]`, or disable them with
-`notify = false`, in `~/.config/gw/config.toml`.
+Configure which events notify with `notify = ["attention", "turn_end"]`, or
+disable them with `notify = false`, in `~/.config/gw/config.toml`. The starting
+view (`current` or `global`) is configurable there too.
 
 ## Layout
 
 - `crates/gw` — the binary: panel TUI, `gw hook` ingest, `gw setup`.
-- `crates/gw-core` — domain: discovery, correlation, Session interpretation (Status, Subagents, Activity), event store, tmux/ps wrappers.
-- `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust plugin authors.
-- `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp` — official provider plugins.
+- `crates/gw-core` — domain: discovery, correlation, Session interpretation
+  (Status, Subagents, Activity), event store, tmux/ps wrappers.
+- `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust
+  plugin authors.
+- `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp` —
+  official provider plugins.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
 tracking that TUI's foreground thread; runner/execute modes and background
@@ -66,4 +129,5 @@ threads are intentionally excluded. `gw setup` installs the observer plugin at
 `~/.config/amp/plugins/gw.ts`; restart Amp or run `plugins: reload` in an
 already-running TUI after setup.
 
-Design notes live in [docs/design.md](docs/design.md); vocabulary in [CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).
+Design notes live in [docs/design.md](docs/design.md); vocabulary in
+[CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).
