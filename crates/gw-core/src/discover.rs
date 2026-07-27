@@ -7,28 +7,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use gw_plugin_protocol::Event;
 
 use crate::plugins::Plugin;
 use crate::procs::{self, Proc};
-use crate::protocol::{AttentionKind, Manifest};
+use crate::protocol::Manifest;
+use crate::session::{self, ActivityEntry, Status, Subagent};
 use crate::setup;
-use crate::status::{self, Derived, SessionStatus, Subagent};
 use crate::store::{SessionRecord, Store};
 use crate::tmux::{self, Pane, TmuxSessionPane, TopologyRow};
-
-const AGENT_EVENT_TAIL: usize = 64;
-
-/// Variant order is priority order: the panel sorts by it, most urgent first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AgentStatus {
-    Attention(AttentionKind),
-    Error,
-    Stale,
-    Working,
-    Done,
-    Idle,
-}
 
 /// A live agent: a provider process in a pane of a tmux session.
 #[derive(Debug, Clone)]
@@ -40,14 +26,15 @@ pub struct Agent {
     pub pid: i32,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
-    pub status: AgentStatus,
+    pub status: Status,
     /// When the current status was established; None before the first event.
     pub since: Option<DateTime<Utc>>,
     /// One-line context for the status (task, activity, result, reason).
     pub detail: Option<String>,
     /// Subagents currently running inside this session, in start order.
     pub subagents: Vec<Subagent>,
-    pub events: Vec<Event>,
+    /// Recent display-ready Activity in Event Log order.
+    pub activity: Vec<ActivityEntry>,
 }
 
 /// An ended but resumable session (log has a session id, pane is gone).
@@ -131,9 +118,9 @@ fn join(
         }
     }
 
-    let derived: Vec<Option<Derived>> = sessions
+    let interpretations: Vec<_> = sessions
         .iter()
-        .map(|session| status::derive(&session.events, now, stale_after))
+        .map(|record| session::interpret(&record.events, now, stale_after))
         .collect();
     let mut matched = HashSet::new();
     let mut agents = Vec::new();
@@ -141,34 +128,21 @@ fn join(
         let session_index = latest_match(sessions, &matched, |session| {
             session.meta.provider == candidate.provider && session.meta.pid == Some(candidate.pid)
         });
-        let (session_id, agent_status, since, detail, subagents, events) = match session_index {
-            // A matched session can still derive nothing: a log whose every
-            // line is retired vocabulary reads back empty.
+        let (session_id, status, since, detail, subagents, activity) = match session_index {
             Some(index) => {
                 matched.insert(index);
-                let session = &sessions[index];
-                let (status, since, detail) = match derived[index].as_ref() {
-                    Some(derived) => (
-                        map_status(derived.status),
-                        Some(derived.since),
-                        derived.detail.clone(),
-                    ),
-                    None => (AgentStatus::Idle, None, None),
-                };
-                let subagents = status::subagents(&session.events);
-                let events = session.events
-                    [session.events.len().saturating_sub(AGENT_EVENT_TAIL)..]
-                    .to_vec();
+                let record = &sessions[index];
+                let interpretation = &interpretations[index];
                 (
-                    Some(session.meta.session.clone()),
-                    status,
-                    since,
-                    detail,
-                    subagents,
-                    events,
+                    Some(record.meta.session.clone()),
+                    interpretation.status,
+                    interpretation.since,
+                    interpretation.detail.clone(),
+                    interpretation.subagents.clone(),
+                    interpretation.activity.clone(),
                 )
             }
-            None => (None, AgentStatus::Idle, None, None, Vec::new(), Vec::new()),
+            None => (None, Status::Idle, None, None, Vec::new(), Vec::new()),
         };
         agents.push(Agent {
             provider: candidate.provider.clone(),
@@ -178,11 +152,11 @@ fn join(
             pid: candidate.pid,
             cwd: candidate.cwd.clone(),
             session_id,
-            status: agent_status,
+            status,
             since,
             detail,
             subagents,
-            events,
+            activity,
         });
     }
 
@@ -191,10 +165,7 @@ fn join(
         if matched.contains(&index) || session.meta.session.is_empty() {
             continue;
         }
-        let explicitly_ended = matches!(
-            derived[index].as_ref().map(|value| value.status),
-            Some(SessionStatus::Ended)
-        );
+        let explicitly_ended = interpretations[index].ended;
         let still_live = live.iter().any(|candidate| {
             candidate.provider == session.meta.provider && session.meta.pid == Some(candidate.pid)
         });
@@ -246,25 +217,15 @@ fn latest_match(
         .map(|(index, _)| index)
 }
 
-fn map_status(status: SessionStatus) -> AgentStatus {
-    match status {
-        SessionStatus::Attention(kind) => AgentStatus::Attention(kind),
-        SessionStatus::Error => AgentStatus::Error,
-        SessionStatus::Stale => AgentStatus::Stale,
-        SessionStatus::Working => AgentStatus::Working,
-        SessionStatus::Done => AgentStatus::Done,
-        SessionStatus::Idle | SessionStatus::Ended => AgentStatus::Idle,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use crate::protocol::{
-        Command as ProviderCommand, Event, EventKind, FileFormat, HookFile, ManagedFile, Manifest,
-        ProcessMatch,
+        AttentionKind, Command as ProviderCommand, Event, EventKind, FileFormat, HookFile,
+        ManagedFile, Manifest, ProcessMatch,
     };
+    use crate::session::ActivityKind;
     use crate::store::SessionMeta;
 
     use super::*;
@@ -499,22 +460,23 @@ mod tests {
         );
         assert!(matches!(
             snapshot.agents[0].status,
-            AgentStatus::Attention(AttentionKind::Approval)
+            Status::Attention(AttentionKind::Approval)
         ));
         assert_eq!(snapshot.agents[0].cwd, PathBuf::from("/real-claude"));
-        assert_eq!(snapshot.agents[0].events, sessions[0].events);
+        assert_eq!(snapshot.agents[0].activity.len(), 1);
+        assert_eq!(snapshot.agents[0].activity[0].kind, ActivityKind::Approval);
         assert_eq!(
             snapshot.agents[0].detail.as_deref(),
             Some("Bash: rm -rf build")
         );
-        assert_eq!(snapshot.agents[1].status, AgentStatus::Working);
+        assert_eq!(snapshot.agents[1].status, Status::Working);
         assert_eq!(snapshot.agents[1].cwd, PathBuf::from("/pane-codex"));
         assert_eq!(snapshot.agents[1].tmux_session_name, "other");
         assert_eq!(snapshot.agents[1].tmux_session_id, "$2");
-        assert_eq!(snapshot.agents[2].status, AgentStatus::Done);
+        assert_eq!(snapshot.agents[2].status, Status::Done);
         assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("agy-live"));
-        assert_eq!(snapshot.agents[3].status, AgentStatus::Idle);
-        assert!(snapshot.agents[3].events.is_empty());
+        assert_eq!(snapshot.agents[3].status, Status::Idle);
+        assert!(snapshot.agents[3].activity.is_empty());
         assert_eq!(
             snapshot
                 .ended
@@ -543,7 +505,7 @@ mod tests {
             |_| None,
         );
 
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
+        assert_eq!(snapshot.agents[0].status, Status::Idle);
         assert_eq!(
             providers_requiring_setup(&snapshot.agents, &manifests),
             ["amp"]
@@ -587,9 +549,9 @@ mod tests {
         );
 
         assert_eq!(snapshot.agents.len(), 1);
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
+        assert_eq!(snapshot.agents[0].status, Status::Idle);
         assert!(snapshot.agents[0].session_id.is_none());
-        assert!(snapshot.agents[0].events.is_empty());
+        assert!(snapshot.agents[0].activity.is_empty());
         assert_eq!(snapshot.ended[0].session_id, "old");
     }
 
@@ -621,50 +583,10 @@ mod tests {
         );
 
         assert_eq!(snapshot.agents.len(), 1);
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
+        assert_eq!(snapshot.agents[0].status, Status::Idle);
         assert!(snapshot.agents[0].session_id.is_none());
-        assert!(snapshot.agents[0].events.is_empty());
+        assert!(snapshot.agents[0].activity.is_empty());
         assert_eq!(snapshot.ended[0].session_id, "old");
-    }
-
-    #[test]
-    fn matched_agent_keeps_the_latest_event_tail() {
-        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
-        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "claude")];
-        let manifests = [manifest("claude", true)];
-        let mut sessions = [session(
-            "claude",
-            "live",
-            Some("%1"),
-            Some(101),
-            Some("/work"),
-            0,
-            EventKind::SessionStart { model: None },
-        )];
-        sessions[0].events = (0..65)
-            .map(|secs| Event {
-                v: 1,
-                ts: Some(at(secs)),
-                session: "live".into(),
-                kind: EventKind::Heartbeat {
-                    activity: Some(secs.to_string()),
-                },
-            })
-            .collect();
-
-        let snapshot = join(
-            &panes,
-            &procs,
-            &sessions,
-            &manifests,
-            at(65),
-            Duration::minutes(30),
-            |_| None,
-        );
-
-        assert_eq!(snapshot.agents[0].events.len(), AGENT_EVENT_TAIL);
-        assert_eq!(snapshot.agents[0].events[0].ts, Some(at(1)));
-        assert_eq!(snapshot.agents[0].events[63].ts, Some(at(64)));
     }
 
     #[test]
@@ -692,7 +614,7 @@ mod tests {
             |_| None,
         );
 
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
+        assert_eq!(snapshot.agents[0].status, Status::Idle);
         assert_eq!(snapshot.agents[0].session_id.as_deref(), Some("done"));
         assert!(snapshot.ended.is_empty());
     }
@@ -766,7 +688,7 @@ mod tests {
             |_| None,
         );
 
-        assert_eq!(snapshot.agents[0].status, AgentStatus::Idle);
+        assert_eq!(snapshot.agents[0].status, Status::Idle);
         assert_eq!(snapshot.agents[0].session_id.as_deref(), Some("old"));
     }
 }

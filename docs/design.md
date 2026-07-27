@@ -40,7 +40,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 
 Cargo workspace:
 
-- `gw-core` — domain: discovery, event model, status derivation (pure), correlation, log store, plugin client, tmux shell-out wrapper.
+- `gw-core` — domain: discovery, event model, Session interpretation (pure Status, Subagent, and Activity replay), correlation, log store, plugin client, tmux shell-out wrapper.
 - `gw` — the binary: CLI (`panel`, `hook`, `setup`), ratatui TUI (fullscreen alt-screen; `TuiEvent`/`AppEvent` split, single `tokio::select!` loop, frame coalescing — patterned after codex-rs's tui architecture).
 - `gw-plugin-protocol` — serde types for manifest/events, published for Rust plugin authors (the protocol itself is JSON-over-CLI; non-Rust plugins just follow the spec).
 - `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp` — official plugin binaries.

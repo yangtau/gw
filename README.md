@@ -56,7 +56,7 @@ which events notify with `notify = ["attention", "turn_end"]`, or disable them w
 ## Layout
 
 - `crates/gw` — the binary: panel TUI, `gw hook` ingest, `gw setup`.
-- `crates/gw-core` — domain: discovery, correlation, status derivation, event store, tmux/ps wrappers.
+- `crates/gw-core` — domain: discovery, correlation, Session interpretation (Status, Subagents, Activity), event store, tmux/ps wrappers.
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust plugin authors.
 - `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp` — official provider plugins.
 

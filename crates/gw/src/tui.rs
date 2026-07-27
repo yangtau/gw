@@ -17,9 +17,10 @@ use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use gw_core::config::PanelView;
-use gw_core::discover::{self, Agent, AgentStatus, Snapshot};
+use gw_core::discover::{self, Agent, Snapshot};
 use gw_core::plugins::{self, Plugin};
-use gw_core::protocol::{AttentionKind, Event, EventKind};
+use gw_core::protocol::AttentionKind;
+use gw_core::session::{ActivityEntry, ActivityKind, Status, Subagent};
 use gw_core::store::Store;
 use gw_core::tmux;
 use notify::Watcher;
@@ -424,7 +425,7 @@ impl App {
             .find(|&selection| {
                 list.agent_index(selection)
                     .and_then(|index| self.snapshot.agents.get(index))
-                    .is_some_and(|agent| matches!(agent.status, AgentStatus::Attention(_)))
+                    .is_some_and(|agent| matches!(agent.status, Status::Attention(_)))
             });
         if let Some(selection) = next {
             self.selected = selection;
@@ -523,7 +524,7 @@ impl App {
                     color,
                     urgent: matches!(
                         agent.status,
-                        AgentStatus::Attention(_) | AgentStatus::Error | AgentStatus::Stale
+                        Status::Attention(_) | Status::Error | Status::Stale
                     ),
                     detail: agent.detail.clone().unwrap_or_default(),
                     cwd_full: shorten(&agent.cwd, CWD_MAX),
@@ -700,7 +701,7 @@ impl App {
             return;
         }
 
-        let rows = activity_rows(&agent.events, Utc::now());
+        let rows = activity_rows(&agent.activity, Utc::now());
         if rows.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::styled("no events yet", Style::new().dim())),
@@ -807,7 +808,7 @@ struct AgentCells {
 }
 
 /// "agent_type · model · task · 3m" — omitting what the provider didn't report.
-fn subagent_text(subagent: &gw_core::status::Subagent, now: DateTime<Utc>) -> String {
+fn subagent_text(subagent: &Subagent, now: DateTime<Utc>) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let agent_type = subagent.agent_type.as_deref().unwrap_or("subagent");
     parts.push(agent_type);
@@ -919,11 +920,11 @@ fn elsewhere_hint(agents: &[Agent], current_tmux_session_id: Option<&str>) -> Op
     }
     let attention = elsewhere
         .iter()
-        .filter(|agent| matches!(agent.status, AgentStatus::Attention(_)))
+        .filter(|agent| matches!(agent.status, Status::Attention(_)))
         .count();
     let errors = elsewhere
         .iter()
-        .filter(|agent| agent.status == AgentStatus::Error)
+        .filter(|agent| agent.status == Status::Error)
         .count();
     let mut parts = vec![format!("{} elsewhere", elsewhere.len())];
     if attention > 0 {
@@ -1004,15 +1005,15 @@ fn agent_line(
     Line::from(spans)
 }
 
-fn status_cell(status: AgentStatus) -> (&'static str, &'static str, Color) {
+fn status_cell(status: Status) -> (&'static str, &'static str, Color) {
     match status {
-        AgentStatus::Attention(AttentionKind::Approval) => ("●", "approval", Color::Red),
-        AgentStatus::Attention(AttentionKind::Question) => ("●", "question", Color::Red),
-        AgentStatus::Error => ("✗", "error", Color::Magenta),
-        AgentStatus::Stale => ("!", "stale", Color::Yellow),
-        AgentStatus::Working => ("●", "working", Color::Green),
-        AgentStatus::Done => ("●", "done", Color::Cyan),
-        AgentStatus::Idle => ("○", "idle", Color::Blue),
+        Status::Attention(AttentionKind::Approval) => ("●", "approval", Color::Red),
+        Status::Attention(AttentionKind::Question) => ("●", "question", Color::Red),
+        Status::Error => ("✗", "error", Color::Magenta),
+        Status::Stale => ("!", "stale", Color::Yellow),
+        Status::Working => ("●", "working", Color::Green),
+        Status::Done => ("●", "done", Color::Cyan),
+        Status::Idle => ("○", "idle", Color::Blue),
     }
 }
 
@@ -1024,77 +1025,41 @@ struct ActivityRow {
     text: String,
 }
 
-fn activity_rows(events: &[Event], now: DateTime<Utc>) -> Vec<ActivityRow> {
-    events
+fn activity_rows(activity: &[ActivityEntry], now: DateTime<Utc>) -> Vec<ActivityRow> {
+    activity
         .iter()
-        .map(|event| {
-            let age = event.ts.map(|ts| ago(ts, now)).unwrap_or_default();
-            let (label, color, text) = match &event.kind {
-                EventKind::SessionFocus => ("focus", Color::DarkGray, "foreground".into()),
-                EventKind::SessionStart { model } => (
-                    "session",
-                    Color::DarkGray,
-                    model.clone().unwrap_or_default(),
-                ),
-                EventKind::TurnStart { summary } => (
-                    "turn",
-                    status_cell(AgentStatus::Working).2,
-                    summary.clone().unwrap_or_default(),
-                ),
-                EventKind::Heartbeat { activity } => (
-                    "tool",
-                    Color::DarkGray,
-                    activity.clone().unwrap_or_default(),
-                ),
-                EventKind::Attention { attention, summary } => {
-                    let label = match attention {
-                        AttentionKind::Approval => "approval",
-                        AttentionKind::Question => "question",
-                    };
-                    (
-                        label,
-                        status_cell(AgentStatus::Attention(*attention)).2,
-                        summary.clone().unwrap_or_default(),
-                    )
-                }
-                EventKind::TurnEnd { summary } => (
-                    "done",
-                    status_cell(AgentStatus::Done).2,
-                    summary.clone().unwrap_or_default(),
-                ),
-                EventKind::TurnError { reason, summary } => (
-                    "error",
-                    status_cell(AgentStatus::Error).2,
-                    summary
-                        .clone()
-                        .or_else(|| reason.clone())
-                        .unwrap_or_default(),
-                ),
-                EventKind::SubagentStart {
-                    agent_type,
-                    summary,
-                    ..
-                } => (
-                    "subagent+",
-                    Color::DarkGray,
-                    [agent_type.as_deref(), summary.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .filter(|value| !value.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(SEP),
-                ),
-                EventKind::SubagentEnd { agent } => ("subagent-", Color::DarkGray, agent.clone()),
-                EventKind::SessionEnd => ("session", Color::DarkGray, "ended".into()),
-            };
+        .map(|entry| {
+            let age = entry.at.map(|at| ago(at, now)).unwrap_or_default();
+            let (label, color) = activity_cell(entry.kind);
             ActivityRow {
                 age,
                 label,
                 color,
-                text,
+                text: entry.detail.clone(),
             }
         })
         .collect()
+}
+
+fn activity_cell(kind: ActivityKind) -> (&'static str, Color) {
+    match kind {
+        ActivityKind::Focus => ("focus", Color::DarkGray),
+        ActivityKind::Session => ("session", Color::DarkGray),
+        ActivityKind::Turn => ("turn", status_cell(Status::Working).2),
+        ActivityKind::Tool => ("tool", Color::DarkGray),
+        ActivityKind::Approval => (
+            "approval",
+            status_cell(Status::Attention(AttentionKind::Approval)).2,
+        ),
+        ActivityKind::Question => (
+            "question",
+            status_cell(Status::Attention(AttentionKind::Question)).2,
+        ),
+        ActivityKind::Done => ("done", status_cell(Status::Done).2),
+        ActivityKind::Error => ("error", status_cell(Status::Error).2),
+        ActivityKind::SubagentStarted => ("subagent+", Color::DarkGray),
+        ActivityKind::SubagentEnded => ("subagent-", Color::DarkGray),
+    }
 }
 
 fn activity_line(row: &ActivityRow, width: usize) -> Line<'static> {
@@ -1249,7 +1214,7 @@ mod tests {
         tmux_session_name: &str,
         tmux_session_id: &str,
         pane_id: &str,
-        status: AgentStatus,
+        status: Status,
     ) -> Agent {
         Agent {
             provider: "claude".into(),
@@ -1271,88 +1236,52 @@ mod tests {
             since: None,
             detail: None,
             subagents: vec![],
-            events: vec![],
+            activity: vec![],
         }
     }
 
-    fn event(ts: Option<DateTime<Utc>>, kind: EventKind) -> Event {
-        Event {
-            v: 1,
-            ts,
-            session: "session-1".into(),
+    fn activity(at: Option<DateTime<Utc>>, kind: ActivityKind, detail: &str) -> ActivityEntry {
+        ActivityEntry {
+            at,
             kind,
+            detail: detail.into(),
         }
     }
 
     #[test]
-    fn maps_every_event_kind_to_activity_rows() {
+    fn maps_every_activity_kind_to_rows() {
         let now = DateTime::from_timestamp(7_200, 0).unwrap();
-        let events = vec![
-            event(Some(now - Duration::minutes(2)), EventKind::SessionFocus),
-            event(
+        let activity = vec![
+            activity(
+                Some(now - Duration::minutes(2)),
+                ActivityKind::Focus,
+                "foreground",
+            ),
+            activity(
                 Some(now - Duration::minutes(1)),
-                EventKind::SessionStart {
-                    model: Some("opus".into()),
-                },
+                ActivityKind::Session,
+                "opus",
             ),
-            event(
+            activity(
                 Some(now - Duration::hours(1)),
-                EventKind::TurnStart {
-                    summary: Some("implement activity".into()),
-                },
+                ActivityKind::Turn,
+                "implement activity",
             ),
-            event(
-                None,
-                EventKind::Heartbeat {
-                    activity: Some("cargo test".into()),
-                },
-            ),
-            event(
+            activity(None, ActivityKind::Tool, "cargo test"),
+            activity(Some(now), ActivityKind::Approval, "run command"),
+            activity(Some(now), ActivityKind::Question, "which option"),
+            activity(Some(now), ActivityKind::Done, "finished"),
+            activity(Some(now), ActivityKind::Error, "try later"),
+            activity(
                 Some(now),
-                EventKind::Attention {
-                    attention: AttentionKind::Approval,
-                    summary: Some("run command".into()),
-                },
+                ActivityKind::SubagentStarted,
+                "Explore · find tests",
             ),
-            event(
-                Some(now),
-                EventKind::Attention {
-                    attention: AttentionKind::Question,
-                    summary: Some("which option".into()),
-                },
-            ),
-            event(
-                Some(now),
-                EventKind::TurnEnd {
-                    summary: Some("finished".into()),
-                },
-            ),
-            event(
-                Some(now),
-                EventKind::TurnError {
-                    reason: Some("rate_limit".into()),
-                    summary: Some("try later".into()),
-                },
-            ),
-            event(
-                Some(now),
-                EventKind::SubagentStart {
-                    agent: "agent-1".into(),
-                    agent_type: Some("Explore".into()),
-                    model: Some("haiku".into()),
-                    summary: Some("find tests".into()),
-                },
-            ),
-            event(
-                Some(now),
-                EventKind::SubagentEnd {
-                    agent: "agent-1".into(),
-                },
-            ),
-            event(Some(now), EventKind::SessionEnd),
+            activity(Some(now), ActivityKind::SubagentEnded, "agent-1"),
+            activity(Some(now), ActivityKind::Session, "ended"),
         ];
 
-        let rows = activity_rows(&events, now);
+        let rows = activity_rows(&activity, now);
         assert_eq!(
             rows.iter()
                 .map(|row| (row.age.as_str(), row.label, row.color, row.text.as_str()))
@@ -1382,11 +1311,11 @@ mod tests {
                 "zeta",
                 "$3",
                 "%3",
-                AgentStatus::Attention(AttentionKind::Approval),
+                Status::Attention(AttentionKind::Approval),
             ),
-            agent("current", "$2", "%2", AgentStatus::Working),
-            agent("alpha", "$1", "%1", AgentStatus::Done),
-            agent("zeta", "$3", "%4", AgentStatus::Idle),
+            agent("current", "$2", "%2", Status::Working),
+            agent("alpha", "$1", "%1", Status::Done),
+            agent("zeta", "$3", "%4", Status::Idle),
         ];
 
         let list = AgentList::new(&agents, PanelView::Global, Some("$2"));
@@ -1417,8 +1346,8 @@ mod tests {
     #[test]
     fn cursor_movement_skips_tmux_session_headers() {
         let agents = vec![
-            agent("current", "$1", "%1", AgentStatus::Working),
-            agent("other", "$2", "%2", AgentStatus::Done),
+            agent("current", "$1", "%1", Status::Working),
+            agent("other", "$2", "%2", Status::Done),
         ];
         let list = AgentList::new(&agents, PanelView::Global, Some("$1"));
 
@@ -1431,14 +1360,14 @@ mod tests {
     #[test]
     fn elsewhere_hint_reports_attention_and_error_counts() {
         let agents = vec![
-            agent("current", "$1", "%1", AgentStatus::Working),
+            agent("current", "$1", "%1", Status::Working),
             agent(
                 "other",
                 "$2",
                 "%2",
-                AgentStatus::Attention(AttentionKind::Question),
+                Status::Attention(AttentionKind::Question),
             ),
-            agent("other", "$2", "%3", AgentStatus::Error),
+            agent("other", "$2", "%3", Status::Error),
         ];
 
         assert_eq!(
@@ -1449,28 +1378,14 @@ mod tests {
     }
 
     #[test]
-    fn activity_text_fallbacks_and_render_truncation() {
+    fn activity_rows_preserve_detail_and_render_truncates() {
         let now = DateTime::from_timestamp(60, 0).unwrap();
-        let events = [
-            event(
-                Some(now),
-                EventKind::TurnError {
-                    reason: Some("rate_limit".into()),
-                    summary: None,
-                },
-            ),
-            event(
-                Some(now),
-                EventKind::SubagentStart {
-                    agent: "agent-1".into(),
-                    agent_type: None,
-                    model: None,
-                    summary: Some("inspect".into()),
-                },
-            ),
-            event(None, EventKind::SessionStart { model: None }),
+        let activity = [
+            activity(Some(now), ActivityKind::Error, "rate_limit"),
+            activity(Some(now), ActivityKind::SubagentStarted, "inspect"),
+            activity(None, ActivityKind::Session, ""),
         ];
-        let rows = activity_rows(&events, now);
+        let rows = activity_rows(&activity, now);
         assert_eq!(rows[0].text, "rate_limit");
         assert_eq!(rows[1].text, "inspect");
         assert_eq!(rows[2].text, "");
@@ -1556,7 +1471,7 @@ mod tests {
     #[test]
     fn subagent_text_joins_known_fields() {
         let now = DateTime::from_timestamp(600, 0).unwrap();
-        let full = gw_core::status::Subagent {
+        let full = Subagent {
             agent_type: Some("Explore".into()),
             model: Some("haiku".into()),
             summary: Some("find hooks".into()),
@@ -1567,7 +1482,7 @@ mod tests {
             "Explore · haiku · find hooks · 10m"
         );
 
-        let bare = gw_core::status::Subagent {
+        let bare = Subagent {
             agent_type: None,
             model: None,
             summary: None,
