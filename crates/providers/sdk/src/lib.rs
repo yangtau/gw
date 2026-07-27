@@ -85,6 +85,9 @@ pub fn normalize(
         v: PROTOCOL_VERSION,
         ts: None,
         session: session.into(),
+        // Providers using claude-style hook payloads carry the native
+        // transcript path under `transcript_path`; extract it generically.
+        transcript: text(payload, "transcript_path"),
         kind,
     }]
 }

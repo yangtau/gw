@@ -54,6 +54,10 @@ fn manifest() -> Manifest {
         resume: Some(Command {
             argv: vec!["agy".into(), "--conversation".into(), "{session_id}".into()],
         }),
+        resume_prompt: None,
+        fork: None,
+        transcript: None,
+        transcript_glob: None,
         hooks: vec![HookFile {
             path: "~/.gemini/config/hooks.json".into(),
             format: FileFormat::Json,

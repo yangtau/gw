@@ -19,6 +19,19 @@ pub struct Manifest {
     pub launch: Command,
     #[serde(default)]
     pub resume: Option<Command>,
+    /// Resume an ended session with an initial prompt (`{prompt}` placeholder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_prompt: Option<Command>,
+    /// Fork a session into a new one; a live target is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<Command>,
+    /// Print the provider-native transcript of a session to stdout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Command>,
+    /// Glob template locating the provider-native transcript file
+    /// (`{session_id}` placeholder); the newest match wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_glob: Option<String>,
     #[serde(default)]
     pub hooks: Vec<HookFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -40,6 +53,10 @@ pub struct ManagedFile {
     pub content: String,
     /// Single-line prefix used for the ownership header (for example `//`).
     pub comment_prefix: String,
+    /// Optional suffix closing the ownership header (for example ` -->`),
+    /// so the header can be a closed HTML comment inside Markdown files.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment_suffix: String,
 }
 
 /// Command template; the core expands `{session_id}` and `{cwd}`.
@@ -89,6 +106,10 @@ pub struct Event {
     pub ts: Option<DateTime<Utc>>,
     /// Provider-native session id extracted from the payload.
     pub session: String,
+    /// Provider-native transcript path, when the payload carries one; the
+    /// store records the latest into the meta sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
     #[serde(flatten)]
     pub kind: EventKind,
 }
@@ -150,6 +171,20 @@ pub enum EventKind {
         agent: String,
     },
     SessionEnd,
+    /// Core-written operational annotation: this session's agent started a
+    /// `gw wait` on another session. Status-neutral, never plugin-emitted.
+    WaitStart {
+        wait_id: String,
+        /// Canonical address (`provider:session-id`) of the awaited session.
+        target: String,
+    },
+    /// Core-written pair closing a `wait_start`. Status-neutral.
+    WaitEnd {
+        wait_id: String,
+        /// The wait result: done | attention | error | stale | idle |
+        /// ended | timeout.
+        outcome: String,
+    },
 }
 
 /// Variant order is priority order (approvals are quicker to act on).

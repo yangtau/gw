@@ -29,12 +29,33 @@ fn manifest() -> Manifest {
                 "{session_id}".into(),
             ],
         }),
+        // Amp has no resume-with-prompt and removed fork.
+        resume_prompt: None,
+        fork: None,
+        transcript: Some(Command {
+            argv: vec![
+                "amp".into(),
+                "threads".into(),
+                "markdown".into(),
+                "{session_id}".into(),
+            ],
+        }),
+        transcript_glob: None,
         hooks: Vec::new(),
-        managed_files: vec![ManagedFile {
-            path: "~/.config/amp/plugins/gw.ts".into(),
-            content: include_str!("bridge.ts").into(),
-            comment_prefix: "//".into(),
-        }],
+        managed_files: vec![
+            ManagedFile {
+                path: "~/.config/amp/plugins/gw.ts".into(),
+                content: include_str!("bridge.ts").into(),
+                comment_prefix: "//".into(),
+                comment_suffix: String::new(),
+            },
+            ManagedFile {
+                path: "~/.config/amp/skills/gw/SKILL.md".into(),
+                content: include_str!("../../gw-skill.md").into(),
+                comment_prefix: "<!--".into(),
+                comment_suffix: " -->".into(),
+            },
+        ],
     }
 }
 

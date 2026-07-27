@@ -62,12 +62,18 @@ mod tests {
 
         write(&path, b"first", false).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"first");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         write(&path, b"second", true).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]

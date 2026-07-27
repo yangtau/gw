@@ -309,6 +309,10 @@ mod tests {
                 argv: vec![id.into()],
             },
             resume: None,
+            resume_prompt: None,
+            fork: None,
+            transcript: None,
+            transcript_glob: None,
             hooks: hooks
                 .then(|| HookFile {
                     path: format!("~/.{id}.json"),
@@ -327,6 +331,7 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             content: "bridge\n".into(),
             comment_prefix: "//".into(),
+            comment_suffix: String::new(),
         });
         manifest
     }
@@ -347,12 +352,14 @@ mod tests {
                 pane_id: pane_id.map(str::to_owned),
                 pid,
                 cwd: cwd.map(PathBuf::from),
+                transcript_path: None,
                 updated_at: at(secs),
             },
             events: vec![Event {
                 v: 1,
                 ts: Some(at(secs)),
                 session: id.into(),
+                transcript: None,
                 kind,
             }],
         }

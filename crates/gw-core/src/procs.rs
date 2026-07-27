@@ -209,6 +209,10 @@ mod tests {
                 argv: vec![id.into()],
             },
             resume: None,
+            resume_prompt: None,
+            fork: None,
+            transcript: None,
+            transcript_glob: None,
             hooks: Vec::new(),
             managed_files: Vec::new(),
         }

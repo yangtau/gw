@@ -49,6 +49,10 @@ fn manifest() -> Manifest {
         resume: Some(Command {
             argv: vec!["traex".into(), "resume".into(), "{session_id}".into()],
         }),
+        resume_prompt: None,
+        fork: None,
+        transcript: None,
+        transcript_glob: None,
         hooks: vec![
             HookFile {
                 path: "~/.trae/cli/hooks.json".into(),

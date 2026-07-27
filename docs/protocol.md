@@ -19,6 +19,9 @@ Prints a single JSON object describing the provider statically:
   "process": { "argv0": ["claude"], "exclude_args": [] },
   "launch": { "argv": ["claude"] },
   "resume": { "argv": ["claude", "--resume", "{session_id}"] },
+  "resume_prompt": { "argv": ["claude", "--resume", "{session_id}", "{prompt}"] },
+  "fork": { "argv": ["claude", "--resume", "{session_id}", "--fork-session"] },
+  "transcript_glob": "~/.claude/projects/*/{session_id}.jsonl",
   "hooks": [
     {
       "path": "~/.claude/settings.json",
@@ -40,12 +43,14 @@ Prints a single JSON object describing the provider statically:
 - `process.argv0` — an agent process is recognized when the basename of one of its first few argv tokens equals one of these (the wider window tolerates wrappers such as `node /path/to/claude`).
 - `process.exclude_args` — optional exact argv tokens that disqualify a process after its executable matches. Amp uses this to exclude `--no-tui`, `-x`, and `--execute`.
 - `launch.argv` / `resume.argv` — command templates. Placeholders expanded by the core: `{session_id}`, `{cwd}`.
+- `resume_prompt` / `fork` — optional capability templates for `gw resume`. `resume_prompt` additionally expands `{prompt}` (an argv token containing `{prompt}` is dropped entirely when no prompt is given). All three resume-family capabilities are independent: declare what the provider CLI actually supports and omit the rest — `gw resume` errors clearly on a missing capability. `resume`/`resume_prompt` target ended Sessions only; `fork` may target a live Agent (it branches instead of fighting the running process).
+- `transcript` — optional argv template printing the provider-native transcript to stdout (Amp: `amp threads markdown {session_id}`). `transcript_glob` — optional glob template locating the transcript file on disk (`{session_id}` placeholder; newest match wins). `gw show --transcript` resolves in order: hook-captured `transcript` path from events, `transcript` command, `transcript_glob`.
 - `hooks` — declarative install spec, applied by `gw setup`:
   - `pointer` is a JSON-Pointer-style path (for TOML it addresses nested tables).
   - `mode: "ensure"` — the pointer addresses an array; setup guarantees it contains `value` (deep equality, no duplicates) and removes exactly that element on uninstall.
   - `mode: "set"` — setup writes `value` at the pointer (e.g. a feature flag) and leaves it in place on uninstall.
   - Setup edits are surgical: unrelated keys, ordering, and (for TOML) formatting are preserved; the target file is backed up before the first write; the operation is idempotent.
-- `managed_files` — optional whole files needed to connect a provider that has no JSON/TOML hook config. Each entry has `path`, `content`, and a single-line `comment_prefix`. The core prepends an ownership header containing a hash of `content`; setup upgrades or removes the file only when that header belongs to the same provider and the body still matches its hash. Unrelated or user-modified files are rejected, never overwritten. Amp uses this to install its system TypeScript observer plugin.
+- `managed_files` — optional whole files installed by `gw setup`. Each entry has `path`, `content`, a single-line `comment_prefix`, and an optional single-line `comment_suffix`. The core prepends an ownership header containing a hash of `content`; with a suffix the header can be a closed comment in any syntax (e.g. `<!-- … -->` inside a Markdown skill file). Setup upgrades or removes the file only when that header belongs to the same provider and the body still matches its hash. Unrelated or user-modified files are rejected, never overwritten. Amp uses this for its system TypeScript observer plugin; claude/codex/amp all use it to install the shared `gw` agent skill (`SKILL.md`) at their global skill paths.
 
 ### `normalize`
 
@@ -58,6 +63,7 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 
 - `session` — the provider-native session id extracted from the payload. Required.
 - `ts` — RFC 3339 timestamp; optional, the core stamps arrival time when absent.
+- `transcript` — optional path to the provider-native transcript file, when the hook payload carries one (Claude-style `transcript_path`); the core records the latest value into the session's meta sidecar for `gw show --transcript`.
 - `kind` — one of:
 
 | kind | extra fields | meaning |
@@ -72,8 +78,12 @@ Reads **one** raw hook payload (whatever the provider POSTs to its hook command)
 | `subagent_start` | `agent` (provider-native subagent id), `agent_type?`, `model?`, `summary?` (task excerpt) | a subagent spawned inside this session started running |
 | `subagent_end` | `agent` | that subagent finished |
 | `session_end` | | the native session ended |
+| `wait_start` | `wait_id`, `target` | **core-written**: this session's agent started a `gw wait` on another session (`target` is its canonical address) |
+| `wait_end` | `wait_id`, `outcome` | **core-written**: that wait finished (`outcome` is the wait result word) |
 
 Excerpt fields (`summary`, `activity`) are display one-liners; plugins truncate them (~120 chars) — the core stores what it is given. Every field beyond `session` and `kind` is optional (exception: `subagent_start`/`subagent_end` require `agent` — without an id there is nothing to correlate): emit what the provider knows, omit what it doesn't.
+
+`wait_start`/`wait_end` are **operational annotations written by the core**, never by plugins: `gw wait` appends them to the *waiter's* event log (waiter identity via the ppid ancestor chain). They are status-neutral — same class as subagent/focus events — and are replayed into a "waiting on" list; a leftover open wait (missed `wait_end`) is cleared by the waiter's next provider event, since a wait blocks the waiter's tool call.
 
 Subagent events use the **parent's** native session id and are status-neutral: they never clear Attention, revive Done, or affect staleness. The panel replays start/end pairs into the running-subagent list shown under the agent's row; a turn boundary (`turn_start`/`turn_end`/`turn_error`) or session boundary (`session_start`/`session_end`) clears the list — a subagent cannot outlive the turn that spawned it, so a Done agent shows no subagents even when an end event is missed or carries a mismatched id.
 

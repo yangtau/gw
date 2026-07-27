@@ -322,7 +322,12 @@ mod tests {
     use super::*;
     use gw_core::protocol::AttentionKind;
 
-    fn agent(tmux_session_name: &str, tmux_session_id: &str, pane_id: &str, status: Status) -> Agent {
+    fn agent(
+        tmux_session_name: &str,
+        tmux_session_id: &str,
+        pane_id: &str,
+        status: Status,
+    ) -> Agent {
         Agent {
             provider: "claude".into(),
             pane: gw_core::tmux::Pane {
@@ -366,7 +371,12 @@ mod tests {
     #[test]
     fn global_groups_put_current_first_then_sort_by_name_and_omit_empty_groups() {
         let agents = vec![
-            agent("zeta", "$3", "%3", Status::Attention(AttentionKind::Approval)),
+            agent(
+                "zeta",
+                "$3",
+                "%3",
+                Status::Attention(AttentionKind::Approval),
+            ),
             agent("current", "$2", "%2", Status::Working),
             agent("alpha", "$1", "%1", Status::Done),
             agent("zeta", "$3", "%4", Status::Idle),
@@ -439,7 +449,10 @@ mod tests {
     fn esc_quits_from_the_list() {
         let snap = snapshot(vec![]);
         let mut state = PanelState::new(PanelView::Current);
-        assert_eq!(state.on(Input::Cancel, &ctx(&snap, None, 0)), [Effect::Quit]);
+        assert_eq!(
+            state.on(Input::Cancel, &ctx(&snap, None, 0)),
+            [Effect::Quit]
+        );
     }
 
     #[test]
@@ -479,7 +492,12 @@ mod tests {
     fn attention_jump_targets_the_next_blocked_agent() {
         let agents = vec![
             agent("current", "$1", "%1", Status::Working),
-            agent("current", "$1", "%2", Status::Attention(AttentionKind::Approval)),
+            agent(
+                "current",
+                "$1",
+                "%2",
+                Status::Attention(AttentionKind::Approval),
+            ),
         ];
         let snap = snapshot(agents);
         let c = ctx(&snap, Some("$1"), 0);

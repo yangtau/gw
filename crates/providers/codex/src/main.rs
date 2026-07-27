@@ -1,6 +1,6 @@
 use gw_plugin_protocol::{
-    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
-    ProcessMatch, PROTOCOL_VERSION,
+    AttentionKind, Command, EventKind, FileFormat, HookFile, ManagedFile, Manifest, Patch,
+    PatchMode, ProcessMatch, PROTOCOL_VERSION,
 };
 use gw_provider_sdk::{command_hook_patch, excerpt, one_liner, text};
 use serde_json::{json, Map, Value};
@@ -41,6 +41,19 @@ fn manifest() -> Manifest {
         resume: Some(Command {
             argv: vec!["codex".into(), "resume".into(), "{session_id}".into()],
         }),
+        resume_prompt: Some(Command {
+            argv: vec![
+                "codex".into(),
+                "resume".into(),
+                "{session_id}".into(),
+                "{prompt}".into(),
+            ],
+        }),
+        fork: Some(Command {
+            argv: vec!["codex".into(), "fork".into(), "{session_id}".into()],
+        }),
+        transcript: None,
+        transcript_glob: Some("~/.codex/sessions/*/*/*/rollout-*{session_id}.jsonl".into()),
         hooks: vec![
             HookFile {
                 path: "~/.codex/hooks.json".into(),
@@ -57,7 +70,12 @@ fn manifest() -> Manifest {
                 }],
             },
         ],
-        managed_files: Vec::new(),
+        managed_files: vec![ManagedFile {
+            path: "~/.agents/skills/gw/SKILL.md".into(),
+            content: include_str!("../../gw-skill.md").into(),
+            comment_prefix: "<!--".into(),
+            comment_suffix: " -->".into(),
+        }],
     }
 }
 

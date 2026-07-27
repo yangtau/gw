@@ -1,5 +1,5 @@
 use gw_plugin_protocol::{
-    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, ProcessMatch,
+    AttentionKind, Command, EventKind, FileFormat, HookFile, ManagedFile, Manifest, ProcessMatch,
     PROTOCOL_VERSION,
 };
 use gw_provider_sdk::{command_hook_patch, excerpt, one_liner, text};
@@ -49,12 +49,37 @@ fn manifest() -> Manifest {
         resume: Some(Command {
             argv: vec!["claude".into(), "--resume".into(), "{session_id}".into()],
         }),
+        resume_prompt: Some(Command {
+            argv: vec![
+                "claude".into(),
+                "--resume".into(),
+                "{session_id}".into(),
+                "{prompt}".into(),
+            ],
+        }),
+        fork: Some(Command {
+            argv: vec![
+                "claude".into(),
+                "--resume".into(),
+                "{session_id}".into(),
+                "--fork-session".into(),
+            ],
+        }),
+        transcript: None,
+        // Hook payloads carry transcript_path; the glob is the fallback for
+        // sessions recorded before the transcript field existed.
+        transcript_glob: Some("~/.claude/projects/*/{session_id}.jsonl".into()),
         hooks: vec![HookFile {
             path: "~/.claude/settings.json".into(),
             format: FileFormat::Json,
             patches,
         }],
-        managed_files: Vec::new(),
+        managed_files: vec![ManagedFile {
+            path: "~/.claude/skills/gw/SKILL.md".into(),
+            content: include_str!("../../gw-skill.md").into(),
+            comment_prefix: "<!--".into(),
+            comment_suffix: " -->".into(),
+        }],
     }
 }
 

@@ -287,12 +287,8 @@ impl App {
         else {
             return Ok(Loop::Continue);
         };
-        let argv: Vec<String> = resume
-            .argv
-            .iter()
-            .map(|a| a.replace("{session_id}", &session.session_id))
-            .collect();
         let cwd = session.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let argv = gw_core::launch::expand_argv(&resume.argv, &session.session_id, None, &cwd);
         let pane = tmux::new_window(&session.provider, &cwd, &argv)?;
         self.jump(&pane)
     }
@@ -491,7 +487,11 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, (label, color, session, cwd, time))| {
-                    let marker = if i == self.state.selected() { " ❯ " } else { "   " };
+                    let marker = if i == self.state.selected() {
+                        " ❯ "
+                    } else {
+                        "   "
+                    };
                     let prefix = MARKER_W + label_w + COL_GAP + session_w + COL_GAP;
                     let mut right = pad(cwd, cwd_w);
                     right.push_str(SEP);
@@ -557,7 +557,8 @@ impl App {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let mut hints = " ?".to_owned();
-        if matches!(self.state.screen(), Screen::Agents) && self.state.view() == PanelView::Current {
+        if matches!(self.state.screen(), Screen::Agents) && self.state.view() == PanelView::Current
+        {
             if let Some(elsewhere) = elsewhere_hint(
                 &self.snapshot.agents,
                 self.current_tmux_session_id.as_deref(),
@@ -915,6 +916,8 @@ fn activity_cell(kind: ActivityKind) -> (&'static str, Color) {
         ActivityKind::Error => ("error", status_cell(Status::Error).2),
         ActivityKind::SubagentStarted => ("subagent+", Color::DarkGray),
         ActivityKind::SubagentEnded => ("subagent-", Color::DarkGray),
+        ActivityKind::WaitStarted => ("wait+", Color::DarkGray),
+        ActivityKind::WaitEnded => ("wait-", Color::DarkGray),
     }
 }
 

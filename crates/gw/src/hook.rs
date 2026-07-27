@@ -65,6 +65,9 @@ fn ingest(provider: &str, payload: &[u8]) -> Result<()> {
 fn notify(provider: &str, event: &Event) {
     let (kind, summary) = match &event.kind {
         EventKind::SessionFocus => unreachable!("focus events are never configured to notify"),
+        EventKind::WaitStart { .. } | EventKind::WaitEnd { .. } => {
+            unreachable!("wait events are never configured to notify")
+        }
         EventKind::SessionStart { model } => ("session_start", model.as_deref()),
         EventKind::TurnStart { summary } => ("turn_start", summary.as_deref()),
         EventKind::TurnEnd { summary } => ("turn_end", summary.as_deref()),

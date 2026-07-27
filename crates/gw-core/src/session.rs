@@ -33,6 +33,9 @@ pub struct Interpretation {
     pub ended: bool,
     /// Subagents currently running inside this Session, in start order.
     pub subagents: Vec<Subagent>,
+    /// Sessions this agent is currently waiting on via `gw wait`, in start
+    /// order. Replayed from core-written wait_start/wait_end annotations.
+    pub waiting_on: Vec<WaitTarget>,
     /// Recent Activity in Event Log order.
     pub activity: Vec<ActivityEntry>,
 }
@@ -49,6 +52,8 @@ pub enum ActivityKind {
     Error,
     SubagentStarted,
     SubagentEnded,
+    WaitStarted,
+    WaitEnded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +72,14 @@ pub struct Subagent {
     pub since: DateTime<Utc>,
 }
 
+/// A session this agent is waiting on, replayed from wait_start/wait_end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitTarget {
+    /// Canonical address (`provider:session-id`) of the awaited session.
+    pub target: String,
+    pub since: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DerivedStatus {
     status: Status,
@@ -80,9 +93,9 @@ struct DerivedStatus {
 /// is a function of the last event (plus `now` for staleness). An idle agent
 /// never goes stale; only an apparently-working one does.
 ///
-/// Subagent and focus events are status-neutral and skipped entirely: a
-/// subagent finishing or foreground-session change must not clear the
-/// parent's Attention or revive a Done session.
+/// Subagent, focus, and wait events are status-neutral and skipped entirely:
+/// a subagent finishing, a foreground-session change, or a core-written wait
+/// annotation must not clear the parent's Attention or revive a Done session.
 pub fn interpret(events: &[Event], now: DateTime<Utc>, stale_after: Duration) -> Interpretation {
     let derived = derive_status(events, now, stale_after);
     Interpretation {
@@ -94,6 +107,7 @@ pub fn interpret(events: &[Event], now: DateTime<Utc>, stale_after: Duration) ->
         detail: derived.as_ref().and_then(|derived| derived.detail.clone()),
         ended: derived.is_some_and(|derived| derived.ended),
         subagents: derive_subagents(events),
+        waiting_on: derive_waits(events),
         activity: derive_activity(events),
     }
 }
@@ -109,7 +123,7 @@ fn derive_status(
         .find(|e| matches!(e.kind, EventKind::SessionFocus));
     let events: Vec<&Event> = events
         .iter()
-        .filter(|e| !is_subagent(e) && !matches!(e.kind, EventKind::SessionFocus))
+        .filter(|e| !is_subagent(e) && !is_wait(e) && !matches!(e.kind, EventKind::SessionFocus))
         .collect();
     let ts = |e: &Event| e.ts.expect("stored events carry ts");
     let Some(last) = events.last().copied() else {
@@ -171,6 +185,9 @@ fn derive_status(
         EventKind::SubagentStart { .. } | EventKind::SubagentEnd { .. } => {
             unreachable!("subagent events are filtered above")
         }
+        EventKind::WaitStart { .. } | EventKind::WaitEnd { .. } => {
+            unreachable!("wait events are filtered above")
+        }
     }
 }
 
@@ -178,6 +195,13 @@ fn is_subagent(event: &Event) -> bool {
     matches!(
         event.kind,
         EventKind::SubagentStart { .. } | EventKind::SubagentEnd { .. }
+    )
+}
+
+fn is_wait(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::WaitStart { .. } | EventKind::WaitEnd { .. }
     )
 }
 
@@ -217,6 +241,32 @@ fn derive_subagents(events: &[Event]) -> Vec<Subagent> {
         }
     }
     running.into_iter().map(|(_, subagent)| subagent).collect()
+}
+
+/// Replay wait_start/wait_end pairs into the currently-waiting set, in start
+/// order. Any provider event clears leftover edges: a wait blocks the agent's
+/// tool call, so the waiter's next provider event proves the wait is over
+/// even when the closing wait_end was lost (killed `gw wait`).
+fn derive_waits(events: &[Event]) -> Vec<WaitTarget> {
+    let mut open: Vec<(&str, WaitTarget)> = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::WaitStart { wait_id, target } => {
+                open.retain(|(id, _)| id != wait_id);
+                open.push((
+                    wait_id,
+                    WaitTarget {
+                        target: target.clone(),
+                        since: event.ts.expect("stored events carry ts"),
+                    },
+                ));
+            }
+            EventKind::WaitEnd { wait_id, .. } => open.retain(|(id, _)| id != wait_id),
+            EventKind::SessionFocus => {}
+            _ => open.clear(),
+        }
+    }
+    open.into_iter().map(|(_, target)| target).collect()
 }
 
 fn derive_activity(events: &[Event]) -> Vec<ActivityEntry> {
@@ -266,6 +316,8 @@ fn derive_activity(events: &[Event]) -> Vec<ActivityEntry> {
                 ),
                 EventKind::SubagentEnd { agent } => (ActivityKind::SubagentEnded, agent.clone()),
                 EventKind::SessionEnd => (ActivityKind::Session, "ended".into()),
+                EventKind::WaitStart { target, .. } => (ActivityKind::WaitStarted, target.clone()),
+                EventKind::WaitEnd { outcome, .. } => (ActivityKind::WaitEnded, outcome.clone()),
             };
             ActivityEntry {
                 at: event.ts,
@@ -318,6 +370,7 @@ mod tests {
             v: 1,
             ts: Some(DateTime::from_timestamp(secs, 0).unwrap()),
             session: "s".into(),
+            transcript: None,
             kind,
         }
     }
@@ -752,6 +805,87 @@ mod tests {
         assert_eq!(activity[0].detail, "1");
         assert_eq!(activity[63].at, Some(at(64)));
         assert_eq!(activity[63].detail, "64");
+    }
+
+    fn wait_start(id: &str, target: &str) -> EventKind {
+        EventKind::WaitStart {
+            wait_id: id.into(),
+            target: target.into(),
+        }
+    }
+
+    fn wait_end(id: &str, outcome: &str) -> EventKind {
+        EventKind::WaitEnd {
+            wait_id: id.into(),
+            outcome: outcome.into(),
+        }
+    }
+
+    #[test]
+    fn wait_events_are_status_neutral() {
+        // A wait ending must not clear a pending approval.
+        let blocked = [
+            ev(0, attention()),
+            ev(10, wait_start("w1", "codex:abc")),
+            ev(20, wait_end("w1", "done")),
+        ];
+        let d = state(&blocked, at(30));
+        assert_eq!(d.status, Status::Attention(AttentionKind::Approval));
+        assert_eq!(d.since, Some(at(0)));
+
+        // Nor revive a finished turn.
+        let done = [
+            ev(0, EventKind::TurnEnd { summary: None }),
+            ev(10, wait_start("w1", "codex:abc")),
+        ];
+        assert_eq!(state(&done, at(20)).status, Status::Done);
+
+        // A log holding only wait events is Idle without a Status timestamp.
+        let wait_only = state(&[ev(0, wait_start("w1", "codex:abc"))], at(10));
+        assert_eq!(wait_only.status, Status::Idle);
+        assert_eq!(wait_only.since, None);
+    }
+
+    #[test]
+    fn waiting_on_replays_pairs_and_provider_events_clear_leftovers() {
+        // Open waits list in start order; a closed pair drops out.
+        let events = [
+            ev(0, wait_start("w1", "codex:abc")),
+            ev(10, wait_start("w2", "claude:def")),
+            ev(20, wait_end("w1", "done")),
+        ];
+        let waiting = state(&events, at(30)).waiting_on;
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].target, "claude:def");
+        assert_eq!(waiting[0].since, at(10));
+
+        // A missed wait_end is cleared by the waiter's next provider event
+        // (the wait blocked that tool call, so the event proves it is over)…
+        let cleared = [
+            ev(0, wait_start("w1", "codex:abc")),
+            ev(10, heartbeat(None)),
+        ];
+        assert!(state(&cleared, at(20)).waiting_on.is_empty());
+
+        // …but status-neutral focus events do not clear open waits.
+        let focused = [
+            ev(0, wait_start("w1", "codex:abc")),
+            ev(10, EventKind::SessionFocus),
+        ];
+        assert_eq!(state(&focused, at(20)).waiting_on.len(), 1);
+    }
+
+    #[test]
+    fn wait_events_appear_in_activity() {
+        let events = [
+            ev(0, wait_start("w1", "codex:abc")),
+            ev(10, wait_end("w1", "timeout")),
+        ];
+        let activity = state(&events, at(20)).activity;
+        assert_eq!(activity[0].kind, ActivityKind::WaitStarted);
+        assert_eq!(activity[0].detail, "codex:abc");
+        assert_eq!(activity[1].kind, ActivityKind::WaitEnded);
+        assert_eq!(activity[1].detail, "timeout");
     }
 
     #[test]

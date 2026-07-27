@@ -70,7 +70,10 @@ fn integration_is_installed_result(manifest: &Manifest) -> Result<bool> {
     }
 
     for file in &manifest.managed_files {
-        if file.comment_prefix.is_empty() || file.comment_prefix.contains(['\n', '\r']) {
+        if file.comment_prefix.is_empty()
+            || file.comment_prefix.contains(['\n', '\r'])
+            || file.comment_suffix.contains(['\n', '\r'])
+        {
             return Ok(false);
         }
         let path = expand_path(&file.path)?;
@@ -156,6 +159,9 @@ fn apply_managed_file(
     if file.comment_prefix.is_empty() || file.comment_prefix.contains(['\n', '\r']) {
         bail!("managed file comment_prefix must be nonempty and single-line");
     }
+    if file.comment_suffix.contains(['\n', '\r']) {
+        bail!("managed file comment_suffix must be single-line");
+    }
     let existed = path.exists();
     if !existed && removing {
         return Ok(Outcome::AlreadyApplied);
@@ -172,7 +178,12 @@ fn apply_managed_file(
     if !removing && current == desired {
         return Ok(Outcome::AlreadyApplied);
     }
-    validate_managed(&current, provider, &file.comment_prefix)?;
+    validate_managed(
+        &current,
+        provider,
+        &file.comment_prefix,
+        &file.comment_suffix,
+    )?;
     let backup = backup_path(path);
     if !backup.exists() {
         fs::copy(path, backup)?;
@@ -188,16 +199,22 @@ fn apply_managed_file(
 fn render_managed(provider: &str, file: &ManagedFile) -> String {
     let hash = format!("{:x}", Sha256::digest(file.content.as_bytes()));
     format!(
-        "{} Managed by gw for provider {}; content-sha256={}\n{}",
-        file.comment_prefix, provider, hash, file.content
+        "{} Managed by gw for provider {}; content-sha256={}{}\n{}",
+        file.comment_prefix, provider, hash, file.comment_suffix, file.content
     )
 }
 
-fn validate_managed(input: &str, provider: &str, comment_prefix: &str) -> Result<()> {
+fn validate_managed(
+    input: &str,
+    provider: &str,
+    comment_prefix: &str,
+    comment_suffix: &str,
+) -> Result<()> {
     let (header, body) = input.split_once('\n').context("file is not gw-managed")?;
     let marker = format!("{comment_prefix} Managed by gw for provider {provider}; content-sha256=");
     let stored = header
         .strip_prefix(&marker)
+        .and_then(|rest| rest.strip_suffix(comment_suffix))
         .context("file belongs to another owner or provider")?;
     if stored.len() != 64 || !stored.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("gw-managed file has an invalid content hash");
@@ -793,6 +810,10 @@ mod tests {
                 argv: vec!["fixture".to_owned()],
             },
             resume: None,
+            resume_prompt: None,
+            fork: None,
+            transcript: None,
+            transcript_glob: None,
             hooks: vec![HookFile {
                 path: path.to_string_lossy().into_owned(),
                 format,
@@ -817,6 +838,7 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             content: content.into(),
             comment_prefix: "//".into(),
+            comment_suffix: String::new(),
         });
         result
     }
@@ -865,6 +887,40 @@ mod tests {
             Outcome::Changed
         );
         assert_eq!(remove(&[new]).unwrap()[0].1, Outcome::AlreadyApplied);
+    }
+
+    #[test]
+    fn managed_markdown_suffix_closes_the_ownership_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("SKILL.md");
+        let mut manifest = managed(&path, "---\nname: gw\n---\nbody\n");
+        manifest.managed_files[0].comment_prefix = "<!--".into();
+        manifest.managed_files[0].comment_suffix = " -->".into();
+
+        assert_eq!(
+            install(std::slice::from_ref(&manifest)).unwrap()[0].1,
+            Outcome::Changed
+        );
+        let written = fs::read_to_string(&path).unwrap();
+        let header = written.lines().next().unwrap();
+        assert!(header.starts_with("<!-- Managed by gw for provider fixture;"));
+        assert!(header.ends_with(" -->"));
+        assert!(integration_is_installed(&manifest));
+
+        // A header missing the suffix belongs to nobody we own.
+        fs::write(&path, written.replacen(" -->", "", 1)).unwrap();
+        assert!(!integration_is_installed(&manifest));
+        assert!(install(std::slice::from_ref(&manifest)).is_err());
+    }
+
+    #[test]
+    fn managed_multiline_comment_markers_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("SKILL.md");
+        let mut manifest = managed(&path, "body\n");
+        manifest.managed_files[0].comment_suffix = " -->\n".into();
+        assert!(install(std::slice::from_ref(&manifest)).is_err());
+        assert!(!path.exists());
     }
 
     fn set(pointer: &str, value: JsonValue) -> Patch {

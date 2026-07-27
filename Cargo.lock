@@ -731,11 +731,13 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "dirs",
  "futures",
  "gw-core",
  "notify",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
  "unicode-width",
 ]

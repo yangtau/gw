@@ -29,6 +29,9 @@ pub struct SessionMeta {
     pub pane_id: Option<String>,
     pub pid: Option<i32>,
     pub cwd: Option<PathBuf>,
+    /// Latest provider-native transcript path seen in an event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -109,6 +112,9 @@ impl Store {
         } else {
             None
         };
+        let previous_transcript = previous
+            .as_ref()
+            .and_then(|meta| meta.transcript_path.clone());
         let (pane_id, pid, cwd) = match loc {
             Some(loc) => (loc.pane_id.clone(), Some(loc.pid), loc.cwd.clone()),
             None => previous
@@ -121,6 +127,7 @@ impl Store {
             pane_id,
             pid,
             cwd,
+            transcript_path: event.transcript.clone().or(previous_transcript),
             updated_at: now,
         };
         atomic::write(
@@ -380,6 +387,7 @@ mod tests {
             v: 1,
             ts: None,
             session: session.to_owned(),
+            transcript: None,
             kind,
         }
     }
@@ -399,6 +407,36 @@ mod tests {
         assert_eq!(records[0].events.len(), 1);
         assert!(records[0].events[0].ts.is_some());
         assert!(input.ts.is_none());
+    }
+
+    #[test]
+    fn meta_keeps_the_latest_transcript_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let mut with_path = event("session-1", EventKind::TurnStart { summary: None });
+        with_path.transcript = Some("/tmp/one.jsonl".into());
+        store.append("test", &with_path, None).unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].meta.transcript_path.as_deref(),
+            Some("/tmp/one.jsonl")
+        );
+
+        // An event without a transcript keeps the recorded path…
+        let without = event("session-1", EventKind::TurnEnd { summary: None });
+        store.append("test", &without, None).unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].meta.transcript_path.as_deref(),
+            Some("/tmp/one.jsonl")
+        );
+
+        // …and a newer transcript replaces it.
+        let mut newer = event("session-1", EventKind::TurnStart { summary: None });
+        newer.transcript = Some("/tmp/two.jsonl".into());
+        store.append("test", &newer, None).unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].meta.transcript_path.as_deref(),
+            Some("/tmp/two.jsonl")
+        );
     }
 
     #[test]

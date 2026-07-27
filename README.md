@@ -113,6 +113,25 @@ Configure which events notify with `notify = ["attention", "turn_end"]`, or
 disable them with `notify = false`, in `~/.config/gw/config.toml`. The starting
 view (`current` or `global`) is configurable there too.
 
+## Session referencing (CLI)
+
+Beyond the panel, `gw` answers questions about sessions from the command line —
+built for agents referencing other agents (a shared skill is installed by
+`gw setup`), equally usable by humans. Sessions are addressed as
+`provider:session-id`; a bare id or unique prefix (≥ 4 chars) works too.
+Ambiguous or unknown addresses are errors.
+
+| command | what it does |
+|---|---|
+| `gw ls [--json]` | The address book: live agents (pane-bound) and ended-but-resumable sessions. |
+| `gw show <addr> [--transcript] [--json]` | Status header plus the Activity timeline; `--transcript` emits the provider-native transcript. |
+| `gw wait <addr> [--timeout <secs>]` | Bounded level-triggered wait: returns `done \| attention \| error \| stale \| idle \| ended \| timeout` (default 45s; `0` = single query). |
+| `gw resume <addr> [prompt] [--fork]` | Relaunch an ended session in a new tmux window; `--fork` branches (required if the session is live). |
+
+Everything is read-only over the event log — no pane scraping, no key
+injection, no daemon. `resume` only ever starts a new process in a new window;
+it never touches an existing pane.
+
 ## Layout
 
 - `crates/gw` — the binary: panel TUI, `gw hook` ingest, `gw setup`.
