@@ -4,16 +4,14 @@
 //! are idempotent. See docs/protocol.md for patch semantics.
 
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value as JsonValue;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value as TomlValue};
 
+use crate::atomic;
 use crate::protocol::{FileFormat, ManagedFile, Manifest, Patch, PatchMode};
 use sha2::{Digest, Sha256};
 
@@ -167,7 +165,7 @@ fn apply_managed_file(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write(path, desired.as_bytes(), false)?;
+        atomic::write(path, desired.as_bytes(), false)?;
         return Ok(Outcome::Changed);
     }
     let current = fs::read_to_string(path)?;
@@ -182,7 +180,7 @@ fn apply_managed_file(
     if removing {
         fs::remove_file(path)?;
     } else {
-        atomic_write(path, desired.as_bytes(), true)?;
+        atomic::write(path, desired.as_bytes(), true)?;
     }
     Ok(Outcome::Changed)
 }
@@ -295,7 +293,7 @@ fn apply_target(target: &Target<'_>, removing: bool) -> Result<Outcome> {
             fs::copy(&target.path, backup)?;
         }
     }
-    atomic_write(&target.path, &output, existed)?;
+    atomic::write(&target.path, &output, existed)?;
     Ok(Outcome::Changed)
 }
 
@@ -771,41 +769,6 @@ fn backup_path(path: &Path) -> PathBuf {
     let mut backup = OsString::from(path.as_os_str());
     backup.push(".gw-backup");
     PathBuf::from(backup)
-}
-
-pub(crate) fn atomic_write(path: &Path, contents: &[u8], existed: bool) -> Result<()> {
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-    let permissions = if existed {
-        Some(fs::metadata(path)?.permissions())
-    } else {
-        None
-    };
-    let mut temp_name = OsString::from(path.as_os_str());
-    temp_name.push(format!(
-        ".gw-tmp-{}-{}",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let temp_path = PathBuf::from(temp_name);
-    let result = (|| -> Result<()> {
-        let mut temp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp_path)?;
-        temp.write_all(contents)?;
-        temp.sync_all()?;
-        if let Some(permissions) = permissions {
-            fs::set_permissions(&temp_path, permissions)?;
-        }
-        fs::rename(&temp_path, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
 }
 
 #[cfg(test)]

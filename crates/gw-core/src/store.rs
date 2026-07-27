@@ -13,9 +13,9 @@ use chrono::{DateTime, Duration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::atomic;
 use crate::procs::AgentLocation;
 use crate::protocol::{Event, EventKind};
-use crate::setup::atomic_write;
 
 pub struct Store {
     root: PathBuf,
@@ -123,7 +123,7 @@ impl Store {
             cwd,
             updated_at: now,
         };
-        atomic_write(
+        atomic::write(
             &meta_path,
             &serde_json::to_vec_pretty(&meta)?,
             meta_path.exists(),
@@ -466,7 +466,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
         let sid = session_id("test", "s1");
-        atomic_write(
+        atomic::write(
             &store.sessions_dir().join(format!("{sid}.jsonl")),
             b"{\"v\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"session\":\"s1\",\"kind\":\"turn_start\"}\n",
             false,
@@ -673,7 +673,7 @@ mod tests {
         let mut old_meta: SessionMeta =
             serde_json::from_slice(&fs::read(&old_meta_path).unwrap()).unwrap();
         old_meta.updated_at = Utc::now() - Duration::days(2);
-        atomic_write(
+        atomic::write(
             &old_meta_path,
             &serde_json::to_vec(&old_meta).unwrap(),
             true,
