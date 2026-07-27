@@ -812,6 +812,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-provider-traex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gw-plugin-protocol",
+ "gw-provider-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
