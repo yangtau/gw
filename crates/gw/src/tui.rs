@@ -9,7 +9,6 @@
 //! fields fit the terminal width, degrading in a fixed order; the detail
 //! text absorbs whatever space is left.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -32,6 +31,8 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::panel::{AgentList, AgentListRow, Ctx, Effect, Input, PanelState, Screen};
 
 const STALE_AFTER_MINUTES: i64 = 30;
 const RETENTION_DAYS: i64 = 7;
@@ -57,17 +58,6 @@ pub fn run(initial_view: PanelView) -> Result<()> {
     })
 }
 
-enum Screen {
-    Agents,
-    Ended,
-}
-
-enum Flow {
-    Continue,
-    Refreshed,
-    Quit,
-}
-
 #[derive(Clone, Copy)]
 struct FrameLayout {
     banner: Rect,
@@ -76,93 +66,7 @@ struct FrameLayout {
     footer: Rect,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum AgentListRow {
-    Header { name: String, current: bool },
-    Agent(usize),
-}
-
-struct AgentList {
-    rows: Vec<AgentListRow>,
-    selectable_rows: Vec<usize>,
-}
-
-impl AgentList {
-    fn new(agents: &[Agent], view: PanelView, current_tmux_session_id: Option<&str>) -> Self {
-        let mut list = Self {
-            rows: Vec::new(),
-            selectable_rows: Vec::new(),
-        };
-        match view {
-            PanelView::Current => {
-                for (index, agent) in agents.iter().enumerate() {
-                    if Some(agent.tmux_session_id.as_str()) == current_tmux_session_id {
-                        list.push_agent(index);
-                    }
-                }
-            }
-            PanelView::Global => {
-                let mut seen = HashSet::new();
-                let mut groups = agents
-                    .iter()
-                    .filter_map(|agent| {
-                        seen.insert(agent.tmux_session_id.as_str()).then_some((
-                            agent.tmux_session_name.as_str(),
-                            agent.tmux_session_id.as_str(),
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                groups.sort_by(|left, right| {
-                    let left_current = Some(left.1) == current_tmux_session_id;
-                    let right_current = Some(right.1) == current_tmux_session_id;
-                    right_current
-                        .cmp(&left_current)
-                        .then_with(|| left.0.cmp(right.0))
-                        .then_with(|| left.1.cmp(right.1))
-                });
-                for (name, tmux_session_id) in groups {
-                    list.rows.push(AgentListRow::Header {
-                        name: name.to_owned(),
-                        current: Some(tmux_session_id) == current_tmux_session_id,
-                    });
-                    for (index, agent) in agents.iter().enumerate() {
-                        if agent.tmux_session_id == tmux_session_id {
-                            list.push_agent(index);
-                        }
-                    }
-                }
-            }
-        }
-        list
-    }
-
-    fn push_agent(&mut self, agent_index: usize) {
-        self.selectable_rows.push(self.rows.len());
-        self.rows.push(AgentListRow::Agent(agent_index));
-    }
-
-    fn selectable_count(&self) -> usize {
-        self.selectable_rows.len()
-    }
-
-    fn agent_index(&self, selection: usize) -> Option<usize> {
-        let row = *self.selectable_rows.get(selection)?;
-        match self.rows.get(row)? {
-            AgentListRow::Agent(index) => Some(*index),
-            AgentListRow::Header { .. } => None,
-        }
-    }
-}
-
-fn move_selection(selected: usize, delta: i64, count: usize) -> usize {
-    if count == 0 {
-        0
-    } else {
-        (selected as i64 + delta).rem_euclid(count as i64) as usize
-    }
-}
-
-fn frame_layout(area: Rect, screen: &Screen, show_banner: bool) -> FrameLayout {
+fn frame_layout(area: Rect, screen: Screen, show_banner: bool) -> FrameLayout {
     let banner_height = u16::from(show_banner);
     let activity_height =
         if matches!(screen, Screen::Ended) || area.height < MIN_ACTIVITY_TERM_HEIGHT {
@@ -198,15 +102,17 @@ struct App {
     store: Store,
     plugins: Vec<Plugin>,
     snapshot: Snapshot,
-    screen: Screen,
-    show_shortcuts: bool,
-    agent_view: PanelView,
-    selected: usize,
-    picker: Option<usize>,
+    state: PanelState,
     panel_pane_id: Option<String>,
     current_tmux_session_id: Option<String>,
     fallback_tmux_session_id: Option<String>,
     exit_after_jump: bool,
+}
+
+/// What the run loop should do after handling a keystroke.
+enum Loop {
+    Continue,
+    Quit,
 }
 
 impl App {
@@ -232,11 +138,7 @@ impl App {
                 ended: vec![],
                 setup_required: vec![],
             },
-            screen: Screen::Agents,
-            show_shortcuts: false,
-            agent_view: initial_view,
-            selected: 0,
-            picker: None,
+            state: PanelState::new(initial_view),
             panel_pane_id,
             current_tmux_session_id: None,
             fallback_tmux_session_id,
@@ -267,14 +169,65 @@ impl App {
                 }
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
-                        match self.on_key(key)? {
-                            Flow::Quit => return Ok(()),
-                            Flow::Continue => {}
-                            Flow::Refreshed => {}
+                        if let Some(input) = map_key(key) {
+                            if let Loop::Quit = self.handle(input)? {
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Fold one semantic input through the pure state machine, then run the
+    /// effects it emits against tmux/store/env. This is the only place the
+    /// panel's decisions meet the outside world.
+    fn handle(&mut self, input: Input) -> Result<Loop> {
+        let effects = {
+            let ctx = Ctx {
+                snapshot: &self.snapshot,
+                current_tmux_session_id: self.current_tmux_session_id.as_deref(),
+                plugin_count: self.plugins.len(),
+            };
+            self.state.on(input, &ctx)
+        };
+        for effect in effects {
+            match effect {
+                Effect::Quit => return Ok(Loop::Quit),
+                Effect::Jump(pane_id) => {
+                    if let Loop::Quit = self.jump(&pane_id)? {
+                        return Ok(Loop::Quit);
+                    }
+                }
+                Effect::LaunchProvider(index) => {
+                    if let Some(plugin) = self.plugins.get(index) {
+                        let cwd = std::env::current_dir()?;
+                        let pane = tmux::new_window(
+                            &plugin.manifest.id,
+                            &cwd,
+                            &plugin.manifest.launch.argv,
+                        )?;
+                        if let Loop::Quit = self.jump(&pane)? {
+                            return Ok(Loop::Quit);
+                        }
+                    }
+                }
+                Effect::ResumeEnded(index) => {
+                    if let Loop::Quit = self.resume_ended(index)? {
+                        return Ok(Loop::Quit);
+                    }
+                }
+            }
+        }
+        Ok(Loop::Continue)
+    }
+
+    fn ctx(&self) -> Ctx<'_> {
+        Ctx {
+            snapshot: &self.snapshot,
+            current_tmux_session_id: self.current_tmux_session_id.as_deref(),
+            plugin_count: self.plugins.len(),
         }
     }
 
@@ -303,182 +256,63 @@ impl App {
             Ok(snapshot) => self.snapshot = snapshot,
             Err(err) => gw_core::tui_log::error(&format!("snapshot failed: {err:#}")),
         }
-        self.selected = self.selected.min(self.row_count().saturating_sub(1));
-    }
-
-    fn row_count(&self) -> usize {
-        match self.screen {
-            Screen::Agents => self.agent_list().selectable_count(),
-            Screen::Ended => self.snapshot.ended.len(),
-        }
+        let ctx = Ctx {
+            snapshot: &self.snapshot,
+            current_tmux_session_id: self.current_tmux_session_id.as_deref(),
+            plugin_count: self.plugins.len(),
+        };
+        self.state.clamp_selection(&ctx);
     }
 
     fn selected_agent(&self) -> Option<&Agent> {
-        match self.screen {
-            Screen::Agents => self
-                .agent_list()
-                .agent_index(self.selected)
-                .and_then(|index| self.snapshot.agents.get(index)),
-            Screen::Ended => None,
-        }
+        let index = self.state.selected_agent_index(&self.ctx())?;
+        self.snapshot.agents.get(index)
     }
 
     fn agent_list(&self) -> AgentList {
-        AgentList::new(
-            &self.snapshot.agents,
-            self.agent_view,
-            self.current_tmux_session_id.as_deref(),
-        )
+        self.state.agent_list(&self.ctx())
     }
 
     fn plugin(&self, provider: &str) -> Option<&Plugin> {
         self.plugins.iter().find(|p| p.manifest.id == provider)
     }
 
-    fn on_key(&mut self, key: KeyEvent) -> Result<Flow> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(Flow::Quit);
-        }
-        if self.show_shortcuts {
-            return match key.code {
-                KeyCode::Char('?') | KeyCode::Esc => {
-                    self.show_shortcuts = false;
-                    Ok(Flow::Continue)
-                }
-                _ => Ok(Flow::Continue),
-            };
-        }
-        if key.code == KeyCode::Char('?') {
-            self.show_shortcuts = true;
-            return Ok(Flow::Continue);
-        }
-        if self.picker.is_some() {
-            return self.on_picker_key(key);
-        }
-        match key.code {
-            KeyCode::Esc => return Ok(Flow::Quit),
-            KeyCode::Char('j') | KeyCode::Down => self.select(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select(-1),
-            KeyCode::Tab => {
-                self.agent_view = self.agent_view.toggled();
-                if matches!(self.screen, Screen::Agents) {
-                    self.selected = 0;
-                }
-            }
-            KeyCode::Char('a') => self.select_next_attention(),
-            KeyCode::Char('n') => self.picker = Some(0),
-            KeyCode::Char('r') => {
-                self.screen = match self.screen {
-                    Screen::Agents => Screen::Ended,
-                    Screen::Ended => Screen::Agents,
-                };
-                self.selected = 0;
-                self.refresh();
-                return Ok(Flow::Refreshed);
-            }
-            KeyCode::Enter => return self.activate(),
-            _ => {}
-        }
-        Ok(Flow::Continue)
+    fn resume_ended(&mut self, index: usize) -> Result<Loop> {
+        let Some(session) = self.snapshot.ended.get(index) else {
+            return Ok(Loop::Continue);
+        };
+        let Some(resume) = self
+            .plugin(&session.provider)
+            .and_then(|p| p.manifest.resume.clone())
+        else {
+            return Ok(Loop::Continue);
+        };
+        let argv: Vec<String> = resume
+            .argv
+            .iter()
+            .map(|a| a.replace("{session_id}", &session.session_id))
+            .collect();
+        let cwd = session.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let pane = tmux::new_window(&session.provider, &cwd, &argv)?;
+        self.jump(&pane)
     }
 
-    fn on_picker_key(&mut self, key: KeyEvent) -> Result<Flow> {
-        let picked = self.picker.unwrap();
-        match key.code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.picker = Some((picked + 1) % self.plugins.len().max(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.picker = Some(
-                    picked
-                        .checked_sub(1)
-                        .unwrap_or(self.plugins.len().saturating_sub(1)),
-                );
-            }
-            KeyCode::Enter => {
-                self.picker = None;
-                if let Some(plugin) = self.plugins.get(picked) {
-                    let cwd = std::env::current_dir()?;
-                    let pane =
-                        tmux::new_window(&plugin.manifest.id, &cwd, &plugin.manifest.launch.argv)?;
-                    return self.jump(&pane);
-                }
-            }
-            _ => {}
-        }
-        Ok(Flow::Continue)
-    }
-
-    fn select(&mut self, delta: i64) {
-        self.selected = move_selection(self.selected, delta, self.row_count());
-    }
-
-    fn select_next_attention(&mut self) {
-        if !matches!(self.screen, Screen::Agents) {
-            return;
-        }
-        let list = self.agent_list();
-        let count = list.selectable_count();
-        let next = (1..=count)
-            .map(|offset| (self.selected + offset) % count.max(1))
-            .find(|&selection| {
-                list.agent_index(selection)
-                    .and_then(|index| self.snapshot.agents.get(index))
-                    .is_some_and(|agent| matches!(agent.status, Status::Attention(_)))
-            });
-        if let Some(selection) = next {
-            self.selected = selection;
-        }
-    }
-
-    fn activate(&mut self) -> Result<Flow> {
-        match self.screen {
-            Screen::Agents => match self.selected_agent() {
-                Some(agent) => {
-                    let pane = agent.pane.id.clone();
-                    self.jump(&pane)
-                }
-                None => Ok(Flow::Continue),
-            },
-            Screen::Ended => {
-                let Some(session) = self.snapshot.ended.get(self.selected) else {
-                    return Ok(Flow::Continue);
-                };
-                let Some(resume) = self
-                    .plugin(&session.provider)
-                    .and_then(|p| p.manifest.resume.clone())
-                else {
-                    return Ok(Flow::Continue);
-                };
-                let argv: Vec<String> = resume
-                    .argv
-                    .iter()
-                    .map(|a| a.replace("{session_id}", &session.session_id))
-                    .collect();
-                let cwd = session.cwd.clone().unwrap_or(std::env::current_dir()?);
-                let pane = tmux::new_window(&session.provider, &cwd, &argv)?;
-                self.jump(&pane)
-            }
-        }
-    }
-
-    fn jump(&mut self, pane_id: &str) -> Result<Flow> {
+    fn jump(&mut self, pane_id: &str) -> Result<Loop> {
         tmux::focus(pane_id)?;
         if self.exit_after_jump {
-            return Ok(Flow::Quit);
+            return Ok(Loop::Quit);
         }
         self.refresh();
-        Ok(Flow::Refreshed)
+        Ok(Loop::Continue)
     }
 
     fn render(&self, frame: &mut Frame) {
-        if self.show_shortcuts {
+        if self.state.show_shortcuts() {
             self.render_shortcuts(frame);
             return;
         }
         let show_banner = !self.snapshot.setup_required.is_empty();
-        let layout = frame_layout(frame.area(), &self.screen, show_banner);
+        let layout = frame_layout(frame.area(), self.state.screen(), show_banner);
 
         if show_banner {
             let msg = format!(
@@ -491,13 +325,13 @@ impl App {
             );
         }
 
-        match self.screen {
+        match self.state.screen() {
             Screen::Agents => self.render_agents(frame, layout.main),
             Screen::Ended => self.render_ended(frame, layout.main),
         }
         self.render_activity(frame, layout.activity);
         self.render_footer(frame, layout.footer);
-        if self.picker.is_some() {
+        if self.state.picker().is_some() {
             self.render_picker(frame);
         }
     }
@@ -545,12 +379,13 @@ impl App {
     fn render_agents(&self, frame: &mut Frame, area: Rect) {
         let cells = self.agent_cells(Utc::now());
         let list = self.agent_list();
+        let selected = self.state.selected();
         let mut lines = vec![Line::default()];
         // Physical line span [top, bottom) of the selected agent + its
         // subagent sub-lines; subagent rows can push it past the viewport.
         let mut selected_span = (0, 0);
         if list.selectable_count() == 0 {
-            let empty = match self.agent_view {
+            let empty = match self.state.view() {
                 PanelView::Current => "   no agents in this tmux session — n launches one",
                 PanelView::Global => "   no agents in any tmux session — n launches one",
             };
@@ -591,12 +426,12 @@ impl App {
                     }
                     AgentListRow::Agent(index) => {
                         let c = &cells[*index];
-                        if selection == self.selected {
+                        if selection == selected {
                             selected_span = (lines.len(), lines.len() + 1 + c.subagents.len());
                         }
                         lines.push(agent_line(
                             c,
-                            selection == self.selected,
+                            selection == selected,
                             agent_w,
                             status_w,
                             &plan,
@@ -656,7 +491,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, (label, color, session, cwd, time))| {
-                    let marker = if i == self.selected { " ❯ " } else { "   " };
+                    let marker = if i == self.state.selected() { " ❯ " } else { "   " };
                     let prefix = MARKER_W + label_w + COL_GAP + session_w + COL_GAP;
                     let mut right = pad(cwd, cwd_w);
                     right.push_str(SEP);
@@ -722,7 +557,7 @@ impl App {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let mut hints = " ?".to_owned();
-        if matches!(self.screen, Screen::Agents) && self.agent_view == PanelView::Current {
+        if matches!(self.state.screen(), Screen::Agents) && self.state.view() == PanelView::Current {
             if let Some(elsewhere) = elsewhere_hint(
                 &self.snapshot.agents,
                 self.current_tmux_session_id.as_deref(),
@@ -769,7 +604,7 @@ impl App {
     }
 
     fn render_picker(&self, frame: &mut Frame) {
-        let picked = self.picker.unwrap();
+        let picked = self.state.picker().unwrap();
         let width = 30u16;
         let height = self.plugins.len() as u16 + 2;
         let area = center(frame.area(), width, height);
@@ -787,6 +622,27 @@ impl App {
             List::new(items).block(Block::new().borders(Borders::ALL).title(" new agent ")),
             area,
         );
+    }
+}
+
+/// Translate a physical keystroke into a semantic panel input, or `None` for
+/// keys the panel ignores. Mode-dependent meaning is resolved by `PanelState`,
+/// not here — this map is context-free.
+fn map_key(key: KeyEvent) -> Option<Input> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(Input::Quit);
+    }
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => Some(Input::Down),
+        KeyCode::Char('k') | KeyCode::Up => Some(Input::Up),
+        KeyCode::Tab => Some(Input::ToggleView),
+        KeyCode::Char('a') => Some(Input::NextAttention),
+        KeyCode::Char('n') => Some(Input::OpenPicker),
+        KeyCode::Char('r') => Some(Input::ToggleEnded),
+        KeyCode::Char('?') => Some(Input::Help),
+        KeyCode::Enter => Some(Input::Confirm),
+        KeyCode::Esc => Some(Input::Cancel),
+        _ => None,
     }
 }
 
@@ -1300,61 +1156,6 @@ mod tests {
                 ("now", "session", Color::DarkGray, "ended"),
             ]
         );
-    }
-
-    #[test]
-    fn global_groups_put_current_first_then_sort_by_name_and_omit_empty_groups() {
-        // Groups come only from live Agents, so a tmux session with no Agent
-        // cannot create a header.
-        let agents = vec![
-            agent(
-                "zeta",
-                "$3",
-                "%3",
-                Status::Attention(AttentionKind::Approval),
-            ),
-            agent("current", "$2", "%2", Status::Working),
-            agent("alpha", "$1", "%1", Status::Done),
-            agent("zeta", "$3", "%4", Status::Idle),
-        ];
-
-        let list = AgentList::new(&agents, PanelView::Global, Some("$2"));
-
-        assert_eq!(
-            list.rows,
-            [
-                AgentListRow::Header {
-                    name: "current".into(),
-                    current: true,
-                },
-                AgentListRow::Agent(1),
-                AgentListRow::Header {
-                    name: "alpha".into(),
-                    current: false,
-                },
-                AgentListRow::Agent(2),
-                AgentListRow::Header {
-                    name: "zeta".into(),
-                    current: false,
-                },
-                AgentListRow::Agent(0),
-                AgentListRow::Agent(3),
-            ]
-        );
-    }
-
-    #[test]
-    fn cursor_movement_skips_tmux_session_headers() {
-        let agents = vec![
-            agent("current", "$1", "%1", Status::Working),
-            agent("other", "$2", "%2", Status::Done),
-        ];
-        let list = AgentList::new(&agents, PanelView::Global, Some("$1"));
-
-        assert_eq!(list.selectable_rows, [1, 3]);
-        let selection = move_selection(0, 1, list.selectable_count());
-        assert_eq!(list.selectable_rows[selection], 3);
-        assert_eq!(list.agent_index(selection), Some(1));
     }
 
     #[test]

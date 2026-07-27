@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gw_core::config::{Config, PanelView};
 
 mod hook;
+mod panel;
 mod setup;
 mod tui;
 
