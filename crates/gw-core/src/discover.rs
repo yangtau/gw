@@ -259,13 +259,6 @@ mod tests {
             pane_current_path: pane.cwd.clone(),
             window_index: pane.window_index,
             window_name: pane.window_name.clone(),
-            geometry: crate::tmux::PaneGeometry {
-                left: 0,
-                top: 0,
-                cols: 80,
-                rows: 24,
-            },
-            window_panes: 1,
         }
     }
 

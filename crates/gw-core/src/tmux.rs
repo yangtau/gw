@@ -20,14 +20,6 @@ pub struct Pane {
     pub window_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaneGeometry {
-    pub left: u32,
-    pub top: u32,
-    pub cols: u32,
-    pub rows: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyRow {
     pub tmux_session_name: String,
@@ -41,16 +33,12 @@ pub struct TopologyRow {
     pub pane_current_path: PathBuf,
     pub window_index: u32,
     pub window_name: String,
-    pub geometry: PaneGeometry,
-    pub window_panes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelLocation {
     pub tmux_session_id: String,
     pub window_id: String,
-    pub visible: bool,
-    pub geometry: PaneGeometry,
 }
 
 #[derive(Debug, Clone)]
@@ -82,8 +70,6 @@ pub fn locate_panel(pane_id: &str, rows: &[TopologyRow]) -> Option<PanelLocation
     Some(PanelLocation {
         tmux_session_id: row.tmux_session_id.clone(),
         window_id: row.window_id.clone(),
-        visible: row.window_active && row.tmux_session_attached,
-        geometry: row.geometry,
     })
 }
 
@@ -189,7 +175,7 @@ fn observe_topology_command() -> Vec<OsString> {
         "list-panes".into(),
         "-a".into(),
         "-F".into(),
-        "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_panes}".into(),
+        "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}".into(),
     ]
 }
 
@@ -240,7 +226,7 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let mut fields = line.splitn(16, '\t');
+            let mut fields = line.splitn(11, '\t');
             let tmux_session_name = fields.next().context("missing tmux session name")?;
             let tmux_session_id = fields.next().context("missing tmux session id")?;
             let window_id = fields.next().context("missing window id")?;
@@ -268,31 +254,6 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
                 .parse()
                 .context("invalid window index")?;
             let window_name = fields.next().context("missing window name")?;
-            let left = fields
-                .next()
-                .context("missing pane left")?
-                .parse()
-                .context("invalid pane left")?;
-            let top = fields
-                .next()
-                .context("missing pane top")?
-                .parse()
-                .context("invalid pane top")?;
-            let cols = fields
-                .next()
-                .context("missing pane width")?
-                .parse()
-                .context("invalid pane width")?;
-            let rows = fields
-                .next()
-                .context("missing pane height")?
-                .parse()
-                .context("invalid pane height")?;
-            let window_panes = fields
-                .next()
-                .context("missing window pane count")?
-                .parse()
-                .context("invalid window pane count")?;
             Ok(TopologyRow {
                 tmux_session_name: tmux_session_name.into(),
                 tmux_session_id: tmux_session_id.into(),
@@ -305,13 +266,6 @@ fn parse_topology(stdout: &str) -> Result<Vec<TopologyRow>> {
                 pane_current_path: pane_current_path.into(),
                 window_index,
                 window_name: window_name.into(),
-                geometry: PaneGeometry {
-                    left,
-                    top,
-                    cols,
-                    rows,
-                },
-                window_panes,
             })
         })
         .collect()
@@ -349,14 +303,14 @@ mod tests {
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_panes}",
+                "#{session_name}\t#{session_id}\t#{window_id}\t#{window_active}\t#{session_attached}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{window_index}\t#{window_name}",
             ]
         );
 
         let rows = parse_topology(
-            "main\t$1\t@7\t1\t2\t%3\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\t12\t4\t80\t24\t3\n\
-             main\t$1\t@9\t0\t2\t%4\t456\ttys002\t/tmp\t3\tsecond window\t0\t0\t100\t30\t1\n\
-             group\t$2\t@7\t1\t0\t%3\t123\ttys001\t/Users/me/project one\t2\tagent\t12\t4\t80\t24\t3\n",
+            "main\t$1\t@7\t1\t2\t%3\t123\t/dev/ttys001\t/Users/me/project one\t2\tagent\n\
+             main\t$1\t@9\t0\t2\t%4\t456\ttys002\t/tmp\t3\tsecond window\n\
+             group\t$2\t@7\t1\t0\t%3\t123\ttys001\t/Users/me/project one\t2\tagent\n",
         )
         .unwrap();
 
@@ -375,41 +329,29 @@ mod tests {
         );
         assert_eq!(rows[0].window_index, 2);
         assert_eq!(rows[0].window_name, "agent");
-        assert_eq!(rows[0].geometry.left, 12);
-        assert_eq!(rows[0].geometry.top, 4);
-        assert_eq!(rows[0].geometry.cols, 80);
-        assert_eq!(rows[0].geometry.rows, 24);
-        assert_eq!(rows[0].window_panes, 3);
         assert!(!rows[1].window_active);
     }
 
     #[test]
     fn locates_panel_in_the_attached_active_group_row() {
         let rows = parse_topology(
-            "old\t$1\t@old\t1\t0\t%panel\t123\tttys001\t/tmp\t1\told\t0\t0\t80\t24\t1\n\
-             attached\t$2\t@attached\t0\t1\t%panel\t123\tttys001\t/tmp\t2\tattached\t4\t6\t90\t30\t1\n\
-             visible\t$3\t@visible\t1\t1\t%panel\t123\tttys001\t/tmp\t3\tvisible\t8\t10\t100\t40\t1\n",
+            "old\t$1\t@old\t1\t0\t%panel\t123\tttys001\t/tmp\t1\told\n\
+             attached\t$2\t@attached\t0\t1\t%panel\t123\tttys001\t/tmp\t2\tattached\n\
+             visible\t$3\t@visible\t1\t1\t%panel\t123\tttys001\t/tmp\t3\tvisible\n",
         )
         .unwrap();
 
         assert_eq!(
             locate_panel("%panel", &rows[..2])
                 .as_ref()
-                .map(|panel| (panel.window_id.as_str(), panel.visible)),
-            Some(("@attached", false))
+                .map(|panel| panel.window_id.as_str()),
+            Some("@attached")
         );
         assert_eq!(
             locate_panel("%panel", &rows),
             Some(PanelLocation {
                 tmux_session_id: "$3".into(),
                 window_id: "@visible".into(),
-                visible: true,
-                geometry: PaneGeometry {
-                    left: 8,
-                    top: 10,
-                    cols: 100,
-                    rows: 40,
-                },
             })
         );
         assert_eq!(locate_panel("%missing", &rows), None);
@@ -418,9 +360,9 @@ mod tests {
     #[test]
     fn grouped_pane_belongs_to_the_attached_tmux_session() {
         let rows = parse_topology(
-            "detached\t$1\t@7\t1\t0\t%3\t123\tttys001\t/tmp\t2\tagent\t0\t0\t80\t24\t1\n\
-             attached\t$2\t@7\t0\t1\t%3\t123\tttys001\t/tmp\t2\tagent\t0\t0\t80\t24\t1\n\
-             other\t$3\t@9\t1\t1\t%4\t456\tttys002\t/work\t3\tother\t0\t0\t80\t24\t1\n",
+            "detached\t$1\t@7\t1\t0\t%3\t123\tttys001\t/tmp\t2\tagent\n\
+             attached\t$2\t@7\t0\t1\t%3\t123\tttys001\t/tmp\t2\tagent\n\
+             other\t$3\t@9\t1\t1\t%4\t456\tttys002\t/work\t3\tother\n",
         )
         .unwrap();
 
