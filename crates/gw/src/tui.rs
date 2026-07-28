@@ -49,13 +49,18 @@ pub fn run(initial_view: PanelView) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async {
+    let outcome = rt.block_on(async {
         let mut app = App::new(initial_view)?;
         let mut terminal = ratatui::init();
         let result = app.run(&mut terminal).await;
         ratatui::restore();
         result
-    })
+    })?;
+    match outcome {
+        Loop::Quit => Ok(()),
+        Loop::Attach(target) => tmux::attach(&target),
+        Loop::Continue => unreachable!("the panel run loop cannot exit with Continue"),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +118,22 @@ struct App {
 enum Loop {
     Continue,
     Quit,
+    /// Restore the terminal, then attach this external terminal to the target.
+    Attach(tmux::TmuxPaneTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpRoute {
+    FocusExistingClient,
+    AttachExternalTerminal,
+}
+
+fn jump_route(inside_tmux: bool) -> JumpRoute {
+    if inside_tmux {
+        JumpRoute::FocusExistingClient
+    } else {
+        JumpRoute::AttachExternalTerminal
+    }
 }
 
 impl App {
@@ -148,7 +169,7 @@ impl App {
         Ok(app)
     }
 
-    async fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+    async fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<Loop> {
         let (fs_tx, mut fs_rx) = tokio::sync::mpsc::unbounded_channel();
         let sessions_dir = self.store.root().join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
@@ -170,8 +191,9 @@ impl App {
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
                         if let Some(input) = map_key(key) {
-                            if let Loop::Quit = self.handle(input)? {
-                                return Ok(());
+                            match self.handle(input)? {
+                                Loop::Continue => {}
+                                outcome => return Ok(outcome),
                             }
                         }
                     }
@@ -195,29 +217,28 @@ impl App {
         for effect in effects {
             match effect {
                 Effect::Quit => return Ok(Loop::Quit),
-                Effect::Jump(pane_id) => {
-                    if let Loop::Quit = self.jump(&pane_id)? {
-                        return Ok(Loop::Quit);
-                    }
-                }
+                Effect::Jump(target) => match self.jump(target)? {
+                    Loop::Continue => {}
+                    outcome => return Ok(outcome),
+                },
                 Effect::LaunchProvider(index) => {
                     if let Some(plugin) = self.plugins.get(index) {
                         let cwd = std::env::current_dir()?;
-                        let pane = tmux::new_window(
+                        let target = tmux::new_window(
                             &plugin.manifest.id,
                             &cwd,
                             &plugin.manifest.launch.argv,
                         )?;
-                        if let Loop::Quit = self.jump(&pane)? {
-                            return Ok(Loop::Quit);
+                        match self.jump(target)? {
+                            Loop::Continue => {}
+                            outcome => return Ok(outcome),
                         }
                     }
                 }
-                Effect::ResumeEnded(index) => {
-                    if let Loop::Quit = self.resume_ended(index)? {
-                        return Ok(Loop::Quit);
-                    }
-                }
+                Effect::ResumeEnded(index) => match self.resume_ended(index)? {
+                    Loop::Continue => {}
+                    outcome => return Ok(outcome),
+                },
             }
         }
         Ok(Loop::Continue)
@@ -289,12 +310,15 @@ impl App {
         };
         let cwd = session.cwd.clone().unwrap_or(std::env::current_dir()?);
         let argv = gw_core::launch::expand_argv(&resume.argv, &session.session_id, None, &cwd);
-        let pane = tmux::new_window(&session.provider, &cwd, &argv)?;
-        self.jump(&pane)
+        let target = tmux::new_window(&session.provider, &cwd, &argv)?;
+        self.jump(target)
     }
 
-    fn jump(&mut self, pane_id: &str) -> Result<Loop> {
-        tmux::focus(pane_id)?;
+    fn jump(&mut self, target: tmux::TmuxPaneTarget) -> Result<Loop> {
+        if jump_route(tmux::inside_tmux()) == JumpRoute::AttachExternalTerminal {
+            return Ok(Loop::Attach(target));
+        }
+        tmux::focus(&target)?;
         if self.exit_after_jump {
             return Ok(Loop::Quit);
         }
@@ -1068,6 +1092,12 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jump_outside_tmux_defers_attach_until_after_the_panel_exits() {
+        assert_eq!(jump_route(false), JumpRoute::AttachExternalTerminal);
+        assert_eq!(jump_route(true), JumpRoute::FocusExistingClient);
+    }
 
     fn agent(
         tmux_session_name: &str,

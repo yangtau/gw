@@ -95,6 +95,10 @@ bind g popup -E 'GW_POPUP=1 gw'
 `gw` runs equally well in a persistent pane (dashboard mode) or a `display-popup`
 (switcher mode); the only difference is whether it exits after a jump.
 
+It can also run from a terminal outside tmux when a tmux server is already
+running. Select an Agent and press `enter`; `gw` restores the terminal, then
+attaches it directly to that Agent's tmux session and pane.
+
 ## Keys
 
 | key | action |

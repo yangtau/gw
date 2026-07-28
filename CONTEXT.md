@@ -42,6 +42,11 @@ A child agent running inside a Session, reported by the provider's subagent hook
 ### Panel
 The TUI itself. Runs equally in a persistent pane (dashboard mode) or a tmux `display-popup` (switcher mode — the primary posture: summon, pick, jump, gone). The only behavioral difference is whether the panel exits after a jump. The Panel has two Views; discovery itself is always global — a View only filters what is displayed.
 
+The Panel can also run in a terminal outside tmux when a tmux server is
+available. Jumping to an Agent then exits the Panel, restores the terminal, and
+attaches that terminal to the Agent's exact tmux session, window, and pane.
+Inside tmux, jumping continues to switch the existing tmux client.
+
 ### View
 Which Agents the Panel displays. The **current view** shows Agents in the current tmux session, with a passive hint when Agents elsewhere need attention. The **global view** shows all Agents grouped by tmux session — current tmux session first, others by name; groups are plain headers (not selectable, not collapsible); tmux sessions with no Agents do not appear. One key toggles between the two; the starting view is configurable. Views never change behavior — Launch always targets the current tmux session regardless of view.
 

@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use gw_core::config::PanelView;
 use gw_core::discover::{Agent, Snapshot};
 use gw_core::session::Status;
+use gw_core::tmux::TmuxPaneTarget;
 
 /// Which list the panel is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +39,8 @@ pub enum Input {
 /// Something the adapter must do against the outside world after a transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    /// Focus the tmux pane with this id.
-    Jump(String),
+    /// Focus or attach to this exact tmux pane target.
+    Jump(TmuxPaneTarget),
     /// Launch the discovered plugin at this index in a new window.
     LaunchProvider(usize),
     /// Resume the ended session at this index of the snapshot.
@@ -167,7 +168,14 @@ impl PanelState {
     fn activate(&self, ctx: &Ctx) -> Vec<Effect> {
         match self.screen {
             Screen::Agents => match self.selected_agent_index(ctx) {
-                Some(index) => vec![Effect::Jump(ctx.snapshot.agents[index].pane.id.clone())],
+                Some(index) => {
+                    let agent = &ctx.snapshot.agents[index];
+                    vec![Effect::Jump(TmuxPaneTarget {
+                        tmux_session_id: agent.tmux_session_id.clone(),
+                        window_id: agent.pane.window_id.clone(),
+                        pane_id: agent.pane.id.clone(),
+                    })]
+                }
                 None => vec![],
             },
             Screen::Ended => {
@@ -477,7 +485,14 @@ mod tests {
         let snap = snapshot(vec![agent("current", "$1", "%7", Status::Working)]);
         let c = ctx(&snap, Some("$1"), 0);
         let mut state = PanelState::new(PanelView::Current);
-        assert_eq!(state.on(Input::Confirm, &c), [Effect::Jump("%7".into())]);
+        assert_eq!(
+            state.on(Input::Confirm, &c),
+            [Effect::Jump(gw_core::tmux::TmuxPaneTarget {
+                tmux_session_id: "$1".into(),
+                window_id: "@%7".into(),
+                pane_id: "%7".into(),
+            })]
+        );
     }
 
     #[test]

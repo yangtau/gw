@@ -635,9 +635,13 @@ pub fn resume(input: &str, prompt: Option<&str>, fork: bool) -> Result<()> {
         .clone()
         .map_or_else(std::env::current_dir, Ok)?;
     let argv = expand_argv(&command.argv, &addr.session, prompt, &cwd);
-    let pane = tmux::new_window(&addr.provider, &cwd, &argv)
+    let target = tmux::new_window(&addr.provider, &cwd, &argv)
         .context("open tmux window (resume requires a running tmux server)")?;
-    println!("{action} {addr} in tmux pane {pane} ({})", argv.join(" "));
+    println!(
+        "{action} {addr} in tmux pane {} ({})",
+        target.pane_id,
+        argv.join(" ")
+    );
     Ok(())
 }
 

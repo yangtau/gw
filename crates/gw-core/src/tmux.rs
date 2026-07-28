@@ -48,6 +48,24 @@ pub struct TmuxSessionPane {
     pub tmux_session_id: String,
 }
 
+/// An unambiguous tmux destination. All three ids are required because a pane
+/// can appear in more than one grouped tmux session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxPaneTarget {
+    pub tmux_session_id: String,
+    pub window_id: String,
+    pub pane_id: String,
+}
+
+impl TmuxPaneTarget {
+    fn qualified(&self) -> String {
+        format!(
+            "{}:{}.{}",
+            self.tmux_session_id, self.window_id, self.pane_id
+        )
+    }
+}
+
 impl TopologyRow {
     pub fn pane(&self) -> Pane {
         Pane {
@@ -120,13 +138,13 @@ pub fn pane_for_tty(tty: &str) -> Result<Option<String>> {
         .map(|pane| pane.id))
 }
 
-/// Open a new window running `argv` in `cwd`; returns the new pane id.
-pub fn new_window(name: &str, cwd: &Path, argv: &[String]) -> Result<String> {
+/// Open a new window running `argv` in `cwd`; returns its exact tmux target.
+pub fn new_window(name: &str, cwd: &Path, argv: &[String]) -> Result<TmuxPaneTarget> {
     let mut args = vec![
         "new-window".into(),
         "-P".into(),
         "-F".into(),
-        "#{pane_id}".into(),
+        "#{session_id}\t#{window_id}\t#{pane_id}".into(),
         "-n".into(),
         name.into(),
         "-c".into(),
@@ -134,15 +152,35 @@ pub fn new_window(name: &str, cwd: &Path, argv: &[String]) -> Result<String> {
         "--".into(),
     ];
     args.extend(argv.iter().map(|arg| OsString::from(arg.as_str())));
-    Ok(parse_pane_id(&run_tmux(&args)?))
+    parse_tmux_pane_target(&run_tmux(&args)?)
 }
 
-/// Focus the window/pane containing `pane_id`.
-pub fn focus(pane_id: &str) -> Result<()> {
-    run_tmux(&["switch-client".into(), "-t".into(), pane_id.into()])?;
-    run_tmux(&["select-window".into(), "-t".into(), pane_id.into()])?;
-    run_tmux(&["select-pane".into(), "-t".into(), pane_id.into()])?;
+/// Focus a target using the tmux client that already contains gw.
+pub fn focus(target: &TmuxPaneTarget) -> Result<()> {
+    let target = target.qualified();
+    run_tmux(&["switch-client".into(), "-t".into(), target.clone().into()])?;
+    run_tmux(&["select-window".into(), "-t".into(), target.clone().into()])?;
+    run_tmux(&["select-pane".into(), "-t".into(), target.into()])?;
     Ok(())
+}
+
+/// Attach the current terminal to an exact target. This must be called only
+/// after the panel has restored the terminal from raw/alternate-screen mode.
+pub fn attach(target: &TmuxPaneTarget) -> Result<()> {
+    let binary = binary();
+    let status = Command::new(binary)
+        .args(attach_command(target))
+        .status()
+        .with_context(|| format!("failed to run {binary} attach-session"))?;
+    if !status.success() {
+        bail!("{binary} attach-session failed with {status}");
+    }
+    Ok(())
+}
+
+/// Whether gw itself is running under a tmux client (pane or popup).
+pub fn inside_tmux() -> bool {
+    std::env::var_os("TMUX").is_some_and(|value| !value.is_empty())
 }
 
 pub fn current_tmux_session_name() -> Result<String> {
@@ -283,8 +321,27 @@ fn normalize_tty(tty: &str) -> &str {
     tty.strip_prefix("/dev/").unwrap_or(tty)
 }
 
-fn parse_pane_id(stdout: &str) -> String {
-    stdout.trim().to_owned()
+fn parse_tmux_pane_target(stdout: &str) -> Result<TmuxPaneTarget> {
+    let mut fields = stdout.trim().splitn(3, '\t');
+    let tmux_session_id = fields.next().context("missing tmux session id")?;
+    let window_id = fields.next().context("missing tmux window id")?;
+    let pane_id = fields.next().context("missing tmux pane id")?;
+    if tmux_session_id.is_empty() || window_id.is_empty() || pane_id.is_empty() {
+        bail!("tmux returned an incomplete pane target");
+    }
+    Ok(TmuxPaneTarget {
+        tmux_session_id: tmux_session_id.into(),
+        window_id: window_id.into(),
+        pane_id: pane_id.into(),
+    })
+}
+
+fn attach_command(target: &TmuxPaneTarget) -> Vec<OsString> {
+    vec![
+        "attach-session".into(),
+        "-t".into(),
+        target.qualified().into(),
+    ]
 }
 
 #[cfg(test)]
@@ -376,8 +433,29 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_tty_prefix_and_pane_id_output() {
+    fn normalizes_tty_prefix() {
         assert_eq!(normalize_tty("/dev/ttys012"), normalize_tty("ttys012"));
-        assert_eq!(parse_pane_id("%7\n"), "%7");
+    }
+
+    #[test]
+    fn parses_and_qualifies_an_exact_tmux_pane_target() {
+        let target = parse_tmux_pane_target("$3\t@9\t%7\n").unwrap();
+
+        assert_eq!(
+            target,
+            TmuxPaneTarget {
+                tmux_session_id: "$3".into(),
+                window_id: "@9".into(),
+                pane_id: "%7".into(),
+            }
+        );
+        assert_eq!(target.qualified(), "$3:@9.%7");
+        assert_eq!(
+            attach_command(&target)
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["attach-session", "-t", "$3:@9.%7"]
+        );
     }
 }

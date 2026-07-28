@@ -17,7 +17,11 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 
 ## UX
 
-- **Panel** runs identically in a persistent pane (dashboard) or `tmux display-popup` (primary posture); after a jump the popup instance exits. Scope: current session only.
+- **Panel** runs in a persistent pane (dashboard), `tmux display-popup`
+  (primary posture), or a terminal outside tmux while a tmux server is
+  available. Inside tmux, a jump switches the existing client; outside tmux,
+  the Panel first restores the terminal and then attaches it to the Agent's
+  exact tmux session/window/pane. A popup exits after a jump.
 - **List columns**: provider, status (+ duration in that status), window/pane, detail (one-line status context: current activity · task, awaited approval, turn summary, failure reason), cwd (abbreviated), git branch. Running subagents render as dim indented sub-lines under their agent's row (`↳ type · model · task · age`).
 - **Activity**: compact event timeline of the selected agent (recent turns, tool activity, attention, subagents from its Event Log; display only — the panel never touches the agent's window).
 - **Keys (v1)**: `j/k` or arrows move, `Enter` jumps, `n` launches (pick provider → new window in the panel's cwd → jump), `r` toggles the resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` toggles current/global views, `a` selects the next Attention agent, `?` opens the keyboard-shortcuts page, and `Esc`/`Ctrl-C` quit.
