@@ -57,7 +57,7 @@ no rotation or size cap.
 | Field         | When                          | Value                                                    |
 | ------------- | ----------------------------- | -------------------------------------------------------- |
 | `ts`          | always                        | RFC3339 UTC, stamped by gw at ingest                     |
-| `provider`    | always                        | provider id (`claude` / `codex` / `amp` / `agy`)         |
+| `provider`    | always                        | provider id (`claude` / `codex` / `amp` / `pi`)          |
 | `events`      | normalize succeeded           | the normalized events verbatim (their `ts` is `null`); `[]` if empty |
 | `error`       | normalize failed              | the error string; replaces `events`                      |
 | `payload`     | raw payload is valid JSON     | the payload embedded as JSON (so it is `jq`-able)        |
@@ -70,8 +70,8 @@ stored result.
 Examples:
 
 ```json
-{"ts":"2026-07-14T09:00:00Z","provider":"agy","events":[{"v":1,"session":"c1","kind":"turn_start"}],"payload":{"conversationId":"c1","invocationNum":1}}
-{"ts":"2026-07-14T09:00:01Z","provider":"agy","events":[],"payload":{"conversationId":"c1","unknownField":9}}
+{"ts":"2026-07-14T09:00:00Z","provider":"pi","events":[{"v":1,"session":"c1","kind":"turn_start"}],"payload":{"session_id":"c1","event":"turn_start"}}
+{"ts":"2026-07-14T09:00:01Z","provider":"pi","events":[],"payload":{"session_id":"c1","event":"unknown"}}
 {"ts":"2026-07-14T09:00:02Z","provider":"claude","error":"gw-provider-claude normalize failed: ...","payload_raw":"not json"}
 ```
 
@@ -82,7 +82,7 @@ Reading:
 tail -f ~/.local/state/gw/sessions/*.debug.jsonl ~/.local/state/gw/sessions/_unmapped.debug.jsonl
 
 # Only one provider
-grep '"provider":"agy"' ~/.local/state/gw/sessions/*.debug.jsonl
+grep '"provider":"pi"' ~/.local/state/gw/sessions/*.debug.jsonl
 
 # Payloads that mapped to nothing — the interesting ones
 jq 'select(.events == [])' ~/.local/state/gw/sessions/_unmapped.debug.jsonl

@@ -33,6 +33,7 @@ fn manifest() -> Manifest {
         color: Some("#74AA9C".into()),
         process: ProcessMatch {
             exclude_args: Vec::new(),
+            exclude_arg_sequences: Vec::new(),
             argv0: vec!["codex".into()],
         },
         launch: Command {

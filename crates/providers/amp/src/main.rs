@@ -17,6 +17,7 @@ fn manifest() -> Manifest {
         process: ProcessMatch {
             argv0: vec!["amp".into()],
             exclude_args: vec!["--no-tui".into(), "-x".into(), "--execute".into()],
+            exclude_arg_sequences: Vec::new(),
         },
         launch: Command {
             argv: vec!["amp".into()],

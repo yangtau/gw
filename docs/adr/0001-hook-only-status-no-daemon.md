@@ -6,7 +6,7 @@ Accepted (2026-07-13); amended (2026-07-25, 2026-07-28)
 
 ## Context
 
-The panel must show what each agent is doing (working / waiting for approval / idle). Candidate detection mechanisms: scraping pane content with per-provider regexes, process-level heuristics, or the hook facilities every supported provider ships (claude `settings.json` hooks, codex `hooks.json`, traex `.trae/hooks.json`). Independently, hook events occur while the TUI is closed, so the state has to live somewhere: a resident daemon, or plain files.
+The panel must show what each agent is doing (working / waiting for approval / idle). Candidate detection mechanisms: scraping pane content with per-provider regexes, process-level heuristics, or provider lifecycle facilities (Claude `settings.json` hooks, Codex `hooks.json`, Pi extensions). Independently, hook events occur while the TUI is closed, so the state has to live somewhere: a resident daemon, or plain files.
 
 ## Decision
 

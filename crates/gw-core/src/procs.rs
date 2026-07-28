@@ -45,24 +45,39 @@ pub fn snapshot() -> Result<Vec<Proc>> {
 /// any of the first few argv tokens has a basename matching `process.argv0`
 /// (first few, not just argv[0], to survive wrappers like `node /path/claude`).
 pub fn matches_provider(proc_: &Proc, manifest: &Manifest) -> bool {
-    !proc_.argv.iter().any(|arg| {
+    let has_excluded_arg = proc_.argv.iter().any(|arg| {
         manifest
             .process
             .exclude_args
             .iter()
             .any(|excluded| excluded == arg)
-    }) && proc_.argv.iter().take(4).any(|arg| {
-        Path::new(arg)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                manifest
-                    .process
-                    .argv0
-                    .iter()
-                    .any(|candidate| candidate == name)
-            })
-    })
+    });
+    let has_excluded_sequence = manifest
+        .process
+        .exclude_arg_sequences
+        .iter()
+        .filter(|sequence| !sequence.is_empty())
+        .any(|sequence| {
+            proc_
+                .argv
+                .windows(sequence.len())
+                .any(|window| window == sequence)
+        });
+
+    !has_excluded_arg
+        && !has_excluded_sequence
+        && proc_.argv.iter().take(4).any(|arg| {
+            Path::new(arg)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    manifest
+                        .process
+                        .argv0
+                        .iter()
+                        .any(|candidate| candidate == name)
+                })
+        })
 }
 
 /// Walk the ppid chain from `from_pid` inclusive (the hook's parent — which
@@ -204,6 +219,7 @@ mod tests {
             process: ProcessMatch {
                 argv0: names.iter().map(|name| (*name).into()).collect(),
                 exclude_args: Vec::new(),
+                exclude_arg_sequences: Vec::new(),
             },
             launch: ProviderCommand {
                 argv: vec![id.into()],
@@ -277,6 +293,25 @@ mod tests {
         assert!(matches_provider(
             &proc_(2, 1, &["amp", "--execute-now"]),
             &amp
+        ));
+    }
+
+    #[test]
+    fn excludes_only_matching_argument_sequences() {
+        let mut pi = manifest("pi", &["pi"]);
+        pi.process.exclude_arg_sequences = vec![vec!["--mode".into(), "rpc".into()]];
+
+        assert!(!matches_provider(
+            &proc_(2, 1, &["pi", "--mode", "rpc"]),
+            &pi
+        ));
+        assert!(matches_provider(
+            &proc_(2, 1, &["pi", "--mode", "text"]),
+            &pi
+        ));
+        assert!(matches_provider(
+            &proc_(2, 1, &["pi", "rpc", "--mode"]),
+            &pi
         ));
     }
 

@@ -44,6 +44,10 @@ pub struct ProcessMatch {
     pub argv0: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_args: Vec<String>,
+    /// Contiguous argv sequences that disqualify a process. This handles
+    /// option/value pairs without excluding an option's other valid values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_arg_sequences: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

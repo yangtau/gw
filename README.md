@@ -1,7 +1,7 @@
 # gw
 
 A tmux-native status panel for coding agents. Summon one popup and see every
-Claude / Codex / Amp / (your own) agent running across your tmux sessions — what
+Claude / Codex / Amp / Pi / (your own) agent running across your tmux sessions — what
 each is doing, which one is blocked on you — then press `enter` to jump straight
 to it.
 
@@ -78,6 +78,7 @@ cargo install --path crates/gw
 cargo install --path crates/providers/claude
 cargo install --path crates/providers/codex
 cargo install --path crates/providers/amp
+cargo install --path crates/providers/pi
 ```
 
 Then install the provider hooks (backed up, surgical, reversible):
@@ -93,7 +94,7 @@ Optionally install the `gw` skill through the open skills ecosystem:
 npx skills add yangtau/gw --skill gw -g
 ```
 
-To target all three official providers non-interactively:
+To install it into several common agent skill directories non-interactively:
 
 ```sh
 npx skills add yangtau/gw --skill gw -g -y \
@@ -119,6 +120,7 @@ attaches it directly to that Agent's tmux session and pane.
 |---|---|
 | `enter` | jump to the selected agent (popup closes) |
 | `n` | launch a new agent in a new window |
+| `f` | fork the selected agent into a new window (source pane untouched) |
 | `r` | recently ended sessions — `enter` resumes |
 | `tab` | toggle between the current and global tmux-session views |
 | `a` | select the next agent needing attention |
@@ -156,14 +158,19 @@ it never touches an existing pane.
   (Status, Subagents, Activity), event store, tmux/ps wrappers.
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust
   plugin authors.
-- `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp` —
-  official provider plugins.
+- `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp`,
+  `crates/providers/pi` — official provider plugins.
 - `skills/gw` — optional agent guidance, installed separately with `npx skills`.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
 tracking that TUI's foreground thread; runner/execute modes and background
 threads are intentionally excluded. `gw setup` installs the observer plugin at
 `~/.config/amp/plugins/gw.ts`; restart Amp or run `plugins: reload` in an
+already-running TUI after setup.
+
+Pi support likewise targets interactive mode and follows the TUI's current
+Session across `/new`, `/resume`, `/fork`, and `/clone`. `gw setup` installs the
+observer extension at `~/.pi/agent/extensions/gw.ts`; restart Pi or run `/reload` in an
 already-running TUI after setup.
 
 Design notes live in [docs/design.md](docs/design.md); vocabulary in

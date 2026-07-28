@@ -8,17 +8,17 @@ Glossary for `gw`, a tmux-native coding agent status panel (Rust TUI).
 A tmux pane in any tmux session running a known coding agent CLI. Identity is **discovery-based**: the tool finds Agents by scanning panes, regardless of how they were started; tmux panes are the single source of truth and the tool keeps no registry of its own.
 
 ### Provider
-A kind of coding agent CLI (e.g. claude, codex, amp, agy). Defines how to recognize, launch, and interpret the state of Agents of that kind.
+A kind of coding agent CLI (e.g. claude, codex, amp, pi). Defines how to recognize, launch, and interpret the state of Agents of that kind.
 
 ### Provider Plugin
-The implementation vehicle of a Provider: a standalone executable, discovered by naming convention, implementing a uniform plugin protocol. A plugin is a pure translator with no side effects: `manifest` describes the provider statically (process match rules, launch command, hook/config or managed-file install spec); `normalize` turns a provider hook payload (stdin) into unified events (stdout). Hook commands installed into provider configs invoke the core (`<tool> hook <provider>`), which delegates payload translation to the plugin and owns all event-log writing itself. Managed integration files, such as Amp's system TypeScript observer plugin, are likewise written only by the core from manifest data. Every provider — including official ones shipped with the tool — goes through the same protocol; there is no built-in fast path. Private providers (e.g. agy) live in separate repositories.
+The implementation vehicle of a Provider: a standalone executable, discovered by naming convention, implementing a uniform plugin protocol. A plugin is a pure translator with no side effects: `manifest` describes the provider statically (process match rules, launch command, hook/config or managed-file install spec); `normalize` turns a provider hook payload (stdin) into unified events (stdout). Hook commands installed into provider configs invoke the core (`<tool> hook <provider>`), which delegates payload translation to the plugin and owns all event-log writing itself. Managed integration files, such as the Amp and Pi TypeScript observer plugins, are likewise written only by the core from manifest data. Every provider — including official ones shipped with the tool — goes through the same protocol; there is no built-in fast path. Private providers live in separate repositories.
 
 ### Session
 A provider-native conversation session, identified by the provider's native session id, recorded in the Event Log. The bare word "session" always means this; a tmux session is never abbreviated — it is written "tmux session" in full everywhere (UI copy, code identifiers: `tmux_session_*`). A Session whose process is alive and bound to a pane is an Agent; a Session is *ended* only when no pane in any tmux session hosts it — ended Sessions may still be resumable (`--resume <id>`). The panel's main list shows Agents; a secondary view lists recently ended, resumable Sessions, unscoped by tmux session (an ended Session belongs to no tmux session).
 
 Some providers can host multiple Sessions in one process. gw remains pane-centric:
-one pane is one Agent row. For Amp, that row follows only the interactive TUI's
-foreground thread; background threads do not take ownership of the row.
+one pane is one Agent row. For Amp and Pi, that row follows only the interactive
+TUI's foreground Session; Amp background threads do not take ownership of the row.
 
 ### Status
 An Agent's runtime state. Dynamic states come from provider hook events: hooks installed into the provider's config report key moments (turn start, stop, approval requests), and the panel derives Status from that event stream. A discovered process with no attributable events defaults to **Idle**. The tool never scrapes pane content or injects keys. Statuses are **eventually consistent**: attention is cleared by subsequent activity events, never by explicit acknowledgement.

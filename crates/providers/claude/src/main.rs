@@ -41,6 +41,7 @@ fn manifest() -> Manifest {
         color: Some("#D97757".into()),
         process: ProcessMatch {
             exclude_args: Vec::new(),
+            exclude_arg_sequences: Vec::new(),
             argv0: vec!["claude".into()],
         },
         launch: Command {

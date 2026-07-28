@@ -14,18 +14,17 @@ Sources and confidence:
 - **amp**: official manual and `@ampcode/plugin` type reference
   (ampcode.com/manual and ampcode.com/manual/plugin-api). Verified against the
   2026-07-18 public API.
-- **agy**: binary inspection (proto type names, format strings). Directionally
-  reliable; exact payload JSON marked UNVERIFIED until confirmed from the internal
-  repo.
+- **pi**: official extension and session-format documentation, verified against
+  Pi 0.82.1.
 
 ## Shared model
 
-Claude, codex, and agy run external hook commands that receive one JSON object on
+Claude and Codex run external hook commands that receive one JSON object on
 **stdin** and communicate back via exit code (and optionally stdout JSON for
-decision-making hooks). Amp instead delivers typed events to a TypeScript plugin;
-gw installs a small system observer plugin that forwards compact JSON to
-`gw hook amp` on stdin. Every integration is observer-only: gw never returns a
-permission decision or modifies provider behavior.
+decision-making hooks). Amp and Pi instead deliver typed events to TypeScript
+integrations; gw installs small observer files that forward compact JSON to
+`gw hook <provider>` on stdin. Every integration is observer-only: gw never
+returns a permission decision or modifies provider behavior.
 
 ---
 
@@ -150,56 +149,47 @@ emits nothing — its gw status decays through Working → Stale.
 
 ---
 
-## agy
+## pi
 
-Everything below is from binary inspection (`hooks_go_proto` / `exa.hooks_pb`
-types and format strings); treat as UNVERIFIED until checked against the internal
-repo.
+### Configuration and invocation
 
-### Configuration
+- Pi extensions live at `~/.pi/agent/extensions/*.ts`.
+- `gw setup` installs `~/.pi/agent/extensions/gw.ts` as a hash-protected
+  managed file. An already-running Pi TUI must run `/reload` or restart.
+- The extension invokes `gw hook pi` with compact JSON on stdin, serializes
+  invocations to preserve event order, and swallows failures so gw cannot affect
+  a Pi run.
+- Only interactive TUI mode is observed. Print, JSON, RPC, export, and model-list
+  invocations are outside the integration boundary.
+- Pi can replace the current Session inside one process via `/new`, `/resume`,
+  `/fork`, and `/clone`. The extension reads the current UUID and transcript path
+  from `ctx.sessionManager` on every event, so the pane's Agent row follows the
+  foreground Session.
 
-- Hooks attach through the plugin system, not global config: a plugin ships
-  `plugins/<name>/hooks.json` ("Lifecycle hooks run by the plugin").
-- `hooks.json` keys are PascalCase event names mapping to command arrays,
-  e.g. `"PreInvocation": [...]`.
-- The hook command's working directory is set to the directory containing
-  `hooks.json`.
-- External hooks receive JSON (format string: `failed to construct JSON
-session-start hook`), presumably the proto message in JSON encoding
-  (camelCase field names per the proto json tags — UNVERIFIED which casing the
-  external boundary uses).
+### Public lifecycle surface
 
-### Hook points (6)
+| Signal | Fields relevant to gw | Notes |
+|---|---|---|
+| `session_start` | `reason`, `ctx.sessionManager`, `ctx.model` | `startup`, `reload`, `new`, `resume`, or `fork`; distinguishes a new Session from a foreground change |
+| `before_agent_start` | `prompt` | top-level user run began |
+| `agent_start` | — | low-level run began; repeats for automatic retry and compaction recovery |
+| `tool_execution_start` | `toolName`, `args` | tool activity; parallel calls can interleave |
+| `turn_end` | finalized assistant `message` | cached for final text and `stopReason` |
+| `agent_end` | messages from the low-level run | may precede automatic retry or compaction |
+| `agent_settled` | current idle state | authoritative terminal signal after retry, compaction, and queued follow-ups finish |
+| `session_shutdown` | `reason` | `quit`, `reload`, `new`, `resume`, or `fork` |
 
-Proto: `exa.hooks_pb.HookArgs` = `HookArgsCommon` + oneof:
+The bridge emits `session_start` for new Sessions and `session_focus` for reloads
+or resumed Sessions. It maps `before_agent_start` to `turn_start`,
+`tool_execution_start` to `heartbeat`, and waits for `agent_settled` before
+emitting `turn_end` or `turn_error`. The final assistant message's
+`stopReason == "error"` is a failure; aborts and other terminal reasons settle as
+Done. `session_shutdown` maps to `session_end` except during `/reload`, where the
+same Session remains active.
 
-| Event            | Args type                | Known fields        |
-| ---------------- | ------------------------ | ------------------- |
-| `SessionStart`   | `SessionStartHookArgs`   |                     |
-| `PreInvocation`  | `PreInvocationHookArgs`  | explicit turn begin |
-| `PostInvocation` | `PostInvocationHookArgs` | explicit turn end   |
-| `PreToolUse`     | `PreToolHookArgs`        | `tool_call_json`    |
-| `PostToolUse`    | `PostToolHookArgs`       | `tool_call_json`    |
-| `Stop`           | `StopHookArgs`           |                     |
-
-`HookArgsCommon` carries `trajectory_id` and `conversation_id` — the session
-identity is the trajectory/conversation, not a claude-style `session_id`.
-
-Hook _results_ are richer than claude/codex: `PreToolHookResult` can influence
-permissions (`permissions.PermissionHookResult`), and results may inject steps
-(`HookInjectedStep`: user/system/error message or tool call). gw ignores all of
-this — observe only.
-
-Notably absent: no `PermissionRequest`, no `Notification`, no failure events.
-Until the hook surface grows, an agy agent can never show Attention in gw —
-only Working / Idle / Stale.
-
-### `PreInvocation`/`PostInvocation` vs `UserPromptSubmit`/`Stop`
-
-agy models turn boundaries explicitly, which is cleaner than claude/codex where
-turn start is inferred from prompt submission. The distinction between
-`PostInvocation` and `Stop` (per-invocation end vs session-level stop?) must be
-confirmed in the internal repo before writing the `gw-provider-agy` mapping.
+Pi has no built-in permission popup and no provider-wide event for arbitrary
+extension UI dialogs. The observer therefore never emits Attention. A Pi Agent
+can show Error because finalized assistant messages report provider failures.
 
 ---
 
@@ -321,29 +311,29 @@ live-captured payloads (gw stores it as the attention summary today). Treat
 
 ## Cross-provider comparison
 
-| Capability          | claude                                              | codex                                            | amp                                      | agy                                 |
-| ------------------- | --------------------------------------------------- | ------------------------------------------------ | ---------------------------------------- | ----------------------------------- |
-| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus)         | `SessionStart`                      |
-| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                        | —                                   |
-| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                            | `PreInvocation`                     |
-| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end` (`done` / `cancelled`)       | `PostInvocation`, `Stop`            |
-| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)                    | —                                   |
-| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | thread state `awaiting-approval`         | —                                   |
-| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                            | `PreToolUse` / `PostToolUse`        |
-| Typed notifications | `Notification` (notification_type matcher)          | —                                                | —                                        | —                                   |
-| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                        | —                                   |
-| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                        | —                                   |
-| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                              | `trajectory_id` / `conversation_id` |
-| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + config.toml feature flag | `~/.config/amp/plugins/gw.ts`            | plugin `hooks.json`                 |
+| Capability          | claude                                              | codex                                            | amp                                      | pi                                      |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------ | ---------------------------------------- | --------------------------------------- |
+| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus)         | `session_start` (reason)                |
+| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                        | `session_shutdown`                      |
+| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                            | `before_agent_start`                    |
+| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end` (`done` / `cancelled`)       | `agent_settled` after final `turn_end`   |
+| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)                    | assistant `stopReason == "error"`       |
+| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | thread state `awaiting-approval`         | —                                       |
+| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                            | `tool_execution_start`                  |
+| Typed notifications | `Notification` (notification_type matcher)          | —                                                | —                                        | —                                       |
+| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                        | — (extension-specific, no shared event) |
+| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                        | `session_before_compact`/`session_compact` |
+| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                              | `SessionManager.getSessionId()`         |
+| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + config.toml feature flag | `~/.config/amp/plugins/gw.ts`            | `~/.pi/agent/extensions/gw.ts`          |
 
 Consequences for gw:
 
-- Claude and Amp report turn failures. A codex/agy agent killed by a rate limit
+- Claude, Amp, and Pi report turn failures. A Codex agent killed by a rate limit
   emits nothing and decays through Working → Stale.
-- Claude and codex expose dedicated approval events. Amp exposes approval as a
-  thread state when a user permission policy is active; agy cannot show
-  Attention/approval until its hook surface grows.
-- claude fires both `PermissionRequest` and `Notification(permission_prompt)`
+- Claude and Codex expose dedicated approval events. Amp exposes approval as a
+  thread state when a user permission policy is active; Pi has no generic
+  provider-wide approval or question event.
+- Claude fires both `PermissionRequest` and `Notification(permission_prompt)`
   for the same dialog; a provider plugin must subscribe exactly one.
 
 ## Current gw subscriptions
@@ -379,6 +369,15 @@ What the shipped plugins subscribe and how they map to unified events
 | codex    | `SubagentStart`                                      | `subagent_start` {agent_id, agent_type, model} |
 | codex    | `SubagentStop`                                       | `subagent_end` {agent_id}                     |
 | codex    | `Stop`                                               | `turn_end` {last_assistant_message}           |
+| pi       | new `session_start`                                  | `session_start` {model}                       |
+| pi       | resumed/reloaded `session_start`                     | `session_focus`                               |
+| pi       | `before_agent_start`                                 | `turn_start` {prompt}                         |
+| pi       | `agent_start`                                        | — (clear prior retry outcome)                 |
+| pi       | `tool_execution_start`                               | `heartbeat` {tool summary}                    |
+| pi       | `turn_end` / `agent_end`                             | — (cache final assistant outcome)             |
+| pi       | `agent_settled` after successful final message       | `turn_end` {last assistant text}              |
+| pi       | `agent_settled` after final assistant error          | `turn_error` {error message}                  |
+| pi       | `session_shutdown` except reload                     | `session_end`                                 |
 
 Deliberately unsubscribed on claude: `Notification` types `permission_prompt`
 (duplicate of `PermissionRequest`), `idle_prompt` (Done already expresses it),
@@ -389,3 +388,9 @@ Deliberately unsubscribed on Amp: `tool.call`, because it is a decision hook
 with no observer-only return; all background-thread events, because one pane is
 one foreground Agent row; and runner/execute modes, because they have no
 interactive foreground thread to jump to.
+
+Pi consumes `turn_end` and `agent_end` only to cache the latest assistant
+outcome; neither is terminal because automatic retries, compaction, or queued
+follow-ups may still run. It deliberately ignores per-message streaming and
+tool progress updates (too noisy), plus arbitrary extension dialog internals,
+which have no provider-wide observer event.

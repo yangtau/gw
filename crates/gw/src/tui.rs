@@ -230,6 +230,10 @@ impl App {
                     Loop::Continue => {}
                     outcome => return Ok(outcome),
                 },
+                Effect::ForkAgent(index) => match self.fork_agent(index)? {
+                    Loop::Continue => {}
+                    outcome => return Ok(outcome),
+                },
             }
         }
         Ok(Loop::Continue)
@@ -302,6 +306,42 @@ impl App {
         let cwd = session.cwd.clone().unwrap_or(std::env::current_dir()?);
         let argv = gw_core::launch::expand_argv(&resume.argv, &session.session_id, None, &cwd);
         let target = tmux::new_window(&session.provider, &cwd, &argv)?;
+        self.jump(target)
+    }
+
+    /// Fork the live agent at `index` into a new tmux window using the
+    /// provider's `fork` capability template. The source pane is never
+    /// touched: the fork lives entirely in the new window, and the branch
+    /// itself is created inside the provider CLI. Missing capability or a
+    /// missing session id are non-fatal — log and stay put.
+    fn fork_agent(&mut self, index: usize) -> Result<Loop> {
+        let Some(agent) = self.snapshot.agents.get(index) else {
+            return Ok(Loop::Continue);
+        };
+        let Some(session_id) = agent.session_id.clone() else {
+            gw_core::tui_log::error(&format!(
+                "fork: agent has no session id yet ({} / {}) — wait for a hook",
+                agent.provider, agent.pane.id
+            ));
+            return Ok(Loop::Continue);
+        };
+        let Some(plugin) = self.plugin(&agent.provider) else {
+            gw_core::tui_log::error(&format!(
+                "fork: no plugin loaded for provider {}",
+                agent.provider
+            ));
+            return Ok(Loop::Continue);
+        };
+        let Some(fork) = plugin.manifest.fork.clone() else {
+            gw_core::tui_log::error(&format!(
+                "fork: provider {} does not support fork",
+                agent.provider
+            ));
+            return Ok(Loop::Continue);
+        };
+        let cwd = agent.cwd.clone();
+        let argv = gw_core::launch::expand_argv(&fork.argv, &session_id, None, &cwd);
+        let target = tmux::new_window(&agent.provider, &cwd, &argv)?;
         self.jump(target)
     }
 
@@ -599,6 +639,7 @@ impl App {
             Line::default(),
             section("actions"),
             shortcut("n", "open the new-agent picker"),
+            shortcut("f", "fork the selected agent into a new window"),
             shortcut("?", "open or close this page"),
             shortcut("esc", "go back, cancel the picker, or quit the panel"),
             shortcut("ctrl-c", "quit from anywhere"),
@@ -643,6 +684,7 @@ fn map_key(key: KeyEvent) -> Option<Input> {
         KeyCode::Char('a') => Some(Input::NextAttention),
         KeyCode::Char('n') => Some(Input::OpenPicker),
         KeyCode::Char('r') => Some(Input::ToggleEnded),
+        KeyCode::Char('f') => Some(Input::ForkSelected),
         KeyCode::Char('?') => Some(Input::Help),
         KeyCode::Enter => Some(Input::Confirm),
         KeyCode::Esc => Some(Input::Cancel),

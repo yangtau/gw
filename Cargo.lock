@@ -767,16 +767,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gw-provider-agy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gw-plugin-protocol",
- "gw-provider-sdk",
- "serde_json",
-]
-
-[[package]]
 name = "gw-provider-amp"
 version = "0.1.0"
 dependencies = [
@@ -806,20 +796,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "gw-provider-sdk"
+name = "gw-provider-pi"
 version = "0.1.0"
 dependencies = [
  "gw-plugin-protocol",
+ "gw-provider-sdk",
  "serde_json",
 ]
 
 [[package]]
-name = "gw-provider-traex"
+name = "gw-provider-sdk"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "gw-plugin-protocol",
- "gw-provider-sdk",
  "serde_json",
 ]
 

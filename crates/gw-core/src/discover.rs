@@ -281,6 +281,7 @@ mod tests {
             process: ProcessMatch {
                 argv0: vec![id.into()],
                 exclude_args: Vec::new(),
+                exclude_arg_sequences: Vec::new(),
             },
             launch: ProviderCommand {
                 argv: vec![id.into()],
@@ -345,14 +346,14 @@ mod tests {
             proc_(200, 1, "zsh"),
             proc_(201, 200, "codex"),
             proc_(300, 1, "zsh"),
-            proc_(301, 300, "agy"),
+            proc_(301, 300, "pi"),
             proc_(400, 1, "zsh"),
             proc_(401, 400, "other"),
         ];
         let manifests = [
             manifest("claude", true),
             manifest("codex", true),
-            manifest("agy", true),
+            manifest("pi", true),
             manifest("other", true),
         ];
         let sessions = [
@@ -378,8 +379,8 @@ mod tests {
                 EventKind::TurnStart { summary: None },
             ),
             session(
-                "agy",
-                "agy-live",
+                "pi",
+                "pi-live",
                 Some("%3"),
                 Some(301),
                 Some("/shared"),
@@ -422,7 +423,7 @@ mod tests {
                 .iter()
                 .map(|agent| agent.provider.as_str())
                 .collect::<Vec<_>>(),
-            ["claude", "codex", "agy", "other",]
+            ["claude", "codex", "pi", "other",]
         );
         assert!(matches!(
             snapshot.agents[0].status,
@@ -440,7 +441,7 @@ mod tests {
         assert_eq!(snapshot.agents[1].tmux_session_name, "other");
         assert_eq!(snapshot.agents[1].tmux_session_id, "$2");
         assert_eq!(snapshot.agents[2].status, Status::Done);
-        assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("agy-live"));
+        assert_eq!(snapshot.agents[2].session_id.as_deref(), Some("pi-live"));
         assert_eq!(snapshot.agents[3].status, Status::Idle);
         assert!(snapshot.agents[3].activity.is_empty());
         assert_eq!(

@@ -805,6 +805,7 @@ mod tests {
             process: ProcessMatch {
                 argv0: vec!["fixture".to_owned()],
                 exclude_args: Vec::new(),
+                exclude_arg_sequences: Vec::new(),
             },
             launch: Command {
                 argv: vec!["fixture".to_owned()],

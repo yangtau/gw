@@ -31,6 +31,7 @@ pub enum Input {
     OpenPicker,
     ToggleEnded,
     Confirm,
+    ForkSelected,
     Help,
     Cancel,
     Quit,
@@ -45,6 +46,10 @@ pub enum Effect {
     LaunchProvider(usize),
     /// Resume the ended session at this index of the snapshot.
     ResumeEnded(usize),
+    /// Fork the live agent at this index of the snapshot into a new window.
+    /// The source pane is never touched — the fork lands in a fresh window
+    /// running the provider's `fork` capability template.
+    ForkAgent(usize),
     /// Leave the panel.
     Quit,
 }
@@ -138,6 +143,7 @@ impl PanelState {
                 self.selected = 0;
             }
             Input::Confirm => return self.activate(ctx),
+            Input::ForkSelected => return self.fork_selected(ctx),
             Input::Help | Input::Quit => {}
         }
         vec![]
@@ -185,6 +191,20 @@ impl PanelState {
                     vec![]
                 }
             }
+        }
+    }
+
+    /// Fork intent for `f`. Meaningful only on Agents with a live selection;
+    /// on Ended (or an empty list) it's a no-op. Whether the target's
+    /// provider actually supports fork is the adapter's business — keeping
+    /// that in the pure state machine would drag manifests in here.
+    fn fork_selected(&self, ctx: &Ctx) -> Vec<Effect> {
+        match self.screen {
+            Screen::Agents => match self.selected_agent_index(ctx) {
+                Some(index) => vec![Effect::ForkAgent(index)],
+                None => vec![],
+            },
+            Screen::Ended => vec![],
         }
     }
 
@@ -564,6 +584,43 @@ mod tests {
         state.on(Input::ToggleEnded, &c);
         assert_eq!(state.screen(), Screen::Ended);
         assert_eq!(state.on(Input::Confirm, &c), [Effect::ResumeEnded(0)]);
+    }
+
+    #[test]
+    fn fork_selected_on_agents_emits_fork_effect_with_snapshot_index() {
+        let agents = vec![
+            agent("current", "$1", "%1", Status::Working),
+            agent("current", "$1", "%2", Status::Done),
+        ];
+        let snap = snapshot(agents);
+        let c = ctx(&snap, Some("$1"), 0);
+        let mut state = PanelState::new(PanelView::Current);
+        state.on(Input::Down, &c);
+        assert_eq!(state.on(Input::ForkSelected, &c), [Effect::ForkAgent(1)]);
+    }
+
+    #[test]
+    fn fork_selected_on_empty_agent_list_is_a_noop() {
+        let snap = snapshot(vec![]);
+        let c = ctx(&snap, Some("$1"), 0);
+        let mut state = PanelState::new(PanelView::Current);
+        assert!(state.on(Input::ForkSelected, &c).is_empty());
+    }
+
+    #[test]
+    fn fork_selected_on_ended_screen_is_a_noop() {
+        let mut snap = snapshot(vec![]);
+        snap.ended.push(gw_core::discover::EndedSession {
+            provider: "claude".into(),
+            session_id: "old".into(),
+            cwd: None,
+            ended_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        });
+        let c = ctx(&snap, None, 0);
+        let mut state = PanelState::new(PanelView::Current);
+        state.on(Input::ToggleEnded, &c);
+        assert_eq!(state.screen(), Screen::Ended);
+        assert!(state.on(Input::ForkSelected, &c).is_empty());
     }
 
     #[test]

@@ -6,7 +6,7 @@ Accepted (2026-07-13)
 
 ## Context
 
-Supported providers include private, internal CLIs (traex) whose hook payload schemas must not appear in this public codebase. Candidate plugin shapes: declarative TOML manifests (field-mapping DSL grows into a bad programming language once payload differences get non-trivial), compiled-in provider traits for official providers plus an external path for private ones (two implementation paths, protocol becomes second-class), or external executables for everyone.
+Supported providers can include private, internal CLIs whose hook payload schemas must not appear in this public codebase. Candidate plugin shapes: declarative TOML manifests (field-mapping DSL grows into a bad programming language once payload differences get non-trivial), compiled-in provider traits for official providers plus an external path for private ones (two implementation paths, protocol becomes second-class), or external executables for everyone.
 
 A second axis: who writes the event log. If hook configs invoke the plugin directly, log paths, locking, and the JSONL format all become plugin-protocol surface that every plugin must reimplement and the core can never change.
 
@@ -23,7 +23,7 @@ Hook commands installed into provider configs—or observer bridges installed as
 
 ## Consequences
 
-- The internal traex repository implements two small pure subcommands in any language, against a protocol whose living documentation and test suite are the official plugins (dogfooding guarantees the protocol suffices).
+- A private provider repository can implement two small pure subcommands in any language, against a protocol whose living documentation and test suite are the official plugins (dogfooding guarantees the protocol suffices).
 - Storage format and paths stay private to the core and can evolve freely.
 - Each hook event costs one extra process spawn (hooks already spawn a process; milliseconds, negligible).
 - The protocol needs versioning from day one (`manifest` carries a protocol version).
