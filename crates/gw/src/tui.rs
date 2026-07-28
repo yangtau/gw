@@ -65,29 +65,21 @@ pub fn run(initial_view: PanelView) -> Result<()> {
 
 #[derive(Clone, Copy)]
 struct FrameLayout {
-    banner: Rect,
     main: Rect,
     activity: Rect,
     footer: Rect,
 }
 
-fn frame_layout(area: Rect, screen: Screen, show_banner: bool) -> FrameLayout {
-    let banner_height = u16::from(show_banner);
+fn frame_layout(area: Rect, screen: Screen) -> FrameLayout {
     let activity_height =
         if matches!(screen, Screen::Ended) || area.height < MIN_ACTIVITY_TERM_HEIGHT {
             Constraint::Length(0)
         } else {
             Constraint::Percentage(40)
         };
-    let [banner, main, activity, footer] = Layout::vertical([
-        Constraint::Length(banner_height),
-        Constraint::Min(5),
-        activity_height,
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    let [main, activity, footer] =
+        Layout::vertical([Constraint::Min(5), activity_height, Constraint::Length(1)]).areas(area);
     FrameLayout {
-        banner,
         main,
         activity,
         footer,
@@ -157,7 +149,6 @@ impl App {
             snapshot: Snapshot {
                 agents: vec![],
                 ended: vec![],
-                setup_required: vec![],
             },
             state: PanelState::new(initial_view),
             panel_pane_id,
@@ -331,19 +322,7 @@ impl App {
             self.render_shortcuts(frame);
             return;
         }
-        let show_banner = !self.snapshot.setup_required.is_empty();
-        let layout = frame_layout(frame.area(), self.state.screen(), show_banner);
-
-        if show_banner {
-            let msg = format!(
-                " setup required for {} — run `gw setup`",
-                self.snapshot.setup_required.join(", ")
-            );
-            frame.render_widget(
-                Paragraph::new(msg).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
-                layout.banner,
-            );
-        }
+        let layout = frame_layout(frame.area(), self.state.screen());
 
         match self.state.screen() {
             Screen::Agents => self.render_agents(frame, layout.main),

@@ -86,6 +86,20 @@ Then install the provider hooks (backed up, surgical, reversible):
 gw setup
 ```
 
+`gw setup` installs runtime integrations only; it never installs agent skills.
+Optionally install the `gw` skill through the open skills ecosystem:
+
+```sh
+npx skills add yangtau/gw --skill gw -g
+```
+
+To target all three official providers non-interactively:
+
+```sh
+npx skills add yangtau/gw --skill gw -g -y \
+  -a amp -a claude-code -a codex
+```
+
 Bind a key in `~/.tmux.conf` for the switcher posture — summon, pick, jump, gone:
 
 ```tmux
@@ -120,10 +134,9 @@ view (`current` or `global`) is configurable there too.
 ## Session referencing (CLI)
 
 Beyond the panel, `gw` answers questions about sessions from the command line —
-built for agents referencing other agents (a shared skill is installed by
-`gw setup`), equally usable by humans. Sessions are addressed as
-`provider:session-id`; a bare id or unique prefix (≥ 4 chars) works too.
-Ambiguous or unknown addresses are errors.
+built for agents referencing other agents and equally usable by humans.
+Sessions are addressed as `provider:session-id`; a bare id or unique prefix
+(≥ 4 chars) works too. Ambiguous or unknown addresses are errors.
 
 | command | what it does |
 |---|---|
@@ -145,6 +158,7 @@ it never touches an existing pane.
   plugin authors.
 - `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp` —
   official provider plugins.
+- `skills/gw` — optional agent guidance, installed separately with `npx skills`.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
 tracking that TUI's foreground thread; runner/execute modes and background

@@ -364,7 +364,6 @@ mod tests {
         Snapshot {
             agents,
             ended: vec![],
-            setup_required: vec![],
         }
     }
 

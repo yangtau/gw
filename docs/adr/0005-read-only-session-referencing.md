@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-07-27)
+Accepted (2026-07-27); amended (2026-07-28)
 
 ## Context
 
@@ -30,7 +30,8 @@ already owns:
   result word (`done | attention | error | stale | idle | ended | timeout`).
   Attention is a distinct result so a waiter fetches a human instead of
   treating it as completion. The default timeout (45s) sits below every
-  provider's tool-timeout floor; skills teach a bounded wait-recheck loop.
+  provider's tool-timeout floor; a future agent skill should teach a bounded
+  wait-recheck loop.
 - `gw resume <addr> [prompt] [--fork]` relaunches via manifest capability
   templates (`resume` / `resume_prompt` / `fork`) in a **new** tmux window —
   the same mechanism as panel resume. Plain resume refuses a live target;
@@ -45,10 +46,10 @@ identity via the existing ppid ancestor chain). These are status-neutral —
 the same class as subagent/focus events — so the ADR 0001 invariant stands:
 dynamic Status remains a pure replay of provider events only.
 
-An agent-facing `gw` skill (shared `SKILL.md` body) is installed per provider
-through the existing `managed_files` ownership mechanism at each provider's
-global skill path; `comment_suffix` lets the ownership header be a closed
-HTML comment inside Markdown.
+The agent-facing skill is distributed independently at `skills/gw/SKILL.md`
+using the open skills ecosystem. Users opt in with
+`npx skills add yangtau/gw --skill gw -g`; `gw setup` remains limited to
+runtime hooks and managed integration files declared by provider manifests.
 
 ## Consequences
 
@@ -62,6 +63,5 @@ HTML comment inside Markdown.
 - In-place steering, an approval channel, transcript normalization, and
   `forked_from` lineage are explicitly deferred (v2); the address model and
   result vocabulary are designed to survive those additions.
-- The skill's ownership header occupies line 1 of `SKILL.md`, so YAML
-  frontmatter starts at line 2; agents whose frontmatter parser requires
-  line 1 fall back to directory-name + first-paragraph metadata.
+- Agent skill installation is explicit and provider-independent; changing the
+  skill never changes runtime setup health.

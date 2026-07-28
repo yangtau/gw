@@ -52,7 +52,8 @@ target is alive and Working. Result enum:
 distinct result so the waiter fetches a human instead of treating it as
 completion. Default timeout 45s (below every provider's tool-timeout floor:
 amp 60s / claude 120s / codex 600s); `--timeout 0` = single query; self-wait
-rejected. Skills teach a bounded wait-recheck loop, never an unbounded block.
+rejected. The optional skill teaches a bounded wait-recheck loop, never an
+unbounded block.
 
 Wake sources: 1s poll of the target's event log (covers fs change, the Stale
 timer, which is time-derived with no event) plus a periodic process-liveness
@@ -93,21 +94,21 @@ transcript; codex refuses with "already has an active writer") and points at
 - `ManagedFile`: optional `comment_suffix` so the ownership header can be a
   closed HTML comment (`<!-- … -->`) inside Markdown skill files.
 
-## Skill injection
+## Skill distribution
 
-`gw setup` installs a gw-owned standalone skill file per provider via the
-existing `managed_files` ownership mechanism (never a user-shared file like
-`~/.codex/AGENTS.md`, never the deprecated amp toolbox):
+The shared skill lives at `skills/gw/SKILL.md`, the standard repository layout
+discovered by `npx skills`. It is installed explicitly and independently of
+runtime setup:
 
-- claude: `~/.claude/skills/gw/SKILL.md`
-- codex: `~/.agents/skills/gw/SKILL.md` (official USER scope)
-- amp: `~/.config/amp/skills/gw/SKILL.md`
+```sh
+npx skills add yangtau/gw --skill gw -g
+```
 
-One shared skill body teaching: address other sessions via `gw ls`, read via
-`gw show`, flow-control via bounded `gw wait` loops, continue work via
-`gw resume`. Known risk: the ownership header occupies line 1, so YAML
-frontmatter starts at line 2; agents fall back to directory-name +
-first-paragraph metadata if their frontmatter parser requires line 1.
+Users can target Amp, Claude Code, and Codex with
+`-a amp -a claude-code -a codex`. `gw setup` never installs this skill; it
+only installs runtime hooks and Amp's observer plugin. The skill teaches:
+address other sessions via `gw ls`, read via `gw show`, flow-control via
+bounded `gw wait` loops, and continue work via `gw resume`.
 
 ## Deferred to v2
 
@@ -121,5 +122,5 @@ normalization, `forked_from` lineage, richer waiting-on panel edges.
 3. `03-show` — timeline + transcript locator chain
 4. `04-wait` — wait loop, wait events, status-neutral derivation, activity
 5. `05-resume` — capability gating + launch
-6. `06-skill-injection` — shared SKILL.md + per-provider managed files
+6. `06-skill-injection` — shared SKILL.md distributed through `npx skills`
 7. `07-docs` — protocol.md, CONTEXT.md wording, ADR 0005

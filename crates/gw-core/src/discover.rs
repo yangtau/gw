@@ -12,7 +12,6 @@ use crate::plugins::Plugin;
 use crate::procs::{self, Proc};
 use crate::protocol::Manifest;
 use crate::session::{self, ActivityEntry, Status, Subagent};
-use crate::setup;
 use crate::store::{SessionRecord, Store};
 use crate::tmux::{self, Pane, TmuxSessionPane, TopologyRow};
 
@@ -50,8 +49,6 @@ pub struct EndedSession {
 pub struct Snapshot {
     pub agents: Vec<Agent>,
     pub ended: Vec<EndedSession>,
-    /// Live providers whose declared hook/config integration is not installed.
-    pub setup_required: Vec<String>,
 }
 
 /// One full global scan: list panes, find provider processes under each pane,
@@ -72,7 +69,7 @@ pub fn snapshot(
         .iter()
         .map(|plugin| plugin.manifest.clone())
         .collect();
-    let mut snapshot = join(
+    Ok(join(
         &panes,
         &procs,
         &sessions,
@@ -80,9 +77,7 @@ pub fn snapshot(
         now,
         stale_after,
         procs::cwd_of,
-    );
-    snapshot.setup_required = providers_requiring_setup(&snapshot.agents, &manifests);
-    Ok(snapshot)
+    ))
 }
 
 #[derive(Debug)]
@@ -185,23 +180,7 @@ fn join(
     agents.sort_by_key(|agent| (agent.status, agent.pane.window_index));
     ended.sort_by_key(|session| std::cmp::Reverse(session.ended_at));
 
-    Snapshot {
-        agents,
-        ended,
-        setup_required: Vec::new(),
-    }
-}
-
-fn providers_requiring_setup(agents: &[Agent], manifests: &[Manifest]) -> Vec<String> {
-    manifests
-        .iter()
-        .filter(|manifest| {
-            (!manifest.hooks.is_empty() || !manifest.managed_files.is_empty())
-                && agents.iter().any(|agent| agent.provider == manifest.id)
-                && !setup::integration_is_installed(manifest)
-        })
-        .map(|manifest| manifest.id.clone())
-        .collect()
+    Snapshot { agents, ended }
 }
 
 fn latest_match(
@@ -219,11 +198,9 @@ fn latest_match(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use crate::protocol::{
         AttentionKind, Command as ProviderCommand, Event, EventKind, FileFormat, HookFile,
-        ManagedFile, Manifest, ProcessMatch,
+        Manifest, ProcessMatch,
     };
     use crate::session::ActivityKind;
     use crate::store::SessionMeta;
@@ -323,17 +300,6 @@ mod tests {
                 .collect(),
             managed_files: Vec::new(),
         }
-    }
-
-    fn managed_manifest(id: &str, path: &Path) -> Manifest {
-        let mut manifest = manifest(id, false);
-        manifest.managed_files.push(ManagedFile {
-            path: path.to_string_lossy().into_owned(),
-            content: "bridge\n".into(),
-            comment_prefix: "//".into(),
-            comment_suffix: String::new(),
-        });
-        manifest
     }
 
     fn session(
@@ -484,40 +450,6 @@ mod tests {
                 .map(|session| session.session_id.as_str())
                 .collect::<Vec<_>>(),
             ["claude-ended", "codex-old",]
-        );
-        assert!(snapshot.setup_required.is_empty());
-    }
-
-    #[test]
-    fn idle_agent_setup_warning_follows_integration_file_not_event_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("gw.ts");
-        let manifests = [managed_manifest("amp", &path)];
-        let panes = [tmux_pane("main", "$1", pane("%1", 100, 1, "/work"))];
-        let procs = [proc_(100, 1, "zsh"), proc_(101, 100, "amp")];
-        let snapshot = join(
-            &panes,
-            &procs,
-            &[],
-            &manifests,
-            at(20),
-            Duration::minutes(30),
-            |_| None,
-        );
-
-        assert_eq!(snapshot.agents[0].status, Status::Idle);
-        assert_eq!(
-            providers_requiring_setup(&snapshot.agents, &manifests),
-            ["amp"]
-        );
-
-        setup::install(&manifests).unwrap();
-        assert!(providers_requiring_setup(&snapshot.agents, &manifests).is_empty());
-
-        std::fs::write(path, "modified").unwrap();
-        assert_eq!(
-            providers_requiring_setup(&snapshot.agents, &manifests),
-            ["amp"]
         );
     }
 

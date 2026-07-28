@@ -42,20 +42,12 @@ fn manifest() -> Manifest {
         }),
         transcript_glob: None,
         hooks: Vec::new(),
-        managed_files: vec![
-            ManagedFile {
-                path: "~/.config/amp/plugins/gw.ts".into(),
-                content: include_str!("bridge.ts").into(),
-                comment_prefix: "//".into(),
-                comment_suffix: String::new(),
-            },
-            ManagedFile {
-                path: "~/.config/amp/skills/gw/SKILL.md".into(),
-                content: include_str!("../../gw-skill.md").into(),
-                comment_prefix: "<!--".into(),
-                comment_suffix: " -->".into(),
-            },
-        ],
+        managed_files: vec![ManagedFile {
+            path: "~/.config/amp/plugins/gw.ts".into(),
+            content: include_str!("bridge.ts").into(),
+            comment_prefix: "//".into(),
+            comment_suffix: String::new(),
+        }],
     }
 }
 
@@ -112,6 +104,7 @@ mod tests {
             m.resume.as_ref().unwrap().argv,
             ["amp", "threads", "continue", "{session_id}"]
         );
+        assert_eq!(m.managed_files.len(), 1);
         assert_eq!(m.managed_files[0].path, "~/.config/amp/plugins/gw.ts");
         assert_eq!(m.process.exclude_args, ["--no-tui", "-x", "--execute"]);
         assert!(m.hooks.is_empty());

@@ -1,6 +1,6 @@
 use gw_plugin_protocol::{
-    AttentionKind, Command, EventKind, FileFormat, HookFile, ManagedFile, Manifest, Patch,
-    PatchMode, ProcessMatch, PROTOCOL_VERSION,
+    AttentionKind, Command, EventKind, FileFormat, HookFile, Manifest, Patch, PatchMode,
+    ProcessMatch, PROTOCOL_VERSION,
 };
 use gw_provider_sdk::{command_hook_patch, excerpt, one_liner, text};
 use serde_json::{json, Map, Value};
@@ -70,12 +70,7 @@ fn manifest() -> Manifest {
                 }],
             },
         ],
-        managed_files: vec![ManagedFile {
-            path: "~/.agents/skills/gw/SKILL.md".into(),
-            content: include_str!("../../gw-skill.md").into(),
-            comment_prefix: "<!--".into(),
-            comment_suffix: " -->".into(),
-        }],
+        managed_files: Vec::new(),
     }
 }
 
@@ -289,7 +284,9 @@ mod tests {
 
     #[test]
     fn manifest_round_trips() {
-        let value = serde_json::to_value(manifest()).unwrap();
+        let manifest = manifest();
+        assert!(manifest.managed_files.is_empty());
+        let value = serde_json::to_value(manifest).unwrap();
         let decoded: gw_plugin_protocol::Manifest = serde_json::from_value(value.clone()).unwrap();
 
         assert_eq!(serde_json::to_value(decoded).unwrap(), value);
