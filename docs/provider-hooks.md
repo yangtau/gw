@@ -188,8 +188,122 @@ Done. `session_shutdown` maps to `session_end` except during `/reload`, where th
 same Session remains active.
 
 Pi has no built-in permission popup and no provider-wide event for arbitrary
-extension UI dialogs. The observer therefore never emits Attention. A Pi Agent
-can show Error because finalized assistant messages report provider failures.
+extension UI prompts. gw therefore relies on a **cooperative bus convention**
+described below; without at least one extension participating, a Pi Agent can
+show every gw status except Attention. It can still show Error because
+finalized assistant messages report provider failures.
+
+### Cooperative UI-prompt bus (`ui:prompt:opened` / `ui:prompt:closed`)
+
+Pi ships an in-process pub/sub bus at `pi.events` for cross-extension
+communication. gw subscribes to two well-known versioned topics on that bus.
+Any observer (status-line extension, telemetry, IDE integration) can consume
+the same events; gw is one consumer among many.
+
+#### Payload
+
+```ts
+// ui:prompt:opened
+{
+  version: 1,               // required; other values ignored
+  source: string,           // required; extension name, part of identity
+  id: string,               // required; unique within `source`
+  summary: string,          // required; human-readable, <= 240 chars
+  kind?: "approval" | "question",  // optional; missing == "approval"
+  tool?: string,
+  toolCallId?: string,
+}
+
+// ui:prompt:closed
+{
+  version: 1,
+  source: string,           // required; must match the opened event
+  id: string,               // required; must match the opened event
+  outcome?: string,         // optional; suggested: "accepted" | "rejected"
+                            // | "cancelled" | "timed_out" | "error"
+}
+```
+
+#### Producer contract
+
+- **Only emit for prompts that suspend an active agent turn.** gw maps close
+  to a Heartbeat, which flips status Attention → Working. Emitting from an
+  idle context makes the Agent bounce Idle → Attention → Working → Stale for
+  zero agent work.
+- **Identity is `(source, id)`.** Two extensions may safely reuse the same
+  `id` string. Within one `source`, an `id` MUST NOT be reused for a
+  logically different prompt.
+- **Emit the close in `finally`.** Missing a close leaves Attention pinned
+  until the next real Pi event (agent activity, session end, ...).
+- **A duplicate open with the same key is treated as an idempotent update.**
+  Use it to refresh `summary` while the prompt is still open.
+- **Overlapping prompts are supported.** gw tracks all open prompts by
+  `(source, id)` and only clears Attention when the last one closes; closing
+  a superseded prompt while others remain open triggers a fresh Attention
+  event for the most recently opened remaining prompt.
+
+#### gw processing rules
+
+- The bridge validates every payload before forwarding. Producers cannot rely
+  on unknown fields being passed through: gw currently persists `summary`,
+  `kind`, `source`, `tool`, and `tool_call_id` after bounding each string.
+- `kind` other than `"approval"` or `"question"` is dropped so a typo or a
+  future protocol addition cannot silently become an Approval.
+- `ui:prompt:closed` for an unknown `(source, id)` is silently dropped;
+  producers therefore cannot cause phantom Heartbeats by miscounting closes.
+- Bridge listeners are unsubscribed on `session_shutdown` (including
+  `reason: "reload"`) so a rebound extension instance never races the old
+  listeners.
+
+#### Interaction with gw status
+
+- `ui:prompt:opened` publishes an Attention event carrying `summary` and the
+  resolved `kind`. Any Pi lifecycle event that follows normally supersedes
+  the Attention through gw's "last event wins" rule (`derive_status` in
+  `crates/gw-core/src/session.rs`).
+- `ui:prompt:closed` publishes a Heartbeat carrying `outcome`. That
+  Heartbeat immediately shifts Attention → Working. A subsequent terminal
+  event (Turn end, error, ...) replaces it in the usual way; if none
+  arrives, the Agent decays through Working → Stale (never to Idle).
+- `/reload` emits Pi's status-neutral `session_focus`, so an Attention
+  outstanding at reload time persists in the panel until the next real
+  event. gw does not synthesize a clear on reload because doing so would
+  drop legitimate Attention for a prompt that survived the reload.
+
+#### Example producer
+
+Drop into any permission or question extension:
+
+```typescript
+pi.on("tool_call", async (event, ctx) => {
+  if (event.toolName !== "bash" || !ctx.hasUI) return;
+  const cmd = String(event.input.command ?? "");
+  if (!/\brm\s+-rf\b|\bsudo\b/i.test(cmd)) return;
+
+  const source = "my-permission-gate";
+  const id = event.toolCallId;
+  pi.events.emit("ui:prompt:opened", {
+    version: 1,
+    source,
+    id,
+    kind: "approval",
+    tool: event.toolName,
+    toolCallId: event.toolCallId,
+    summary: `Allow ${event.toolName}: ${cmd}`,
+  });
+  try {
+    const ok = await ctx.ui.confirm("Dangerous command", cmd);
+    pi.events.emit("ui:prompt:closed", {
+      version: 1, source, id,
+      outcome: ok ? "accepted" : "rejected",
+    });
+    return ok ? undefined : { block: true, reason: "Blocked by user" };
+  } catch (err) {
+    pi.events.emit("ui:prompt:closed", { version: 1, source, id, outcome: "error" });
+    throw err;
+  }
+});
+```
 
 ---
 
@@ -318,7 +432,7 @@ live-captured payloads (gw stores it as the attention summary today). Treat
 | Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                            | `before_agent_start`                    |
 | Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end` (`done` / `cancelled`)       | `agent_settled` after final `turn_end`   |
 | Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)                    | assistant `stopReason == "error"`       |
-| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | thread state `awaiting-approval`         | —                                       |
+| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | thread state `awaiting-approval`         | cooperative `ui:prompt:opened` bus      |
 | Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                            | `tool_execution_start`                  |
 | Typed notifications | `Notification` (notification_type matcher)          | —                                                | —                                        | —                                       |
 | Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                        | — (extension-specific, no shared event) |
@@ -331,8 +445,11 @@ Consequences for gw:
 - Claude, Amp, and Pi report turn failures. A Codex agent killed by a rate limit
   emits nothing and decays through Working → Stale.
 - Claude and Codex expose dedicated approval events. Amp exposes approval as a
-  thread state when a user permission policy is active; Pi has no generic
-  provider-wide approval or question event.
+  thread state when a user permission policy is active. Pi has no built-in
+  provider-wide approval event; the shipped bridge subscribes to a cooperative
+  `ui:prompt:opened` / `ui:prompt:closed` convention on `pi.events` so any
+  user extension that shows a blocking prompt can produce Attention. Without
+  at least one cooperating extension a Pi Agent cannot enter Attention.
 - Claude fires both `PermissionRequest` and `Notification(permission_prompt)`
   for the same dialog; a provider plugin must subscribe exactly one.
 
@@ -378,6 +495,8 @@ What the shipped plugins subscribe and how they map to unified events
 | pi       | `agent_settled` after successful final message       | `turn_end` {last assistant text}              |
 | pi       | `agent_settled` after final assistant error          | `turn_error` {error message}                  |
 | pi       | `session_shutdown` except reload                     | `session_end`                                 |
+| pi       | `pi.events` → `ui:prompt:opened`                     | `attention` (kind approval/question) {summary} |
+| pi       | `pi.events` → `ui:prompt:closed`                     | `heartbeat` {outcome} (Attention → Working; may decay to Stale if no later event) |
 
 Deliberately unsubscribed on claude: `Notification` types `permission_prompt`
 (duplicate of `PermissionRequest`), `idle_prompt` (Done already expresses it),
@@ -392,5 +511,7 @@ interactive foreground thread to jump to.
 Pi consumes `turn_end` and `agent_end` only to cache the latest assistant
 outcome; neither is terminal because automatic retries, compaction, or queued
 follow-ups may still run. It deliberately ignores per-message streaming and
-tool progress updates (too noisy), plus arbitrary extension dialog internals,
-which have no provider-wide observer event.
+tool progress updates (too noisy). Attention arrives through the cooperative
+`ui:prompt:opened` / `ui:prompt:closed` bus convention rather than a
+provider-wide event: the bridge validates each payload and rejects unknown
+`kind` values, but never chooses which prompts count as Attention.

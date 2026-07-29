@@ -1,5 +1,5 @@
 use gw_plugin_protocol::{
-    Command, EventKind, ManagedFile, Manifest, ProcessMatch, PROTOCOL_VERSION,
+    AttentionKind, Command, EventKind, ManagedFile, Manifest, ProcessMatch, PROTOCOL_VERSION,
 };
 use gw_provider_sdk::{excerpt, text};
 use serde_json::{Map, Value};
@@ -76,6 +76,25 @@ fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
         }),
         "tool_start" => Some(EventKind::Heartbeat {
             activity: excerpt(payload, "activity"),
+        }),
+        "attention" => Some(EventKind::Attention {
+            attention: match payload.get("kind").and_then(Value::as_str) {
+                None | Some("approval") => AttentionKind::Approval,
+                Some("question") => AttentionKind::Question,
+                // Reject unknown kinds so a typo or a future kind cannot
+                // silently masquerade as an Approval. The bridge also
+                // rejects them before wire encoding; this is the second
+                // line of defense for hand-written payloads.
+                Some(_) => return None,
+            },
+            summary: excerpt(payload, "summary"),
+        }),
+        // Attention is a single-shot event on gw's side (any later event
+        // clears it), so `ui:prompt:closed` from the bus is normalized as a
+        // Heartbeat carrying the outcome. Real Pi lifecycle events usually
+        // arrive right after and take over the status naturally.
+        "attention_end" => Some(EventKind::Heartbeat {
+            activity: excerpt(payload, "outcome"),
         }),
         "agent_settled" => match payload.get("status").and_then(Value::as_str) {
             Some("done") => Some(EventKind::TurnEnd {
@@ -224,6 +243,67 @@ mod tests {
                 summary: None,
             }
         );
+    }
+
+    #[test]
+    fn maps_dialog_bus_events_to_attention_lifecycle() {
+        assert_eq!(
+            kind(
+                r#"{"session_id":"s1","event":"attention","kind":"approval","summary":"Allow rm -rf /tmp/foo"}"#
+            ),
+            EventKind::Attention {
+                attention: AttentionKind::Approval,
+                summary: Some("Allow rm -rf /tmp/foo".into()),
+            }
+        );
+        assert_eq!(
+            kind(
+                r#"{"session_id":"s1","event":"attention","kind":"question","summary":"Which db?"}"#
+            ),
+            EventKind::Attention {
+                attention: AttentionKind::Question,
+                summary: Some("Which db?".into()),
+            }
+        );
+        // Missing kind falls back to approval, the safer default for a
+        // blocking prompt.
+        assert_eq!(
+            kind(r#"{"session_id":"s1","event":"attention","summary":"Allow?"}"#),
+            EventKind::Attention {
+                attention: AttentionKind::Approval,
+                summary: Some("Allow?".into()),
+            }
+        );
+        // Unknown kinds are rejected instead of silently becoming approval.
+        assert!(events(
+            r#"{"session_id":"s1","event":"attention","kind":"notice","summary":"heads up"}"#
+        )
+        .is_empty());
+        assert!(events(
+            r#"{"session_id":"s1","event":"attention","kind":"aproval","summary":"typo"}"#
+        )
+        .is_empty());
+        assert_eq!(
+            kind(r#"{"session_id":"s1","event":"attention_end","outcome":"confirmed"}"#),
+            EventKind::Heartbeat {
+                activity: Some("confirmed".into()),
+            }
+        );
+        assert_eq!(
+            kind(r#"{"session_id":"s1","event":"attention_end"}"#),
+            EventKind::Heartbeat { activity: None }
+        );
+    }
+
+    #[test]
+    fn bridge_subscribes_to_the_ui_prompt_bus_convention() {
+        let bridge = manifest().managed_files[0].content.clone();
+        assert!(bridge.contains("pi.events.on(\"ui:prompt:opened\""));
+        assert!(bridge.contains("pi.events.on(\"ui:prompt:closed\""));
+        // Protocol is versioned so the bridge can evolve without breaking
+        // early adopters, and listeners are removed on session_shutdown.
+        assert!(bridge.contains("PROMPT_PROTOCOL_VERSION = 1"));
+        assert!(bridge.contains("unsubscribes"));
     }
 
     #[test]
