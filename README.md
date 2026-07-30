@@ -78,6 +78,7 @@ cargo install --path crates/gw
 cargo install --path crates/providers/claude
 cargo install --path crates/providers/codex
 cargo install --path crates/providers/amp
+cargo install --path crates/providers/opencode
 cargo install --path crates/providers/pi
 ```
 
@@ -159,7 +160,7 @@ it never touches an existing pane.
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust
   plugin authors.
 - `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp`,
-  `crates/providers/pi` — official provider plugins.
+  `crates/providers/opencode`, `crates/providers/pi` — official provider plugins.
 - `skills/gw` — optional agent guidance, installed separately with `npx skills`.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
@@ -172,6 +173,10 @@ Pi support likewise targets interactive mode and follows the TUI's current
 Session across `/new`, `/resume`, `/fork`, and `/clone`. `gw setup` installs the
 observer extension at `~/.pi/agent/extensions/gw.ts`; restart Pi or run `/reload` in an
 already-running TUI after setup.
+
+OpenCode support targets its interactive TUI; commands such as `run`, `serve`,
+`web`, and `attach` are excluded from pane discovery. `gw setup` installs the
+observer plugin at `~/.config/opencode/plugins/gw.ts`; restart OpenCode after setup.
 
 Design notes live in [docs/design.md](docs/design.md); vocabulary in
 [CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).

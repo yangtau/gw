@@ -51,7 +51,7 @@ Prints a single JSON object describing the provider statically:
   - `mode: "ensure"` — the pointer addresses an array; setup guarantees it contains `value` (deep equality, no duplicates) and removes exactly that element on uninstall.
   - `mode: "set"` — setup writes `value` at the pointer (e.g. a feature flag) and leaves it in place on uninstall.
   - Setup edits are surgical: unrelated keys, ordering, and (for TOML) formatting are preserved; the target file is backed up before the first write; the operation is idempotent.
-- `managed_files` — optional whole files installed by `gw setup`. Each entry has `path`, `content`, a single-line `comment_prefix`, and an optional single-line `comment_suffix`. The core prepends an ownership header containing a hash of `content`; with a suffix the header can be a closed comment in any syntax (e.g. `<!-- … -->` in Markdown). Setup upgrades or removes the file only when that header belongs to the same provider and the body still matches its hash. Unrelated or user-modified files are rejected, never overwritten. Amp and Pi use this for their TypeScript observer integrations.
+- `managed_files` — optional whole files installed by `gw setup`. Each entry has `path`, `content`, a single-line `comment_prefix`, and an optional single-line `comment_suffix`. The core prepends an ownership header containing a hash of `content`; with a suffix the header can be a closed comment in any syntax (e.g. `<!-- … -->` in Markdown). Setup upgrades or removes the file only when that header belongs to the same provider and the body still matches its hash. Unrelated or user-modified files are rejected, never overwritten. Amp, OpenCode, and Pi use this for their TypeScript observer integrations.
 
 ### `normalize`
 

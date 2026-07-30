@@ -1,6 +1,6 @@
 # Provider hook reference
 
-Authoritative reference for the hook systems of the four providers gw integrates
+Authoritative reference for the hook systems of the five providers gw integrates
 with: what events exist, how hooks are configured, how the hook process is invoked,
 and the exact payload each event delivers. This is the factual basis for the unified
 event vocabulary in `protocol.md`.
@@ -16,12 +16,14 @@ Sources and confidence:
   2026-07-18 public API.
 - **pi**: official extension and session-format documentation, verified against
   Pi 0.82.1.
+- **opencode**: official plugin documentation and generated SDK event types,
+  verified against OpenCode 1.18.9.
 
 ## Shared model
 
 Claude and Codex run external hook commands that receive one JSON object on
 **stdin** and communicate back via exit code (and optionally stdout JSON for
-decision-making hooks). Amp and Pi instead deliver typed events to TypeScript
+decision-making hooks). Amp, OpenCode, and Pi instead deliver typed events to TypeScript
 integrations; gw installs small observer files that forward compact JSON to
 `gw hook <provider>` on stdin. Every integration is observer-only: gw never
 returns a permission decision or modifies provider behavior.
@@ -423,26 +425,69 @@ live-captured payloads (gw stores it as the attention summary today). Treat
 
 ---
 
+## opencode
+
+### Configuration and invocation
+
+- Global plugins live at `~/.config/opencode/plugins/*.{js,ts}` and load at
+  process startup. `gw setup` installs `gw.ts` as a hash-protected managed file.
+- The bridge invokes `gw hook opencode` with compact JSON on stdin. Calls are
+  serialized to preserve event order; failures are swallowed so gw cannot fail
+  an OpenCode turn.
+- The integration targets the interactive TUI. Process discovery excludes
+  non-interactive and remote-client commands including `run`, `serve`, `web`,
+  `acp`, and `attach`.
+- Child sessions are OpenCode subagents. Their events are ignored so the pane's
+  row remains bound to the root interactive Session.
+
+### Public lifecycle surface
+
+| Signal | Fields relevant to gw | Notes |
+|---|---|---|
+| `chat.message` | `sessionID`, model, user text parts | user turn admitted; plugin hook |
+| `session.status` | `sessionID`, `status.type` | `busy`, `retry`, or `idle` |
+| `message.part.updated` | text part and `sessionID` | caches latest assistant text for terminal summary |
+| `permission.asked` | `sessionID`, permission, patterns | blocking approval request |
+| `permission.replied` | `sessionID`, reply | clears Attention through a heartbeat |
+| `tool.execute.before` | `sessionID`, tool, args | tool activity; plugin hook |
+| `session.error` | `sessionID`, typed error | provider-reported turn failure |
+| `session.created` / `session.deleted` | Session info | native Session lifecycle |
+
+`session.status: idle` is the authoritative successful turn boundary. The bridge
+caches full text parts but forwards only a bounded one-line summary. A `retry`
+status is activity rather than failure because OpenCode is still working.
+
+### Bridge payload
+
+```json
+{"session_id":"ses_…","event":"turn_start","summary":"fix the tests"}
+{"session_id":"ses_…","event":"tool_start","activity":"bash: cargo test"}
+{"session_id":"ses_…","event":"permission_asked","summary":"bash: cargo test"}
+{"session_id":"ses_…","event":"turn_end","summary":"all green"}
+```
+
+---
+
 ## Cross-provider comparison
 
-| Capability          | claude                                              | codex                                            | amp                                      | pi                                      |
-| ------------------- | --------------------------------------------------- | ------------------------------------------------ | ---------------------------------------- | --------------------------------------- |
-| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus)         | `session_start` (reason)                |
-| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                        | `session_shutdown`                      |
-| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                            | `before_agent_start`                    |
-| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end` (`done` / `cancelled`)       | `agent_settled` after final `turn_end`   |
-| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)                    | assistant `stopReason == "error"`       |
-| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | thread state `awaiting-approval`         | cooperative `ui:prompt:opened` bus      |
-| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                            | `tool_execution_start`                  |
-| Typed notifications | `Notification` (notification_type matcher)          | —                                                | —                                        | —                                       |
-| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                        | — (extension-specific, no shared event) |
-| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                        | `session_before_compact`/`session_compact` |
-| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                              | `SessionManager.getSessionId()`         |
-| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + config.toml feature flag | `~/.config/amp/plugins/gw.ts`            | `~/.pi/agent/extensions/gw.ts`          |
+| Capability          | claude                                              | codex                                            | amp                              | opencode                         | pi                                      |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------ | -------------------------------- | -------------------------------- | --------------------------------------- |
+| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus) | `session.created` / status busy  | `session_start` (reason)                |
+| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                | `session.deleted`                | `session_shutdown`                      |
+| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                    | `chat.message`                   | `before_agent_start`                    |
+| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end`                      | `session.status` idle            | `agent_settled` after final `turn_end`   |
+| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)            | `session.error`                  | assistant `stopReason == "error"`       |
+| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | state `awaiting-approval`        | `permission.asked`               | cooperative `ui:prompt:opened` bus      |
+| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                    | `tool.execute.before`            | `tool_execution_start`                  |
+| Typed notifications | `Notification`                                      | —                                                | —                                | —                                | —                                       |
+| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                | child sessions (ignored)         | — (extension-specific, no shared event) |
+| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                | `session.compacted`              | `session_before_compact`/`session_compact` |
+| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                      | Session `id`                     | `SessionManager.getSessionId()`         |
+| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + feature flag             | Amp global plugin                | OpenCode global plugin           | Pi global extension                     |
 
 Consequences for gw:
 
-- Claude, Amp, and Pi report turn failures. A Codex agent killed by a rate limit
+- Claude, Amp, OpenCode, and Pi report turn failures. A Codex agent killed by a rate limit
   emits nothing and decays through Working → Stale.
 - Claude and Codex expose dedicated approval events. Amp exposes approval as a
   thread state when a user permission policy is active. Pi has no built-in
@@ -486,6 +531,14 @@ What the shipped plugins subscribe and how they map to unified events
 | codex    | `SubagentStart`                                      | `subagent_start` {agent_id, agent_type, model} |
 | codex    | `SubagentStop`                                       | `subagent_end` {agent_id}                     |
 | codex    | `Stop`                                               | `turn_end` {last_assistant_message}           |
+| opencode | root `session.created`                               | `session_start`                               |
+| opencode | root `chat.message`                                  | `turn_start` {user text}                      |
+| opencode | `session.status` busy/retry                           | `session_focus` / `heartbeat`                 |
+| opencode | `tool.execute.before`                                | `heartbeat` {tool summary}                    |
+| opencode | `permission.asked` / `permission.replied`            | `attention` approval / `heartbeat`            |
+| opencode | `session.status` idle                                | `turn_end` {last assistant text}              |
+| opencode | `session.error`                                      | `turn_error` {error type/message}             |
+| opencode | root `session.deleted`                               | `session_end`                                 |
 | pi       | new `session_start`                                  | `session_start` {model}                       |
 | pi       | resumed/reloaded `session_start`                     | `session_focus`                               |
 | pi       | `before_agent_start`                                 | `turn_start` {prompt}                         |
@@ -515,3 +568,7 @@ tool progress updates (too noisy). Attention arrives through the cooperative
 `ui:prompt:opened` / `ui:prompt:closed` bus convention rather than a
 provider-wide event: the bridge validates each payload and rejects unknown
 `kind` values, but never chooses which prompts count as Attention.
+
+OpenCode deliberately ignores child-session events, streaming deltas, file
+events, todos, and LSP events. It observes permission events but does not use the
+decision-capable `permission.ask` hook, preserving the observer-only boundary.
