@@ -1,7 +1,7 @@
 # gw
 
 A tmux-native status panel for coding agents. Summon one popup and see every
-Claude / Codex / Amp / Pi / (your own) agent running across your tmux sessions — what
+Claude / Codex / Amp / OpenCode / Pi / (your own) agent running across your tmux sessions — what
 each is doing, which one is blocked on you — then press `enter` to jump straight
 to it.
 
@@ -40,8 +40,8 @@ doing" — it's "which one needs me right now". `gw` answers that in one keystro
   no daemon. The event log is the only persistent state, and status is a pure
   function of replaying it.
 - **Attention routing** — `a` jumps to the next agent blocked on you (a pending
-  approval or question); attention also fires a desktop notification whether the
-  panel is open or not.
+  approval or question); on macOS, attention also fires a desktop notification
+  whether the panel is open or not.
 - **Pluggable providers** — a provider is a standalone `gw-provider-<id>`
   executable speaking a small pure-translator protocol; private CLIs plug in from
   their own repositories. See [docs/protocol.md](docs/protocol.md).
@@ -63,17 +63,29 @@ never by being acknowledged. Rows sort most-urgent-first in this order:
 Which statuses a provider can reach depends on the hook events it emits; the
 model is sized to the richest provider and degrades gracefully per-provider.
 
-## Setup
+## Requirements
 
-Via nix (installs `gw` and the official provider plugins):
+gw supports macOS and Linux. It requires `tmux`, a provider CLI, and the
+matching `gw-provider-*` executable on `PATH`. Process discovery also uses
+standard Unix `ps` and `lsof` commands. Windows is not supported.
+
+The project is currently pre-1.0. The provider protocol is versioned, but CLI
+and configuration compatibility may still change between releases.
+
+## Install
+
+There are no tagged binary releases yet. Install the latest development version
+directly from GitHub with Nix (installs `gw` and all official provider plugins):
 
 ```sh
-nix profile install .        # or reference this repo as a flake input
+nix profile install github:yangtau/gw
 ```
 
-Or with cargo:
+Or clone the repository and install with Cargo:
 
 ```sh
+git clone https://github.com/yangtau/gw.git
+cd gw
 cargo install --path crates/gw
 cargo install --path crates/providers/claude
 cargo install --path crates/providers/codex
@@ -82,7 +94,7 @@ cargo install --path crates/providers/opencode
 cargo install --path crates/providers/pi
 ```
 
-Then install the provider hooks (backed up, surgical, reversible):
+Then install the provider hooks:
 
 ```sh
 gw setup
@@ -91,8 +103,10 @@ gw setup
 `gw setup` detects which agent CLIs are available locally, shows the matching
 provider integrations and target files, and asks for explicit confirmation
 before changing anything. Use `gw setup --yes` for non-interactive installs and
-`gw setup --remove` to remove installed integrations. Setup installs runtime
-integrations only; it never installs agent skills.
+`gw setup --remove` to remove owned hook entries and managed files. Shared
+feature flags may remain enabled, and `.gw-backup` files preserve the original
+config before its first modification. Setup installs runtime integrations only;
+it never installs agent skills.
 Optionally install the `gw` skill through the open skills ecosystem:
 
 ```sh
@@ -152,9 +166,32 @@ Sessions are addressed as `provider:session-id`; a bare id or unique prefix
 | `gw wait <addr> [--timeout <secs>]` | Bounded level-triggered wait: returns `done \| attention \| error \| stale \| idle \| ended \| timeout` (default 45s; `0` = single query). |
 | `gw resume <addr> [prompt] [--fork]` | Relaunch an ended session in a new tmux window; `--fork` branches (required if the session is live). |
 
-Everything is read-only over the event log — no pane scraping, no key
-injection, no daemon. `resume` only ever starts a new process in a new window;
-it never touches an existing pane.
+`ls`, `show`, and `wait` read the event log and process/tmux state without pane
+scraping or key injection. `resume` starts a new process in a new window; it
+never touches an existing pane.
+
+## Data and privacy
+
+gw stores per-session event logs under `~/.local/state/gw/` by default. They may
+contain status summaries, working directories, session IDs, and transcript
+paths. Logs for ended sessions are removed after seven days when the panel
+starts; provider-native transcripts are not removed.
+
+Keep `debug.hooks` disabled unless diagnosing an integration. When enabled, it
+stores raw hook payloads that may contain prompts, responses, commands, source
+paths, or other sensitive data. See [docs/config.md](docs/config.md) and
+[SECURITY.md](SECURITY.md).
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. gw is
+available under the [MIT License](LICENSE).
 
 ## Layout
 

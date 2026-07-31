@@ -637,11 +637,7 @@ pub fn resume(input: &str, prompt: Option<&str>, fork: bool) -> Result<()> {
     let argv = expand_argv(&command.argv, &addr.session, prompt, &cwd);
     let target = tmux::new_window(&addr.provider, &cwd, &argv)
         .context("open tmux window (resume requires a running tmux server)")?;
-    println!(
-        "{action} {addr} in tmux pane {} ({})",
-        target.pane_id,
-        argv.join(" ")
-    );
+    println!("{action} {addr} in tmux pane {}", target.pane_id);
     Ok(())
 }
 

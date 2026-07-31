@@ -9,6 +9,9 @@ config never blocks a hook or a panel launch.
 ```toml
 notify = ["attention", "turn_end", "turn_error"]
 
+[panel]
+default_view = "current"
+
 [debug]
 hooks = true
 ```
@@ -25,6 +28,14 @@ Use an empty list (or `false`) to disable all notifications. `true` is retained 
 shorthand for the default `["attention"]`. Notification settings do not affect the
 panel or event log.
 
+## `[panel]`
+
+| Key            | Type   | Default     | Effect                                      |
+| -------------- | ------ | ----------- | ------------------------------------------- |
+| `default_view` | string | `"current"` | Initial panel view: `"current"` or `"global"`. |
+
+The CLI `--view` option overrides this setting for one launch.
+
 ## `[debug]`
 
 | Key     | Type | Default | Effect                                                             |
@@ -38,6 +49,11 @@ the **raw hook payload** with the **normalized events** it produced. This is the
 for debugging the provider-hook → gw-event mapping (`docs/provider-hooks.md`) against
 real payloads — including payloads that map to nothing, which are otherwise dropped
 silently.
+
+> **Privacy warning:** raw payloads may include prompts, responses, commands,
+> source paths, transcript paths, and other sensitive data. Enable this only
+> briefly, do not attach dumps to public issues without redacting them, and
+> delete the debug files when diagnosis is complete.
 
 It is a manual switch: turn it on, reproduce, read the files, turn it off. There is
 no rotation or size cap.

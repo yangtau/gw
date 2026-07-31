@@ -1,6 +1,6 @@
 ---
 name: gw
-description: References other coding-agent sessions on this machine. Use when asked to check on, read, wait for, or continue another agent session (Claude Code, Codex, Amp), or to coordinate work across parallel agent sessions.
+description: References other coding-agent sessions on this machine. Use when asked to check on, read, wait for, or continue another supported agent session, or to coordinate work across parallel agent sessions.
 compatibility: Requires gw on PATH with provider hooks installed by gw setup.
 ---
 

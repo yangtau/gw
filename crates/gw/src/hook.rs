@@ -52,11 +52,10 @@ fn ingest(provider: &str, payload: &[u8]) -> Result<()> {
     };
 
     for event in events {
-        if let Err(error) = store.append(provider, &event, location.as_ref()) {
-            eprintln!("gw hook {provider}: could not append event: {error:#}");
-        }
-        if cfg.should_notify(&event.kind) {
-            notify(provider, &event);
+        match store.append(provider, &event, location.as_ref()) {
+            Ok(()) if cfg.should_notify(&event.kind) => notify(provider, &event),
+            Ok(()) => {}
+            Err(error) => eprintln!("gw hook {provider}: could not append event: {error:#}"),
         }
     }
     Ok(())

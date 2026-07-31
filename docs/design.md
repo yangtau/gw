@@ -1,10 +1,10 @@
 # gw — Design (v1)
 
-A tmux-native TUI panel that shows every coding agent running in the current tmux session, their live status, and lets you jump to, launch, and resume agents. Rust, from scratch. Vocabulary in [CONTEXT.md](../CONTEXT.md); load-bearing decisions in [docs/adr/](adr/).
+A tmux-native TUI panel that shows coding agents across tmux sessions, their live status, and lets you jump to, launch, and resume agents. Rust, from scratch. Vocabulary in [CONTEXT.md](../CONTEXT.md); load-bearing decisions in [docs/adr/](adr/).
 
 ## Model
 
-- **Discovery-based identity** — an Agent is any pane in the current session whose process tree matches a provider's process rules. No registry; panes are the source of truth. ([CONTEXT.md](../CONTEXT.md))
+- **Discovery-based identity** — an Agent is any pane across the tmux server whose process tree matches a provider's process rules. No registry; panes are the source of truth. ([CONTEXT.md](../CONTEXT.md))
 - **One row per pane** — providers may host more than one native Session, but the panel still renders one Agent per pane. Amp and Pi rows follow their interactive TUI's foreground Session; Amp background threads and non-TUI modes are outside the integration boundary.
 - **Hook-driven status, no daemon** — plugins normalize provider hook payloads into unified events; the core appends them to per-session JSONL logs; the TUI derives dynamic status by pure replay + fs watch, with Idle as the fallback before a discovered process emits its first event. (ADR 0001)
 - **Providers as external executables** — `gw-provider-<id>` binaries speaking a pure-translator protocol (`manifest` / `normalize`); the core owns all I/O. (ADR 0002)
@@ -25,7 +25,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 - **List columns**: provider, status (+ duration in that status), window/pane, detail (one-line status context: current activity · task, awaited approval, turn summary, failure reason), cwd (abbreviated), git branch. Running subagents render as dim indented sub-lines under their agent's row (`↳ type · model · task · age`).
 - **Activity**: compact event timeline of the selected agent (recent turns, tool activity, attention, subagents from its Event Log; display only — the panel never touches the agent's window).
 - **Keys (v1)**: `j/k` or arrows move, `Enter` jumps, `n` launches (pick provider → new window in the panel's cwd → jump), `r` toggles the resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` toggles current/global views, `a` selects the next Attention agent, `?` opens the keyboard-shortcuts page, and `Esc`/`Ctrl-C` quit.
-- **Notifications**: `gw hook` itself fires a desktop notification (macOS `osascript`) + terminal bell when writing an attention event — global notifications without a daemon.
+- **Notifications**: `gw hook` itself fires a desktop notification through macOS `osascript` after writing a configured event. Other platforms currently skip desktop notifications.
 - **Setup**: `gw setup` filters discovered plugins to agent CLIs available on the local `PATH`, displays the matching providers and target files, and requires explicit confirmation before installation (`--yes` is the non-interactive opt-in). Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. Removal still considers every discovered plugin so an integration can be cleaned up after its agent CLI is uninstalled. Providers may also declare a whole managed integration file: the core creates, hashes, upgrades, and removes it only while its ownership marker and body hash prove it remains unmodified. Amp, OpenCode, and Pi use this for their TypeScript observer integrations. The panel does not report setup health; an uninstrumented provider remains Idle.
 
 ## Plugin protocol (v1 sketch)
@@ -37,8 +37,8 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 
 ## Storage
 
-- Event logs: `~/.local/state/gw/sessions/<sha256(provider:native_session_id)>.jsonl`, append-only, `O_APPEND` single-write per event; retention sweep on panel start (drop logs of dead sessions older than N days).
-- Config (optional, TOML): `~/.config/gw/config.toml` — currently `notify` and `[debug] hooks` (see `config.md`); stale threshold, plugin dir overrides, keybindings later.
+- Event logs: `~/.local/state/gw/sessions/<date>-<cwd>-<provider>-<session-hash>.jsonl`, append-only, `O_APPEND` single-write per event; the panel removes logs of dead sessions older than seven days on startup.
+- Config (optional, TOML): `~/.config/gw/config.toml` — currently `notify`, `[panel] default_view`, and `[debug] hooks` (see `config.md`); stale threshold, plugin dir overrides, keybindings later.
 
 ## Crate layout
 

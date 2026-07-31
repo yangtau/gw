@@ -3,10 +3,10 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,7 +61,13 @@ pub fn discover() -> Result<Vec<Plugin>> {
 
     let mut plugins = Vec::new();
     for bin in candidates {
-        let manifest = read_manifest(&bin)?;
+        let manifest = match read_manifest(&bin) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                eprintln!("warning: ignoring plugin {}: {error:#}", bin.display());
+                continue;
+            }
+        };
         if manifest.protocol != PROTOCOL_VERSION {
             eprintln!(
                 "warning: ignoring plugin {} with unsupported protocol {}",
@@ -85,19 +91,12 @@ pub fn find(id: &str) -> Result<Plugin> {
 /// Pipe `payload` to the plugin's `normalize`; parse one event per stdout
 /// line. A failing or garbage-printing plugin yields an error, never a panic.
 pub fn normalize(plugin: &Plugin, payload: &[u8]) -> Result<Vec<Event>> {
-    let mut child = Command::new(&plugin.bin)
-        .arg("normalize")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start {} normalize", plugin.bin.display()))?;
-    child
-        .stdin
-        .take()
-        .context("normalize stdin unavailable")?
-        .write_all(payload)?;
-    let output = child.wait_with_output()?;
+    let output = run_with_timeout(
+        &plugin.bin,
+        "normalize",
+        Some(payload),
+        Duration::from_secs(10),
+    )?;
     if !output.status.success() {
         bail!(
             "{} normalize failed: {}",
@@ -116,6 +115,72 @@ pub fn normalize(plugin: &Plugin, payload: &[u8]) -> Result<Vec<Event>> {
         .collect())
 }
 
+fn run_with_timeout(
+    bin: &Path,
+    argument: &str,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Output> {
+    let mut child = Command::new(bin)
+        .arg(argument)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start {} {argument}", bin.display()))?;
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().context("plugin stdout unavailable")?;
+    let mut stderr = child.stderr.take().context("plugin stderr unavailable")?;
+
+    thread::scope(|scope| -> Result<Output> {
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            if let (Some(stdin), Some(input)) = (&mut stdin, input) {
+                stdin.write_all(input)?;
+            }
+            Ok(())
+        });
+        let stdout_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let deadline = Instant::now() + timeout;
+        let (status, timed_out) = loop {
+            if let Some(status) = child.try_wait()? {
+                break (status, false);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break (child.wait()?, true);
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let write_result = writer.join().expect("plugin stdin writer panicked");
+        let stdout = stdout_reader
+            .join()
+            .expect("plugin stdout reader panicked")?;
+        let stderr = stderr_reader
+            .join()
+            .expect("plugin stderr reader panicked")?;
+        if timed_out {
+            bail!("{} {argument} timed out", bin.display());
+        }
+        write_result?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+}
+
 fn candidate_id(path: &Path) -> Option<&str> {
     let id = path.file_name()?.to_str()?.strip_prefix("gw-provider-")?;
     (!id.is_empty()).then_some(id)
@@ -127,28 +192,10 @@ fn is_executable(path: &Path) -> bool {
 }
 
 fn read_manifest(bin: &Path) -> Result<Manifest> {
-    let mut child = Command::new(bin)
-        .arg("manifest")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start {} manifest", bin.display()))?;
     // Generous: a hung-plugin guard, not a perf contract — process spawn can
     // take seconds on a loaded machine (nix sandbox builds hit this at 2s).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("{} manifest timed out", bin.display());
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let output = child.wait_with_output()?;
-    if !status.success() {
+    let output = run_with_timeout(bin, "manifest", None, Duration::from_secs(10))?;
+    if !output.status.success() {
         bail!(
             "{} manifest failed: {}",
             bin.display(),
@@ -246,6 +293,22 @@ esac
         let _env = EnvGuard::set(temp.path());
 
         assert!(discover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ignores_broken_plugins_without_hiding_valid_ones() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let valid = write_plugin(temp.path(), "valid", PROTOCOL_VERSION);
+        let broken = temp.path().join("gw-provider-broken");
+        fs::write(&broken, "#!/bin/sh\nprintf 'not json\\n'\n").unwrap();
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = EnvGuard::set(temp.path());
+
+        let plugins = discover().unwrap();
+
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].bin, valid);
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub struct Manifest {
     pub managed_files: Vec<ManagedFile>,
 }
 
-/// An agent process is recognized when its argv[0] basename matches.
+/// An agent process is recognized when one of its leading argv tokens matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessMatch {
     pub argv0: Vec<String>,

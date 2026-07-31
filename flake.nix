@@ -17,6 +17,9 @@
           cargoLock.lockFile = ./Cargo.lock;
           meta = {
             description = "tmux-native status panel for coding agents";
+            homepage = "https://github.com/yangtau/gw";
+            license = pkgs.lib.licenses.mit;
+            platforms = systems;
             mainProgram = "gw";
           };
         };

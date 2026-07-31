@@ -1,3 +1,10 @@
 /target
 /.envrc
+/.env
+/.env.*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
 /.claude/scheduled_tasks.lock
