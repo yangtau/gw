@@ -33,6 +33,9 @@ enum Cmd {
         /// Remove previously installed hooks instead.
         #[arg(long)]
         remove: bool,
+        /// Install the detected provider integrations without prompting.
+        #[arg(short, long, conflicts_with = "remove")]
+        yes: bool,
     },
     /// List live agents and ended, resumable sessions.
     Ls {
@@ -104,7 +107,7 @@ fn main() -> Result<()> {
             ))
         }
         Some(Cmd::Hook { provider }) => hook::run(&provider),
-        Some(Cmd::Setup { remove }) => setup::run(remove),
+        Some(Cmd::Setup { remove, yes }) => setup::run(remove, yes),
         Some(Cmd::Ls { json }) => sessions::ls(json),
         Some(Cmd::Show {
             address,
@@ -168,5 +171,17 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["gw", "hook", "claude", "--view", "global"]).is_err());
+    }
+
+    #[test]
+    fn setup_accepts_yes_but_not_with_remove() {
+        assert!(matches!(
+            Cli::try_parse_from(["gw", "setup", "--yes"]).unwrap().cmd,
+            Some(Cmd::Setup {
+                remove: false,
+                yes: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["gw", "setup", "--remove", "--yes"]).is_err());
     }
 }

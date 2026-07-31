@@ -88,7 +88,11 @@ Then install the provider hooks (backed up, surgical, reversible):
 gw setup
 ```
 
-`gw setup` installs runtime integrations only; it never installs agent skills.
+`gw setup` detects which agent CLIs are available locally, shows the matching
+provider integrations and target files, and asks for explicit confirmation
+before changing anything. Use `gw setup --yes` for non-interactive installs and
+`gw setup --remove` to remove installed integrations. Setup installs runtime
+integrations only; it never installs agent skills.
 Optionally install the `gw` skill through the open skills ecosystem:
 
 ```sh
