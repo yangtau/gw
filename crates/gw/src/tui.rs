@@ -9,11 +9,14 @@
 //! fields fit the terminal width, degrading in a fixed order; the detail
 //! text absorbs whatever space is left.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use futures::StreamExt;
 use gw_core::config::PanelView;
 use gw_core::discover::{self, Agent, Snapshot};
@@ -95,10 +98,16 @@ fn activity_viewport(area: Rect) -> Rect {
     )
 }
 
+struct RepoMetadata {
+    project: String,
+    branch: String,
+}
+
 struct App {
     store: Store,
     plugins: Vec<Plugin>,
     snapshot: Snapshot,
+    repo_metadata: HashMap<PathBuf, RepoMetadata>,
     state: PanelState,
     panel_pane_id: Option<String>,
     current_tmux_session_id: Option<String>,
@@ -150,6 +159,7 @@ impl App {
                 agents: vec![],
                 ended: vec![],
             },
+            repo_metadata: HashMap::new(),
             state: PanelState::new(initial_view),
             panel_pane_id,
             current_tmux_session_id: None,
@@ -161,11 +171,11 @@ impl App {
     }
 
     async fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<Loop> {
-        let (fs_tx, mut fs_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel(1);
         let sessions_dir = self.store.root().join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let mut watcher = notify::recommended_watcher(move |_| {
-            let _ = fs_tx.send(());
+            let _ = fs_tx.try_send(());
         })?;
         watcher.watch(&sessions_dir, notify::RecursiveMode::NonRecursive)?;
 
@@ -175,10 +185,7 @@ impl App {
             terminal.draw(|f| self.render(f))?;
             tokio::select! {
                 _ = tick.tick() => self.refresh(),
-                Some(_) = fs_rx.recv() => {
-                    while fs_rx.try_recv().is_ok() {}
-                    self.refresh();
-                }
+                Some(_) = fs_rx.recv() => self.refresh(),
                 Some(Ok(ev)) = input.next() => {
                     if let TermEvent::Key(key) = ev {
                         if let Some(input) = map_key(key) {
@@ -269,7 +276,10 @@ impl App {
             Duration::minutes(STALE_AFTER_MINUTES),
             &topology,
         ) {
-            Ok(snapshot) => self.snapshot = snapshot,
+            Ok(snapshot) => {
+                self.repo_metadata = repo_metadata(&snapshot);
+                self.snapshot = snapshot;
+            }
             Err(err) => gw_core::tui_log::error(&format!("snapshot failed: {err:#}")),
         }
         let ctx = Ctx {
@@ -402,7 +412,11 @@ impl App {
                     detail: agent.detail.clone().unwrap_or_default(),
                     cwd_full: shorten(&agent.cwd, CWD_MAX),
                     cwd_short: basename(&agent.cwd),
-                    branch: git_branch(&agent.cwd).unwrap_or_default(),
+                    branch: self
+                        .repo_metadata
+                        .get(&agent.cwd)
+                        .map(|metadata| metadata.branch.clone())
+                        .unwrap_or_default(),
                     window: format!("{}:{}", agent.pane.window_index, agent.pane.window_name),
                     time: agent.since.map(|t| ago(t, now)).unwrap_or_default(),
                     subagents: agent
@@ -549,7 +563,8 @@ impl App {
                     ])
                 }),
         );
-        frame.render_widget(Paragraph::new(lines), area);
+        let scroll = ended_scroll_offset(self.state.selected(), area.height as usize);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
     }
 
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
@@ -570,7 +585,14 @@ impl App {
             .title_position(TitlePosition::Top)
             .title(format!(
                 " {}: {} ",
-                project_name(&agent.cwd),
+                self.repo_metadata
+                    .get(&agent.cwd)
+                    .map(|metadata| metadata.project.as_str())
+                    .unwrap_or_else(|| agent
+                        .cwd
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("")),
                 agent.provider
             ));
         let inner = block.inner(viewport);
@@ -674,6 +696,9 @@ impl App {
 /// keys the panel ignores. Mode-dependent meaning is resolved by `PanelState`,
 /// not here — this map is context-free.
 fn map_key(key: KeyEvent) -> Option<Input> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(Input::Quit);
     }
@@ -719,6 +744,10 @@ fn subagent_text(subagent: &Subagent, now: DateTime<Utc>) -> String {
     let time = ago(subagent.since, now);
     parts.push(&time);
     parts.join(SEP)
+}
+
+fn ended_scroll_offset(selected: usize, height: usize) -> usize {
+    scroll_offset(selected + 3, selected + 4, height)
 }
 
 /// Scroll offset keeping the selected block [top, bottom) visible: 0 while
@@ -1060,6 +1089,19 @@ fn basename(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn repo_metadata(snapshot: &Snapshot) -> HashMap<PathBuf, RepoMetadata> {
+    let mut metadata = HashMap::new();
+    for agent in &snapshot.agents {
+        metadata
+            .entry(agent.cwd.clone())
+            .or_insert_with(|| RepoMetadata {
+                project: project_name(&agent.cwd),
+                branch: git_branch(&agent.cwd).unwrap_or_default(),
+            });
+    }
+    metadata
+}
+
 fn project_name(cwd: &std::path::Path) -> String {
     let root = cwd
         .ancestors()
@@ -1288,6 +1330,51 @@ mod tests {
             ),
             cell("", "~/Workspaces/gw2", "main", "1:.claude-wrap", "12m"),
         ]
+    }
+
+    #[test]
+    fn key_mapping_ignores_release_and_keeps_repeat() {
+        let key = |code, modifiers, kind| KeyEvent::new_with_kind(code, modifiers, kind);
+
+        assert_eq!(
+            map_key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Press)),
+            Some(Input::Down)
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat)),
+            Some(Input::Down)
+        );
+        assert_eq!(
+            map_key(key(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )),
+            None
+        );
+        assert_eq!(
+            map_key(key(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )),
+            Some(Input::Quit)
+        );
+        assert_eq!(
+            map_key(key(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn ended_scroll_keeps_selection_visible() {
+        assert_eq!(ended_scroll_offset(0, 10), 0);
+        assert_eq!(ended_scroll_offset(7, 10), 1);
+        assert_eq!(ended_scroll_offset(7, 0), 10);
     }
 
     #[test]
