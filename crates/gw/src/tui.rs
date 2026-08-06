@@ -10,6 +10,7 @@
 //! text absorbs whatever space is left.
 
 use std::collections::HashMap;
+use std::io::stdout;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -17,6 +18,8 @@ use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{
     Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
+use crossterm::execute;
+use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use futures::StreamExt;
 use gw_core::config::PanelView;
 use gw_core::discover::{self, Agent, Snapshot};
@@ -52,18 +55,37 @@ pub fn run(initial_view: PanelView) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let outcome = rt.block_on(async {
-        let mut app = App::new(initial_view)?;
-        let mut terminal = ratatui::init();
-        let result = app.run(&mut terminal).await;
+    let mut app = App::new(initial_view)?;
+    let mut terminal = ratatui::init();
+    loop {
+        let outcome = rt.block_on(app.run(&mut terminal));
         ratatui::restore();
-        result
-    })?;
-    match outcome {
-        Loop::Quit => Ok(()),
-        Loop::Attach(target) => tmux::attach(&target),
-        Loop::Continue => unreachable!("the panel run loop cannot exit with Continue"),
+        match outcome? {
+            Loop::Quit => return Ok(()),
+            Loop::Attach(target) => {
+                tmux::attach(&target)?;
+                resume_terminal(&mut terminal)?;
+                app.refresh();
+            }
+            Loop::Continue => unreachable!("the panel run loop cannot exit with Continue"),
+        }
     }
+}
+
+/// Re-enter the same terminal after an externally attached tmux client detaches.
+/// Reusing the terminal and App keeps the panel's navigation state intact.
+fn resume_terminal(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+    let result = (|| {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen)?;
+        let size = terminal.size()?;
+        terminal.resize(size.into())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        ratatui::restore();
+    }
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -119,7 +141,7 @@ struct App {
 enum Loop {
     Continue,
     Quit,
-    /// Restore the terminal, then attach this external terminal to the target.
+    /// Restore the terminal, attach it to the target, then resume the Panel on detach.
     Attach(tmux::TmuxPaneTarget),
 }
 
