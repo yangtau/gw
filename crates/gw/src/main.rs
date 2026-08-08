@@ -2,10 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gw_core::config::{Config, PanelView};
 
-mod hook;
 mod panel;
-mod sessions;
-mod setup;
 mod tui;
 
 #[derive(Parser)]
@@ -25,55 +22,6 @@ enum Cmd {
         /// Initial agent view. Overrides [panel].default_view in the config.
         #[arg(long, value_enum)]
         view: Option<ViewArg>,
-    },
-    /// Ingest one hook payload from stdin for the given provider.
-    Hook { provider: String },
-    /// Install hooks into provider configs (global).
-    Setup {
-        /// Remove previously installed hooks instead.
-        #[arg(long)]
-        remove: bool,
-        /// Install the detected provider integrations without prompting.
-        #[arg(short, long, conflicts_with = "remove")]
-        yes: bool,
-    },
-    /// List live agents and ended, resumable sessions.
-    Ls {
-        /// Print one JSON object: {"agents":[…],"sessions":[…]}.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a session's status and activity timeline.
-    Show {
-        /// Session address: provider:session-id, a bare id, or a unique prefix.
-        address: String,
-        /// Emit the provider-native transcript instead of the timeline.
-        #[arg(long, conflicts_with = "json")]
-        transcript: bool,
-        /// Print the session as one JSON object.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Wait until a session finishes, needs attention, or errors.
-    Wait {
-        /// Session address: provider:session-id, a bare id, or a unique prefix.
-        address: String,
-        /// Give up after this many seconds; 0 queries once without blocking.
-        #[arg(long, default_value_t = 45)]
-        timeout: u64,
-        /// Print the result as one JSON object.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Resume (or fork) a session in a new tmux window.
-    Resume {
-        /// Session address: provider:session-id, a bare id, or a unique prefix.
-        address: String,
-        /// Initial prompt for the resumed session (where supported).
-        prompt: Option<String>,
-        /// Fork into a new session instead; allowed on a live target.
-        #[arg(long)]
-        fork: bool,
     },
 }
 
@@ -106,24 +54,6 @@ fn main() -> Result<()> {
                 config.panel.default_view,
             ))
         }
-        Some(Cmd::Hook { provider }) => hook::run(&provider),
-        Some(Cmd::Setup { remove, yes }) => setup::run(remove, yes),
-        Some(Cmd::Ls { json }) => sessions::ls(json),
-        Some(Cmd::Show {
-            address,
-            transcript,
-            json,
-        }) => sessions::show(&address, transcript, json),
-        Some(Cmd::Wait {
-            address,
-            timeout,
-            json,
-        }) => sessions::wait(&address, timeout, json),
-        Some(Cmd::Resume {
-            address,
-            prompt,
-            fork,
-        }) => sessions::resume(&address, prompt.as_deref(), fork),
         None => {
             let config = Config::load();
             tui::run(resolve_panel_view(cli.view, config.panel.default_view))
@@ -169,19 +99,5 @@ mod tests {
                 view: Some(ViewArg::Current)
             })
         ));
-
-        assert!(Cli::try_parse_from(["gw", "hook", "claude", "--view", "global"]).is_err());
-    }
-
-    #[test]
-    fn setup_accepts_yes_but_not_with_remove() {
-        assert!(matches!(
-            Cli::try_parse_from(["gw", "setup", "--yes"]).unwrap().cmd,
-            Some(Cmd::Setup {
-                remove: false,
-                yes: true
-            })
-        ));
-        assert!(Cli::try_parse_from(["gw", "setup", "--remove", "--yes"]).is_err());
     }
 }

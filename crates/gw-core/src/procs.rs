@@ -1,6 +1,6 @@
-//! Process facts via `ps`: the bridge between hook processes, provider
-//! processes, and tmux panes. No /proc on macOS, so everything goes through
-//! one `ps -axo pid,ppid,tty,args` snapshot.
+//! Process facts via `ps`: how the panel maps tmux panes to provider agents.
+//! No /proc on macOS, so everything goes through one
+//! `ps -axo pid,ppid,tty,args` snapshot.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,6 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::protocol::Manifest;
-use crate::tmux;
 
 #[derive(Debug, Clone)]
 pub struct Proc {
@@ -17,13 +16,6 @@ pub struct Proc {
     pub ppid: i32,
     pub tty: Option<String>,
     pub argv: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentLocation {
-    pub pid: i32,
-    pub pane_id: Option<String>,
-    pub cwd: Option<PathBuf>,
 }
 
 /// One `ps` snapshot of all processes.
@@ -78,33 +70,6 @@ pub fn matches_provider(proc_: &Proc, manifest: &Manifest) -> bool {
                         .any(|candidate| candidate == name)
                 })
         })
-}
-
-/// Walk the ppid chain from `from_pid` inclusive (the hook's parent — which
-/// IS the agent when the provider spawns hooks directly, or a shell below it)
-/// to the nearest process matching any manifest; resolve its tty to a pane
-/// and its cwd. Pane resolution failure degrades to None so pid/cwd
-/// correlation still works outside tmux.
-pub fn locate_agent(
-    from_pid: i32,
-    manifests: &[Manifest],
-) -> Result<Option<(String, AgentLocation)>> {
-    let procs = snapshot()?;
-    let Some((provider, proc_)) = provider_ancestor(from_pid, &procs, manifests) else {
-        return Ok(None);
-    };
-    let pane_id = proc_
-        .tty
-        .as_deref()
-        .and_then(|tty| tmux::pane_for_tty(tty).ok().flatten());
-    Ok(Some((
-        provider,
-        AgentLocation {
-            pid: proc_.pid,
-            pane_id,
-            cwd: cwd_of(proc_.pid),
-        },
-    )))
 }
 
 /// Provider processes running inside `pane_root_pid`'s process tree
@@ -177,25 +142,6 @@ fn parse_snapshot(stdout: &str) -> Result<Vec<Proc>> {
             })
         })
         .collect()
-}
-
-fn provider_ancestor(
-    from_pid: i32,
-    procs: &[Proc],
-    manifests: &[Manifest],
-) -> Option<(String, Proc)> {
-    let by_pid: HashMap<_, _> = procs.iter().map(|proc_| (proc_.pid, proc_)).collect();
-    let mut pid = from_pid;
-    while let Some(proc_) = by_pid.get(&pid) {
-        if let Some(manifest) = manifests
-            .iter()
-            .find(|manifest| matches_provider(proc_, manifest))
-        {
-            return Some((manifest.id.clone(), (*proc_).clone()));
-        }
-        pid = proc_.ppid;
-    }
-    None
 }
 
 fn parse_cwd(stdout: &str) -> Option<PathBuf> {
@@ -313,31 +259,6 @@ mod tests {
             &proc_(2, 1, &["pi", "rpc", "--mode"]),
             &pi
         ));
-    }
-
-    #[test]
-    fn finds_nearest_provider_ancestor() {
-        let manifests = [manifest("outer", &["outer"]), manifest("inner", &["inner"])];
-        let procs = [
-            proc_(10, 1, &["outer"]),
-            proc_(20, 10, &["inner"]),
-            proc_(30, 20, &["gw", "hook"]),
-        ];
-
-        let (provider, proc_) = provider_ancestor(30, &procs, &manifests).unwrap();
-        assert_eq!(provider, "inner");
-        assert_eq!(proc_.pid, 20);
-    }
-
-    #[test]
-    fn matches_the_starting_pid_itself_when_hooks_are_spawned_directly() {
-        let manifests = [manifest("claude", &["claude"])];
-        let procs = [proc_(10, 1, &["claude"]), proc_(30, 10, &["gw", "hook"])];
-
-        // `gw hook`'s parent is the agent itself: from_pid IS the agent.
-        let (provider, proc_) = provider_ancestor(10, &procs, &manifests).unwrap();
-        assert_eq!(provider, "claude");
-        assert_eq!(proc_.pid, 10);
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! Plugin discovery and invocation. A plugin is any executable named
-//! `gw-provider-<id>` on PATH or in `~/.config/gw/providers/bin/`.
+//! Plugin discovery. A plugin is any executable named `gw-provider-<id>` on
+//! PATH or in `~/.config/gw/providers/bin/`; the panel reads its manifest to
+//! recognize and launch matching agent processes.
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::protocol::{Event, Manifest, PROTOCOL_VERSION};
+use crate::protocol::{Manifest, PROTOCOL_VERSION};
 
 #[derive(Debug, Clone)]
 pub struct Plugin {
@@ -81,68 +82,18 @@ pub fn discover() -> Result<Vec<Plugin>> {
     Ok(plugins)
 }
 
-pub fn find(id: &str) -> Result<Plugin> {
-    discover()?
-        .into_iter()
-        .find(|plugin| plugin.manifest.id == id)
-        .with_context(|| format!("provider plugin {id:?} not found"))
-}
-
-/// Pipe `payload` to the plugin's `normalize`; parse one event per stdout
-/// line. A failing or garbage-printing plugin yields an error, never a panic.
-pub fn normalize(plugin: &Plugin, payload: &[u8]) -> Result<Vec<Event>> {
-    let output = run_with_timeout(
-        &plugin.bin,
-        "normalize",
-        Some(payload),
-        Duration::from_secs(10),
-    )?;
-    if !output.status.success() {
-        bail!(
-            "{} normalize failed: {}",
-            plugin.bin.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    // Lines that don't parse are skipped, not fatal: same evolution policy
-    // as log replay — a plugin speaking a newer vocabulary keeps working.
-    Ok(output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .filter_map(|line| serde_json::from_slice(line).ok())
-        .collect())
-}
-
-fn run_with_timeout(
-    bin: &Path,
-    argument: &str,
-    input: Option<&[u8]>,
-    timeout: Duration,
-) -> Result<Output> {
+fn run_manifest(bin: &Path, timeout: Duration) -> Result<Output> {
     let mut child = Command::new(bin)
-        .arg(argument)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .arg("manifest")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("start {} {argument}", bin.display()))?;
-    let mut stdin = child.stdin.take();
+        .with_context(|| format!("start {} manifest", bin.display()))?;
     let mut stdout = child.stdout.take().context("plugin stdout unavailable")?;
     let mut stderr = child.stderr.take().context("plugin stderr unavailable")?;
 
     thread::scope(|scope| -> Result<Output> {
-        let writer = scope.spawn(move || -> std::io::Result<()> {
-            if let (Some(stdin), Some(input)) = (&mut stdin, input) {
-                stdin.write_all(input)?;
-            }
-            Ok(())
-        });
         let stdout_reader = scope.spawn(move || {
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).map(|_| bytes)
@@ -162,7 +113,6 @@ fn run_with_timeout(
             }
             thread::sleep(Duration::from_millis(10));
         };
-        let write_result = writer.join().expect("plugin stdin writer panicked");
         let stdout = stdout_reader
             .join()
             .expect("plugin stdout reader panicked")?;
@@ -170,9 +120,8 @@ fn run_with_timeout(
             .join()
             .expect("plugin stderr reader panicked")?;
         if timed_out {
-            bail!("{} {argument} timed out", bin.display());
+            bail!("{} manifest timed out", bin.display());
         }
-        write_result?;
         Ok(Output {
             status,
             stdout,
@@ -194,7 +143,7 @@ fn is_executable(path: &Path) -> bool {
 fn read_manifest(bin: &Path) -> Result<Manifest> {
     // Generous: a hung-plugin guard, not a perf contract — process spawn can
     // take seconds on a loaded machine (nix sandbox builds hit this at 2s).
-    let output = run_with_timeout(bin, "manifest", None, Duration::from_secs(10))?;
+    let output = run_manifest(bin, Duration::from_secs(10))?;
     if !output.status.success() {
         bail!(
             "{} manifest failed: {}",
@@ -209,7 +158,6 @@ fn read_manifest(bin: &Path) -> Result<Manifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::EventKind;
     use std::ffi::OsString;
     use std::sync::Mutex;
 
@@ -253,9 +201,6 @@ case "$1" in
   manifest)
     printf '%s\n' '{{"protocol":{protocol},"id":"{name}","label":"Test","process":{{"argv0":["test"]}},"launch":{{"argv":["test"]}}}}'
     ;;
-  normalize)
-    printf '%s\n' '{{"v":1,"session":"fixture-session","kind":"turn_start"}}'
-    ;;
 esac
 "#
         );
@@ -265,7 +210,7 @@ esac
     }
 
     #[test]
-    fn discovers_fixture_and_normalizes_events() {
+    fn discovers_fixture_manifest() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let bin = write_plugin(temp.path(), "fixture", PROTOCOL_VERSION);
@@ -276,13 +221,6 @@ esac
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].bin, bin);
         assert_eq!(plugins[0].manifest.id, "fixture");
-        let events = normalize(&plugins[0], br#"{"raw":true}"#).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].session, "fixture-session");
-        assert!(matches!(
-            events[0].kind,
-            EventKind::TurnStart { summary: None }
-        ));
     }
 
     #[test]
@@ -328,30 +266,5 @@ esac
 
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].bin, preferred);
-    }
-
-    #[test]
-    fn normalize_skips_unparseable_lines_and_rejects_nonzero_exit() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let bin = write_plugin(temp.path(), "fixture", PROTOCOL_VERSION);
-        let _env = EnvGuard::set(temp.path());
-        let plugin = discover().unwrap().remove(0);
-        fs::write(
-            &bin,
-            concat!(
-                "#!/bin/sh\n",
-                "printf '%s\\n' 'not json'\n",
-                r#"printf '%s\n' '{"v":1,"session":"s","kind":"turn_start"}'"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let events = normalize(&plugin, b"payload").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].session, "s");
-
-        fs::write(&bin, "#!/bin/sh\nexit 7\n").unwrap();
-        assert!(normalize(&plugin, b"payload").is_err());
     }
 }
