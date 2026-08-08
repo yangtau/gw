@@ -1,16 +1,21 @@
 //! Event-log storage: one append-only JSONL file per session plus a sidecar
-//! meta JSON, under `~/.local/state/gw/sessions/`. The panel reads them to
-//! surface per-session status and activity.
+//! meta JSON, under `~/.local/state/gw/sessions/`. Files share a
+//! human-readable stem, `<date>-<cmd>-<provider>-<sid>`. The store is the
+//! only writer; plugins never touch the filesystem.
 
-use std::fs::{self};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::protocol::Event;
+use crate::atomic;
+use crate::procs::AgentLocation;
+use crate::protocol::{Event, EventKind};
 
 pub struct Store {
     root: PathBuf,
@@ -36,6 +41,20 @@ pub struct SessionRecord {
     pub events: Vec<Event>,
 }
 
+#[derive(Serialize)]
+struct DebugRecord<'a> {
+    ts: DateTime<Utc>,
+    provider: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<&'a [Event]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_raw: Option<String>,
+}
+
 impl Store {
     /// `~/.local/state/gw` (override with `GW_STATE_DIR`, for tests).
     pub fn open_default() -> Result<Self> {
@@ -48,6 +67,121 @@ impl Store {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         fs::set_permissions(root.join("sessions"), fs::Permissions::from_mode(0o700))?;
         Ok(Self { root })
+    }
+
+    /// Append one event (stamping `ts` if absent) and refresh the meta
+    /// sidecar. Single `O_APPEND` write per event; a JSONL line is the
+    /// atomicity unit.
+    pub fn append(&self, provider: &str, event: &Event, loc: Option<&AgentLocation>) -> Result<()> {
+        let now = Utc::now();
+        let mut event = event.clone();
+        if event.ts.is_none() {
+            event.ts = Some(now);
+        }
+
+        let (log_path, meta_path) = self.paths(provider, &event.session, loc);
+        // Only an identical heartbeat is throttled: a changed activity is new
+        // information the panel should show.
+        let throttled = matches!(event.kind, EventKind::Heartbeat { .. })
+            && last_complete_event(&log_path)?.is_some_and(|last| {
+                last.kind == event.kind
+                    && last.ts.is_some_and(|ts| ts > now - Duration::seconds(30))
+            });
+
+        if !throttled {
+            let mut line = serde_json::to_vec(&event)?;
+            line.push(b'\n');
+            let mut log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&log_path)
+                .with_context(|| format!("open {}", log_path.display()))?;
+            fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))?;
+            let written = log.write(&line)?;
+            if written != line.len() {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "partial event write").into());
+            }
+        }
+
+        let previous = if meta_path.exists() {
+            Some(
+                serde_json::from_slice::<SessionMeta>(&fs::read(&meta_path)?)
+                    .with_context(|| format!("parse {}", meta_path.display()))?,
+            )
+        } else {
+            None
+        };
+        let previous_transcript = previous
+            .as_ref()
+            .and_then(|meta| meta.transcript_path.clone());
+        let (pane_id, pid, cwd) = match loc {
+            Some(loc) => (loc.pane_id.clone(), Some(loc.pid), loc.cwd.clone()),
+            None => previous
+                .map(|meta| (meta.pane_id, meta.pid, meta.cwd))
+                .unwrap_or((None, None, None)),
+        };
+        let meta = SessionMeta {
+            provider: provider.to_owned(),
+            session: event.session.clone(),
+            pane_id,
+            pid,
+            cwd,
+            transcript_path: event.transcript.clone().or(previous_transcript),
+            updated_at: now,
+        };
+        atomic::write(
+            &meta_path,
+            &serde_json::to_vec_pretty(&meta)?,
+            meta_path.exists(),
+        )?;
+        Ok(())
+    }
+
+    pub fn append_debug(
+        &self,
+        provider: &str,
+        payload: &[u8],
+        result: &anyhow::Result<Vec<Event>>,
+        loc: Option<&AgentLocation>,
+    ) -> Result<()> {
+        let (events, error) = match result {
+            Ok(events) => (Some(events.as_slice()), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
+        let (payload, payload_raw) = match serde_json::from_slice(payload) {
+            Ok(payload) => (Some(payload), None),
+            Err(_) => (None, Some(String::from_utf8_lossy(payload).into_owned())),
+        };
+        let record = DebugRecord {
+            ts: Utc::now(),
+            provider,
+            events,
+            error,
+            payload,
+            payload_raw,
+        };
+        let path = match result {
+            Ok(events) if !events.is_empty() => self.sessions_dir().join(format!(
+                "{}.debug.jsonl",
+                self.stem(provider, &events[0].session, loc)
+            )),
+            _ => self.sessions_dir().join("_unmapped.debug.jsonl"),
+        };
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let written = log.write(&line)?;
+        if written != line.len() {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "partial debug write").into());
+        }
+        Ok(())
     }
 
     /// All sessions with their full event logs, in no particular order.
@@ -131,6 +265,52 @@ impl Store {
     fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
+
+    fn paths(
+        &self,
+        provider: &str,
+        session: &str,
+        loc: Option<&AgentLocation>,
+    ) -> (PathBuf, PathBuf) {
+        let stem = self.stem(provider, session, loc);
+        let dir = self.sessions_dir();
+        (
+            dir.join(format!("{stem}.jsonl")),
+            dir.join(format!("{stem}.meta.json")),
+        )
+    }
+
+    /// Human-readable file stem, `<date>-<cmd>-<provider>-<sid>`, fixed at
+    /// session file creation: later appends reuse whatever stem already ends
+    /// with the session's hash (including pre-rename bare-`<sid>` files).
+    fn stem(&self, provider: &str, session: &str, loc: Option<&AgentLocation>) -> String {
+        let sid = session_id(provider, session);
+        if let Some(stem) = self.find_stem(&sid) {
+            return stem;
+        }
+        let cmd = loc
+            .and_then(|loc| loc.cwd.as_deref())
+            .and_then(Path::file_name)
+            .map(|name| sanitize(&name.to_string_lossy()))
+            .unwrap_or_default();
+        let cmd = if cmd.is_empty() {
+            "unknown".to_owned()
+        } else {
+            cmd
+        };
+        format!("{}-{cmd}-{provider}-{sid}", Local::now().format("%Y-%m-%d"))
+    }
+
+    fn find_stem(&self, sid: &str) -> Option<String> {
+        let entries = fs::read_dir(self.sessions_dir()).ok()?;
+        entries.flatten().find_map(|entry| {
+            let name = entry.file_name();
+            let stem = [".meta.json", ".debug.jsonl", ".jsonl"]
+                .iter()
+                .find_map(|suffix| name.to_str()?.strip_suffix(suffix))?;
+            (stem == sid || stem.ends_with(&format!("-{sid}"))).then(|| stem.to_owned())
+        })
+    }
 }
 
 pub(crate) fn default_state_dir() -> Result<PathBuf> {
@@ -142,15 +322,39 @@ pub(crate) fn default_state_dir() -> Result<PathBuf> {
     }
 }
 
+fn session_id(provider: &str, session: &str) -> String {
+    let digest = Sha256::digest(format!("{provider}:{session}").as_bytes());
+    format!("{digest:x}")[..16].to_owned()
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn last_complete_event(path: &Path) -> Result<Option<Event>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let last = complete_lines(&bytes)
+        .rev()
+        .find_map(|line| serde_json::from_slice(line).ok());
+    Ok(last)
+}
+
 // Unparseable lines are skipped, not fatal: the event vocabulary evolves and
 // logs written by other versions must still replay.
 fn read_record(meta_path: &Path, log_path: &Path) -> Result<SessionRecord> {
     let meta = serde_json::from_slice(&fs::read(meta_path)?)?;
-    let bytes = match fs::read(log_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let bytes = fs::read(log_path)?;
     let events = complete_lines(&bytes)
         .filter_map(|line| serde_json::from_slice(line).ok())
         .collect();
@@ -174,47 +378,14 @@ fn meta_stem(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::EventKind;
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    fn write_session(
-        store: &Store,
-        stem: &str,
-        provider: &str,
-        session: &str,
-        events: &[Event],
-    ) {
-        let meta = SessionMeta {
-            provider: provider.to_owned(),
-            session: session.to_owned(),
-            pane_id: None,
-            pid: None,
-            cwd: None,
-            transcript_path: None,
-            updated_at: Utc::now(),
-        };
-        fs::write(
-            store.sessions_dir().join(format!("{stem}.meta.json")),
-            serde_json::to_vec_pretty(&meta).unwrap(),
-        )
-        .unwrap();
-        let mut log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(store.sessions_dir().join(format!("{stem}.jsonl")))
-            .unwrap();
-        for event in events {
-            let mut line = serde_json::to_vec(event).unwrap();
-            line.push(b'\n');
-            log.write_all(&line).unwrap();
-        }
-    }
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     fn event(session: &str, kind: EventKind) -> Event {
         Event {
             v: 1,
-            ts: Some(Utc::now()),
+            ts: None,
             session: session.to_owned(),
             transcript: None,
             kind,
@@ -222,48 +393,330 @@ mod tests {
     }
 
     #[test]
-    fn reads_session_records() {
+    fn append_read_roundtrip_and_stamp_timestamp() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
-        write_session(
-            &store,
-            "session-1",
-            "test",
-            "s1",
-            &[event("s1", EventKind::TurnStart { summary: None })],
-        );
+        let input = event("session-1", EventKind::TurnStart { summary: None });
+
+        store.append("test", &input, None).unwrap();
 
         let records = store.sessions().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].meta.provider, "test");
-        assert_eq!(records[0].meta.session, "s1");
+        assert_eq!(records[0].meta.session, "session-1");
         assert_eq!(records[0].events.len(), 1);
+        assert!(records[0].events[0].ts.is_some());
+        assert!(input.ts.is_none());
+    }
+
+    #[test]
+    fn meta_keeps_the_latest_transcript_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let mut with_path = event("session-1", EventKind::TurnStart { summary: None });
+        with_path.transcript = Some("/tmp/one.jsonl".into());
+        store.append("test", &with_path, None).unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].meta.transcript_path.as_deref(),
+            Some("/tmp/one.jsonl")
+        );
+
+        // An event without a transcript keeps the recorded path…
+        let without = event("session-1", EventKind::TurnEnd { summary: None });
+        store.append("test", &without, None).unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].meta.transcript_path.as_deref(),
+            Some("/tmp/one.jsonl")
+        );
+
+        // …and a newer transcript replaces it.
+        let mut newer = event("session-1", EventKind::TurnStart { summary: None });
+        newer.transcript = Some("/tmp/two.jsonl".into());
+        store.append("test", &newer, None).unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].meta.transcript_path.as_deref(),
+            Some("/tmp/two.jsonl")
+        );
+    }
+
+    #[test]
+    fn append_debug_maps_non_empty_events_to_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let events = vec![event("session-1", EventKind::TurnStart { summary: None })];
+        let result = Ok(events.clone());
+
+        store
+            .append_debug("test", br#"{"raw":true}"#, &result, None)
+            .unwrap();
+
+        let stem = store.find_stem(&session_id("test", "session-1")).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join(format!("{stem}.debug.jsonl"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["provider"], "test");
+        assert_eq!(record["events"], serde_json::to_value(events).unwrap());
+        assert_eq!(record["payload"], serde_json::json!({"raw": true}));
+        assert!(record.get("payload_raw").is_none());
+    }
+
+    #[test]
+    fn names_session_files_with_date_cmd_and_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let loc = AgentLocation {
+            pid: 1,
+            pane_id: None,
+            cwd: Some(PathBuf::from("/tmp/My Project")),
+        };
+        store
+            .append(
+                "claude",
+                &event("s1", EventKind::TurnStart { summary: None }),
+                Some(&loc),
+            )
+            .unwrap();
+
+        let sid = session_id("claude", "s1");
+        let stem = store.find_stem(&sid).unwrap();
+        assert_eq!(
+            stem,
+            format!(
+                "{}-My-Project-claude-{sid}",
+                Local::now().format("%Y-%m-%d")
+            )
+        );
+
+        // A later append without a location reuses the stem.
+        store
+            .append(
+                "claude",
+                &event("s1", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.sessions().unwrap()[0].events.len(), 2);
+    }
+
+    #[test]
+    fn keeps_appending_to_pre_rename_bare_sid_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let sid = session_id("test", "s1");
+        atomic::write(
+            &store.sessions_dir().join(format!("{sid}.jsonl")),
+            b"{\"v\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"session\":\"s1\",\"kind\":\"turn_start\"}\n",
+            false,
+        )
+        .unwrap();
+
+        store
+            .append(
+                "test",
+                &event("s1", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(store.find_stem(&sid).unwrap(), sid);
+        assert!(store
+            .sessions_dir()
+            .join(format!("{sid}.meta.json"))
+            .exists());
+    }
+
+    #[test]
+    fn append_debug_maps_empty_events_to_fallback_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+
+        store
+            .append_debug("test", b"{}", &Ok(Vec::new()), None)
+            .unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["events"], serde_json::json!([]));
+        assert!(record.get("error").is_none());
+    }
+
+    #[test]
+    fn append_debug_records_errors_without_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let result = Err(anyhow::anyhow!("normalize failed"));
+
+        store.append_debug("test", b"{}", &result, None).unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["error"], "normalize failed");
+        assert!(record.get("events").is_none());
+    }
+
+    #[test]
+    fn append_debug_preserves_non_json_payload_as_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+
+        store
+            .append_debug("test", b"not json", &Ok(Vec::new()), None)
+            .unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["payload_raw"], "not json");
+        assert!(record.get("payload").is_none());
+    }
+
+    #[test]
+    fn append_debug_preserves_json_payload_as_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+
+        store
+            .append_debug("test", br#"{"raw":true}"#, &Ok(Vec::new()), None)
+            .unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(store.sessions_dir().join("_unmapped.debug.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["payload"], serde_json::json!({"raw": true}));
+        assert!(record.get("payload_raw").is_none());
+    }
+
+    #[test]
+    fn throttles_consecutive_heartbeats_and_refreshes_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let heartbeat = event("session-1", EventKind::Heartbeat { activity: None });
+        store.append("test", &heartbeat, None).unwrap();
+        let before = store.sessions().unwrap().remove(0).meta.updated_at;
+        thread::sleep(StdDuration::from_millis(2));
+
+        store.append("test", &heartbeat, None).unwrap();
+
+        let record = store.sessions().unwrap().remove(0);
+        assert_eq!(record.events.len(), 1);
+        assert!(record.meta.updated_at > before);
+
+        // A changed activity is not throttled: the panel shows the new tool.
+        let edit = event(
+            "session-1",
+            EventKind::Heartbeat {
+                activity: Some("Edit".into()),
+            },
+        );
+        store.append("test", &edit, None).unwrap();
+        assert_eq!(store.sessions().unwrap().remove(0).events.len(), 2);
+    }
+
+    #[test]
+    fn refreshes_and_preserves_location_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let first = AgentLocation {
+            pid: 42,
+            pane_id: Some("%7".to_owned()),
+            cwd: Some(PathBuf::from("/tmp/project")),
+        };
+        store
+            .append(
+                "test",
+                &event("session-1", EventKind::TurnStart { summary: None }),
+                Some(&first),
+            )
+            .unwrap();
+
+        store
+            .append(
+                "test",
+                &event("session-1", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+
+        let meta = store.sessions().unwrap().remove(0).meta;
+        assert_eq!(meta.pid, Some(42));
+        assert_eq!(meta.pane_id.as_deref(), Some("%7"));
+        assert_eq!(meta.cwd, Some(PathBuf::from("/tmp/project")));
+    }
+
+    #[test]
+    fn concurrent_appends_keep_meta_parseable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path().join("state")).unwrap());
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let loc = AgentLocation {
+                        pid: index,
+                        pane_id: if index % 2 == 0 {
+                            None
+                        } else {
+                            Some("%a-much-longer-pane-id".to_owned())
+                        },
+                        cwd: Some(PathBuf::from("/")),
+                    };
+                    barrier.wait();
+                    for _ in 0..10 {
+                        store
+                            .append(
+                                "test",
+                                &event("shared", EventKind::TurnStart { summary: None }),
+                                Some(&loc),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.sessions().unwrap().len(), 1);
     }
 
     #[test]
     fn sweep_removes_stale_session_files() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
-        write_session(
-            &store,
-            "old",
-            "test",
-            "old",
-            &[event("old", EventKind::TurnEnd { summary: None })],
-        );
-        write_session(
-            &store,
-            "new",
-            "test",
-            "new",
-            &[event("new", EventKind::TurnEnd { summary: None })],
-        );
-
-        let old_meta_path = store.sessions_dir().join("old.meta.json");
+        store
+            .append(
+                "test",
+                &event("old", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+        store
+            .append(
+                "test",
+                &event("new", EventKind::TurnEnd { summary: None }),
+                None,
+            )
+            .unwrap();
+        let (_, old_meta_path) = store.paths("test", "old", None);
         let mut old_meta: SessionMeta =
             serde_json::from_slice(&fs::read(&old_meta_path).unwrap()).unwrap();
         old_meta.updated_at = Utc::now() - Duration::days(2);
-        fs::write(&old_meta_path, serde_json::to_vec(&old_meta).unwrap()).unwrap();
+        atomic::write(
+            &old_meta_path,
+            &serde_json::to_vec(&old_meta).unwrap(),
+            true,
+        )
+        .unwrap();
 
         store.sweep(Duration::days(1)).unwrap();
 
@@ -277,18 +730,19 @@ mod tests {
     fn skips_lines_it_cannot_parse_and_keeps_the_rest() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
-        write_session(
-            &store,
-            "mixed",
-            "mixed",
-            "s",
-            &[event("s", EventKind::TurnStart { summary: None })],
-        );
+        store
+            .append(
+                "mixed",
+                &event("s", EventKind::TurnStart { summary: None }),
+                None,
+            )
+            .unwrap();
+        let (log, _) = store.paths("mixed", "s", None);
         // A partial tail, garbage, and a line from a retired vocabulary
         // (attention kind `notification`) must not take the session down.
         OpenOptions::new()
             .append(true)
-            .open(store.sessions_dir().join("mixed.jsonl"))
+            .open(log)
             .unwrap()
             .write_all(
                 b"not json\n{\"v\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"session\":\"s\",\"kind\":\"attention\",\"attention\":\"notification\"}\n{\"v\":1",

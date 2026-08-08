@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gw_core::config::{Config, PanelView};
 
+mod hook;
 mod panel;
+mod setup;
 mod tui;
 
 #[derive(Parser)]
@@ -22,6 +24,17 @@ enum Cmd {
         /// Initial agent view. Overrides [panel].default_view in the config.
         #[arg(long, value_enum)]
         view: Option<ViewArg>,
+    },
+    /// Ingest one hook payload from stdin for the given provider.
+    Hook { provider: String },
+    /// Install hooks into provider configs (global).
+    Setup {
+        /// Remove previously installed hooks instead.
+        #[arg(long)]
+        remove: bool,
+        /// Install the detected provider integrations without prompting.
+        #[arg(short, long, conflicts_with = "remove")]
+        yes: bool,
     },
 }
 
@@ -54,6 +67,8 @@ fn main() -> Result<()> {
                 config.panel.default_view,
             ))
         }
+        Some(Cmd::Hook { provider }) => hook::run(&provider),
+        Some(Cmd::Setup { remove, yes }) => setup::run(remove, yes),
         None => {
             let config = Config::load();
             tui::run(resolve_panel_view(cli.view, config.panel.default_view))
@@ -99,5 +114,19 @@ mod tests {
                 view: Some(ViewArg::Current)
             })
         ));
+
+        assert!(Cli::try_parse_from(["gw", "hook", "claude", "--view", "global"]).is_err());
+    }
+
+    #[test]
+    fn setup_accepts_yes_but_not_with_remove() {
+        assert!(matches!(
+            Cli::try_parse_from(["gw", "setup", "--yes"]).unwrap().cmd,
+            Some(Cmd::Setup {
+                remove: false,
+                yes: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["gw", "setup", "--remove", "--yes"]).is_err());
     }
 }

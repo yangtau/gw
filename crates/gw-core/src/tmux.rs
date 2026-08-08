@@ -120,6 +120,24 @@ pub fn panes_from_topology(rows: &[TopologyRow]) -> Vec<TmuxSessionPane> {
         .collect()
 }
 
+/// Panes across all tmux sessions, deduplicated by pane id because grouped
+/// tmux sessions can report the same pane more than once.
+pub fn list_panes() -> Result<Vec<Pane>> {
+    Ok(panes_from_topology(&observe_topology()?)
+        .into_iter()
+        .map(|located| located.pane)
+        .collect())
+}
+
+/// Pane whose tty matches, if any.
+pub fn pane_for_tty(tty: &str) -> Result<Option<String>> {
+    let tty = normalize_tty(tty);
+    Ok(list_panes()?
+        .into_iter()
+        .find(|pane| normalize_tty(&pane.tty) == tty)
+        .map(|pane| pane.id))
+}
+
 /// Open a new window running `argv` in `cwd`; returns its exact tmux target.
 pub fn new_window(name: &str, cwd: &Path, argv: &[String]) -> Result<TmuxPaneTarget> {
     let mut args = vec![
@@ -299,6 +317,10 @@ fn parse_flag(stdout: &str, name: &str) -> Result<bool> {
     }
 }
 
+fn normalize_tty(tty: &str) -> &str {
+    tty.strip_prefix("/dev/").unwrap_or(tty)
+}
+
 fn parse_tmux_pane_target(stdout: &str) -> Result<TmuxPaneTarget> {
     let mut fields = stdout.trim().splitn(3, '\t');
     let tmux_session_id = fields.next().context("missing tmux session id")?;
@@ -408,6 +430,11 @@ mod tests {
         assert_eq!(panes[0].tmux_session_name, "attached");
         assert_eq!(panes[0].tmux_session_id, "$2");
         assert_eq!(panes[1].pane.id, "%4");
+    }
+
+    #[test]
+    fn normalizes_tty_prefix() {
+        assert_eq!(normalize_tty("/dev/ttys012"), normalize_tty("ttys012"));
     }
 
     #[test]
