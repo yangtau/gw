@@ -516,7 +516,7 @@ What the shipped plugins subscribe and how they map to unified events
 | claude   | `PermissionRequest`                                  | `attention` approval {tool: argument}         |
 | claude   | `PreToolUse` (`AskUserQuestion\|ExitPlanMode`)       | `attention` question {first question / plan}  |
 | claude   | `Notification` (`elicitation_dialog\|agent_needs_input`) | `attention` question {message}           |
-| claude   | `PostToolUse`                                        | `heartbeat` {tool_name}                       |
+| claude   | `PostToolUse`                                        | `heartbeat` {tool summary}                    |
 | claude   | `PreCompact` / `PostCompact`                         | `heartbeat` {"compact"}                       |
 | claude   | `SubagentStart`                                      | `subagent_start` {agent_id, agent_type}       |
 | claude   | `SubagentStop`                                       | `subagent_end` {agent_id}                     |
@@ -526,7 +526,7 @@ What the shipped plugins subscribe and how they map to unified events
 | codex    | `SessionStart`                                       | `session_start` {model}                       |
 | codex    | `UserPromptSubmit`                                   | `turn_start` {prompt}                         |
 | codex    | `PermissionRequest`                                  | `attention` approval {command}                |
-| codex    | `PostToolUse`                                        | `heartbeat` {tool_name}                       |
+| codex    | `PostToolUse`                                        | `heartbeat` {tool summary}                    |
 | codex    | `PreCompact` / `PostCompact`                         | `heartbeat` {"compact"}                       |
 | codex    | `SubagentStart`                                      | `subagent_start` {agent_id, agent_type, model} |
 | codex    | `SubagentStop`                                       | `subagent_end` {agent_id}                     |

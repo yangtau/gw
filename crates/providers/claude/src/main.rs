@@ -117,8 +117,11 @@ fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
             }),
             _ => None,
         },
+        // Detailed activity ("Bash: cargo test") so the panel matches
+        // amp/opencode/pi. Falls back to the bare tool name when tool_input
+        // is absent or has no display-worthy field.
         "PostToolUse" => Some(EventKind::Heartbeat {
-            activity: text(payload, "tool_name"),
+            activity: tool_summary(payload),
         }),
         "PreCompact" | "PostCompact" => Some(EventKind::Heartbeat {
             activity: Some("compact".into()),
@@ -145,13 +148,16 @@ fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
 }
 
 /// "Bash: rm -rf build" — tool name plus its most telling argument.
+/// Shared by `PermissionRequest` (approval summary) and `PostToolUse`
+/// (heartbeat activity). Keys mirror the amp/opencode/pi bridges so an
+/// operator jumping between providers sees the same shape.
 fn tool_summary(payload: &Map<String, Value>) -> Option<String> {
     let tool = payload.get("tool_name").and_then(Value::as_str)?;
     let argument = payload
         .get("tool_input")
         .and_then(Value::as_object)
         .and_then(|input| {
-            ["command", "file_path", "description"]
+            ["command", "file_path", "path", "query", "description"]
                 .iter()
                 .find_map(|key| input.get(*key).and_then(Value::as_str))
         });
@@ -204,6 +210,7 @@ mod tests {
                 },
             ),
             (
+                // No tool_input → fall back to the bare tool name.
                 r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash"}"#,
                 EventKind::Heartbeat {
                     activity: Some("Bash".into()),
@@ -240,6 +247,53 @@ mod tests {
             assert_eq!(event.kind, expected_kind);
             assert_eq!(event.ts, None);
         }
+    }
+
+    #[test]
+    fn post_tool_use_carries_detailed_activity() {
+        // Bash-style: command is the telling argument.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("Bash: cargo test".into()),
+            }
+        );
+
+        // Read/Write/Edit: file_path is the telling argument.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{"file_path":"/tmp/a.rs"}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("Write: /tmp/a.rs".into()),
+            }
+        );
+
+        // WebSearch: query is the telling argument.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"WebSearch","tool_input":{"query":"rust lifetimes"}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("WebSearch: rust lifetimes".into()),
+            }
+        );
+
+        // Unrecognized fields → fall back to the bare tool name, not raw JSON.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"WebFetch","tool_input":{"url":"https://example.com"}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("WebFetch".into()),
+            }
+        );
     }
 
     #[test]

@@ -92,8 +92,11 @@ fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
                 summary: Some(summary),
             })
         }
+        // Detailed activity ("shell: cargo test") so the panel matches
+        // amp/opencode/pi. Falls back to the bare tool name when tool_input
+        // is absent or carries no display-worthy field.
         "PostToolUse" => Some(EventKind::Heartbeat {
-            activity: text(payload, "tool_name"),
+            activity: tool_activity(payload),
         }),
         "PreCompact" | "PostCompact" => Some(EventKind::Heartbeat {
             activity: Some("compact".into()),
@@ -132,6 +135,46 @@ fn approval_summary(payload: &Map<String, Value>) -> Option<String> {
     one_liner(&raw)
 }
 
+/// "shell: cargo test" — heartbeat-friendly variant of `approval_summary`.
+/// Unlike the approval summary, the activity flavor falls back to the bare
+/// tool name (never a raw-JSON blob) so a `Bash` heartbeat never turns into
+/// an unreadable one-liner. Keys mirror the amp/opencode/pi bridges.
+fn tool_activity(payload: &Map<String, Value>) -> Option<String> {
+    let tool_name = payload.get("tool_name").and_then(Value::as_str)?;
+    let detail = payload
+        .get("tool_input")
+        .and_then(Value::as_object)
+        .and_then(|input| {
+            command_argument(input.get("command")).or_else(|| {
+                ["file_path", "path", "query", "description"]
+                    .iter()
+                    .find_map(|key| input.get(*key).and_then(Value::as_str).map(str::to_owned))
+            })
+        });
+    match detail.as_deref().and_then(one_liner) {
+        Some(detail) => one_liner(&format!("{tool_name}: {detail}")),
+        None => Some(tool_name.to_owned()),
+    }
+}
+
+/// Codex's `command` is either a shell string or an argv array; both
+/// approval and activity summaries need the same rendering.
+fn command_argument(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(command) => Some(command.clone()),
+        Value::Array(argv) => Some(
+            argv.iter()
+                .map(|arg| match arg {
+                    Value::String(arg) => arg.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +204,7 @@ mod tests {
                 },
             ),
             (
+                // No tool_input → fall back to the bare tool name.
                 r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"shell"}"#,
                 EventKind::Heartbeat {
                     activity: Some("shell".into()),
@@ -186,6 +230,55 @@ mod tests {
             assert_eq!(event.kind, expected_kind);
             assert_eq!(event.ts, None);
         }
+    }
+
+    #[test]
+    fn post_tool_use_carries_detailed_activity() {
+        // Codex canonical shape: `command` is an argv array.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"shell","tool_input":{"command":["cargo","test"]}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("shell: cargo test".into()),
+            }
+        );
+
+        // Some tools carry `command` as a plain shell string.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"shell","tool_input":{"command":"cargo build"}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("shell: cargo build".into()),
+            }
+        );
+
+        // Non-shell tools may carry `file_path` or `query` instead.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{"file_path":"/tmp/a.rs"}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("Write: /tmp/a.rs".into()),
+            }
+        );
+
+        // Unrecognized fields → fall back to the bare tool name.
+        // Heartbeats never carry a raw-JSON blob — that stays exclusive to
+        // `PermissionRequest` where the user needs the full context.
+        assert_eq!(
+            event(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"custom","tool_input":{"weird":42}}"#
+            )
+            .kind,
+            EventKind::Heartbeat {
+                activity: Some("custom".into()),
+            }
+        );
     }
 
     #[test]
