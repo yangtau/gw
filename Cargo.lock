@@ -796,6 +796,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gw-provider-grok"
+version = "0.1.0"
+dependencies = [
+ "gw-plugin-protocol",
+ "gw-provider-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "gw-provider-opencode"
 version = "0.1.0"
 dependencies = [

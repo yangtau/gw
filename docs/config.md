@@ -73,7 +73,7 @@ no rotation or size cap.
 | Field         | When                          | Value                                                    |
 | ------------- | ----------------------------- | -------------------------------------------------------- |
 | `ts`          | always                        | RFC3339 UTC, stamped by gw at ingest                     |
-| `provider`    | always                        | provider id (`claude` / `codex` / `amp` / `opencode` / `pi`) |
+| `provider`    | always                        | provider id (`claude` / `codex` / `amp` / `opencode` / `pi` / `grok`) |
 | `events`      | normalize succeeded           | the normalized events verbatim (their `ts` is `null`); `[]` if empty |
 | `error`       | normalize failed              | the error string; replaces `events`                      |
 | `payload`     | raw payload is valid JSON     | the payload embedded as JSON (so it is `jq`-able)        |

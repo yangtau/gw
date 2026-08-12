@@ -1,7 +1,7 @@
 # gw
 
 A tmux-native status panel for coding agents. Summon one popup and see every
-Claude / Codex / Amp / OpenCode / Pi / (your own) agent running across your tmux sessions — what
+Claude / Codex / Amp / OpenCode / Pi / Grok / (your own) agent running across your tmux sessions — what
 each is doing, which one is blocked on you — then press `enter` to jump straight
 to it.
 
@@ -92,6 +92,7 @@ cargo install --path crates/providers/codex
 cargo install --path crates/providers/amp
 cargo install --path crates/providers/opencode
 cargo install --path crates/providers/pi
+cargo install --path crates/providers/grok
 ```
 
 Then install the provider hooks:
@@ -171,7 +172,8 @@ available under the [MIT License](LICENSE).
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust
   plugin authors.
 - `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp`,
-  `crates/providers/opencode`, `crates/providers/pi` — official provider plugins.
+  `crates/providers/opencode`, `crates/providers/pi`, `crates/providers/grok` —
+  official provider plugins.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
 tracking that TUI's foreground thread; runner/execute modes and background
@@ -187,6 +189,13 @@ already-running TUI after setup.
 OpenCode support targets its interactive TUI; commands such as `run`, `serve`,
 `web`, and `attach` are excluded from pane discovery. `gw setup` installs the
 observer plugin at `~/.config/opencode/plugins/gw.ts`; restart OpenCode after setup.
+
+Grok Build support targets its interactive TUI. Headless (`-p`) and `grok agent`
+are excluded from pane discovery. `gw setup` installs hooks at
+`~/.grok/hooks/gw.json` (always trusted — no `/hooks-trust` step). Restart Grok
+or reload hooks with `/hooks` after setup. Grok has no `PermissionRequest` hook;
+approvals are observed from `Notification(permission_prompt)`, and questions
+from `ask_user_question` / `exit_plan_mode`.
 
 Design notes live in [docs/design.md](docs/design.md); vocabulary in
 [CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).
