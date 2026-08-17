@@ -1,7 +1,7 @@
 # gw
 
 A tmux-native status panel for coding agents. Summon one popup and see every
-Claude / Codex / Amp / OpenCode / Pi / Grok / (your own) agent running across your tmux sessions — what
+Claude / Codex / Amp / OpenCode / Pi / Grok / Cursor / (your own) agent running across your tmux sessions — what
 each is doing, which one is blocked on you — then press `enter` to jump straight
 to it.
 
@@ -93,6 +93,7 @@ cargo install --path crates/providers/amp
 cargo install --path crates/providers/opencode
 cargo install --path crates/providers/pi
 cargo install --path crates/providers/grok
+cargo install --path crates/providers/cursor
 ```
 
 Then install the provider hooks:
@@ -172,8 +173,8 @@ available under the [MIT License](LICENSE).
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust
   plugin authors.
 - `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp`,
-  `crates/providers/opencode`, `crates/providers/pi`, `crates/providers/grok` —
-  official provider plugins.
+  `crates/providers/opencode`, `crates/providers/pi`, `crates/providers/grok`,
+  `crates/providers/cursor` — official provider plugins.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
 tracking that TUI's foreground thread; runner/execute modes and background
@@ -196,6 +197,12 @@ are excluded from pane discovery. `gw setup` installs hooks at
 or reload hooks with `/hooks` after setup. Grok has no `PermissionRequest` hook;
 approvals are observed from `Notification(permission_prompt)`, and questions
 from `ask_user_question` / `exit_plan_mode`.
+
+Cursor Agent CLI support targets the interactive TUI (`cursor-agent` / `agent`).
+Headless (`-p` / `--print`), `acp`, and `worker` are excluded from pane
+discovery. `gw setup` installs hooks at `~/.cursor/hooks.json` (Cursor reloads
+that file automatically). Cursor has no `PermissionRequest` or question hook;
+a Cursor Agent can reach every gw status except Attention.
 
 Design notes live in [docs/design.md](docs/design.md); vocabulary in
 [CONTEXT.md](CONTEXT.md); load-bearing decisions in [docs/adr/](docs/adr/).

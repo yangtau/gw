@@ -8,7 +8,7 @@ Glossary for `gw`, a tmux-native coding agent status panel (Rust TUI).
 A tmux pane in any tmux session running a known coding agent CLI. Identity is **discovery-based**: the tool finds Agents by scanning panes, regardless of how they were started; tmux panes are the single source of truth and the tool keeps no registry of its own.
 
 ### Provider
-A kind of coding agent CLI (e.g. claude, codex, amp, opencode, pi, grok). Defines how to recognize, launch, and interpret the state of Agents of that kind.
+A kind of coding agent CLI (e.g. claude, codex, amp, opencode, pi, grok, cursor). Defines how to recognize, launch, and interpret the state of Agents of that kind.
 
 ### Provider Plugin
 The implementation vehicle of a Provider: a standalone executable, discovered by naming convention, implementing a uniform plugin protocol. A plugin is a pure translator with no side effects: `manifest` describes the provider statically (process match rules, launch command, hook/config or managed-file install spec); `normalize` turns a provider hook payload (stdin) into unified events (stdout). Hook commands installed into provider configs invoke the core (`<tool> hook <provider>`), which delegates payload translation to the plugin and owns all event-log writing itself. Managed integration files, such as the Amp, OpenCode, and Pi TypeScript observer plugins, are likewise written only by the core from manifest data. Every provider — including official ones shipped with the tool — goes through the same protocol; there is no built-in fast path. Private providers live in separate repositories.

@@ -9,6 +9,17 @@ pub fn run(
     session_field: &str,
     map_kind: impl Fn(&Map<String, Value>) -> Option<EventKind>,
 ) {
+    run_session_fields(manifest, &[session_field], map_kind)
+}
+
+/// Like [`run`], but the session id is the first present field in
+/// `session_fields`. Cursor payloads use `conversation_id` on most events and
+/// `session_id` on session boundaries.
+pub fn run_session_fields(
+    manifest: Manifest,
+    session_fields: &[&str],
+    map_kind: impl Fn(&Map<String, Value>) -> Option<EventKind>,
+) {
     let mut args = std::env::args_os().skip(1);
     let command = args.next();
 
@@ -18,7 +29,7 @@ pub fn run(
 
     match command.as_deref().and_then(|value| value.to_str()) {
         Some("manifest") => print_manifest(&manifest),
-        Some("normalize") => print_events(session_field, map_kind),
+        Some("normalize") => print_events(session_fields, map_kind),
         _ => usage(),
     }
 }
@@ -45,7 +56,10 @@ fn print_manifest(manifest: &Manifest) {
     let _ = writeln!(std::io::stdout().lock(), "{json}");
 }
 
-fn print_events(session_field: &str, map_kind: impl Fn(&Map<String, Value>) -> Option<EventKind>) {
+fn print_events(
+    session_fields: &[&str],
+    map_kind: impl Fn(&Map<String, Value>) -> Option<EventKind>,
+) {
     let mut payload = Vec::new();
     if std::io::stdin().read_to_end(&mut payload).is_err() {
         return;
@@ -53,7 +67,7 @@ fn print_events(session_field: &str, map_kind: impl Fn(&Map<String, Value>) -> O
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    for event in normalize(session_field, map_kind, &payload) {
+    for event in normalize_session_fields(session_fields, map_kind, &payload) {
         let Ok(json) = serde_json::to_string(&event) else {
             return;
         };
@@ -68,13 +82,26 @@ pub fn normalize(
     map_kind: impl Fn(&Map<String, Value>) -> Option<EventKind>,
     raw: &[u8],
 ) -> Vec<Event> {
+    normalize_session_fields(&[session_field], map_kind, raw)
+}
+
+pub fn normalize_session_fields(
+    session_fields: &[&str],
+    map_kind: impl Fn(&Map<String, Value>) -> Option<EventKind>,
+    raw: &[u8],
+) -> Vec<Event> {
     let Ok(payload) = serde_json::from_slice::<Value>(raw) else {
         return Vec::new();
     };
     let Some(payload) = payload.as_object() else {
         return Vec::new();
     };
-    let Some(session) = payload.get(session_field).and_then(Value::as_str) else {
+    let Some(session) = session_fields.iter().find_map(|field| {
+        payload
+            .get(*field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    }) else {
         return Vec::new();
     };
     let Some(kind) = map_kind(payload) else {
@@ -107,6 +134,22 @@ pub fn command_hook_patch(provider: &str, event: &str, matcher: Option<&str>) ->
             "command": format!("gw hook {provider}")
         }]),
     );
+    Patch {
+        pointer: format!("/hooks/{event}"),
+        mode: PatchMode::Ensure,
+        value: Value::Object(value),
+    }
+}
+
+/// Build the command-hook patch for providers whose hook file is a flat
+/// `{ command, matcher? }` array (Cursor `hooks.json`), not Claude's nested
+/// `{ hooks: [{ type, command }] }` shape.
+pub fn flat_command_hook_patch(provider: &str, event: &str, matcher: Option<&str>) -> Patch {
+    let mut value = Map::new();
+    value.insert("command".into(), json!(format!("gw hook {provider}")));
+    if let Some(matcher) = matcher {
+        value.insert("matcher".into(), json!(matcher));
+    }
     Patch {
         pointer: format!("/hooks/{event}"),
         mode: PatchMode::Ensure,
@@ -160,6 +203,24 @@ mod tests {
     fn ignores_missing_or_non_string_session_field() {
         assert!(normalize("session_id", session_end, br#"{}"#).is_empty());
         assert!(normalize("session_id", session_end, br#"{"session_id":1}"#).is_empty());
+        assert!(normalize("session_id", session_end, br#"{"session_id":""}"#).is_empty());
+    }
+
+    #[test]
+    fn session_fields_prefer_the_first_present_nonempty_name() {
+        let events = normalize_session_fields(
+            &["conversation_id", "session_id"],
+            session_end,
+            br#"{"session_id":"s1"}"#,
+        );
+        assert_eq!(events[0].session, "s1");
+
+        let events = normalize_session_fields(
+            &["conversation_id", "session_id"],
+            session_end,
+            br#"{"conversation_id":"c1","session_id":"s1"}"#,
+        );
+        assert_eq!(events[0].session, "c1");
     }
 
     #[test]
@@ -209,6 +270,23 @@ mod tests {
         let unmatched = command_hook_patch("codex", "Stop", None);
         assert!(unmatched.value.get("matcher").is_none());
         assert_eq!(unmatched.value["hooks"][0]["command"], "gw hook codex");
+    }
+
+    #[test]
+    fn flat_command_hook_patch_uses_cursor_entry_shape() {
+        let patch = flat_command_hook_patch("cursor", "sessionStart", None);
+        assert_eq!(patch.pointer, "/hooks/sessionStart");
+        assert_eq!(patch.mode, PatchMode::Ensure);
+        assert_eq!(patch.value, json!({ "command": "gw hook cursor" }));
+
+        let matched = flat_command_hook_patch("cursor", "preToolUse", Some("Shell"));
+        assert_eq!(
+            matched.value,
+            json!({
+                "command": "gw hook cursor",
+                "matcher": "Shell"
+            })
+        );
     }
 
     #[test]

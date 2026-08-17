@@ -27,14 +27,14 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 - **Activity**: compact event timeline of the selected agent (recent turns, tool activity, attention, subagents from its Event Log; display only — the panel never touches the agent's window).
 - **Keys (v1)**: `j/k` or arrows move, `Enter` jumps, `n` launches (pick provider → new window in the panel's cwd → jump), `r` toggles the resumable-sessions view (`Enter` = new window running the provider's resume command), `tab` toggles current/global views, `a` selects the next Attention agent, `?` opens the keyboard-shortcuts page, and `Esc`/`Ctrl-C` quit.
 - **Notifications**: `gw hook` itself fires a desktop notification through macOS `osascript` after writing a configured event. Other platforms currently skip desktop notifications.
-- **Setup**: `gw setup` filters discovered plugins to agent CLIs available on the local `PATH`, displays the matching providers and target files, and requires explicit confirmation before installation (`--yes` is the non-interactive opt-in). Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. Removal still considers every discovered plugin so an integration can be cleaned up after its agent CLI is uninstalled. Providers may also declare a whole managed integration file: the core creates, hashes, upgrades, and removes it only while its ownership marker and body hash prove it remains unmodified. Amp, OpenCode, and Pi use this for their TypeScript observer integrations. Grok uses a dedicated hook file under `~/.grok/hooks/`. The panel does not report setup health; an uninstrumented provider remains Idle.
+- **Setup**: `gw setup` filters discovered plugins to agent CLIs available on the local `PATH`, displays the matching providers and target files, and requires explicit confirmation before installation (`--yes` is the non-interactive opt-in). Surgical merge only — preserve unrelated keys and formatting (claude's `settings.json` mixes user config with hooks), back up before writing, idempotent, reversible via `gw setup --remove`. Removal still considers every discovered plugin so an integration can be cleaned up after its agent CLI is uninstalled. Providers may also declare a whole managed integration file: the core creates, hashes, upgrades, and removes it only while its ownership marker and body hash prove it remains unmodified. Amp, OpenCode, and Pi use this for their TypeScript observer integrations. Grok uses a dedicated hook file under `~/.grok/hooks/`. Cursor uses the user-level `~/.cursor/hooks.json`. The panel does not report setup health; an uninstrumented provider remains Idle.
 
 ## Plugin protocol (v1 sketch)
 
 - Discovery: `gw-provider-*` on PATH and in `~/.config/gw/providers/bin/`.
 - `manifest` → JSON: protocol version, provider id, display label/color, process match rules (argv basename patterns plus excluded args/sequences), launch command, resume command template (`{session_id}`, `{cwd}`), hook install specs (target files, entries to merge), and optional managed integration files.
 - `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_focus`, `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `subagent_start`, `subagent_end`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields. `session_focus` changes correlation without changing status.
-- Official plugins: `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-pi`, `gw-provider-grok` (same workspace, same protocol, no fast path).
+- Official plugins: `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-pi`, `gw-provider-grok`, `gw-provider-cursor` (same workspace, same protocol, no fast path).
 
 ## Storage
 
@@ -48,7 +48,7 @@ Cargo workspace:
 - `gw-core` — domain: discovery, event model, Session interpretation (pure Status, Subagent, and Activity replay), correlation, log store, plugin client, tmux shell-out wrapper.
 - `gw` — the binary: CLI (`panel`, `hook`, `setup`), ratatui TUI (fullscreen alt-screen; `TuiEvent`/`AppEvent` split, single `tokio::select!` loop, frame coalescing — patterned after codex-rs's tui architecture).
 - `gw-plugin-protocol` — serde types for manifest/events, published for Rust plugin authors (the protocol itself is JSON-over-CLI; non-Rust plugins just follow the spec).
-- `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-pi`, `gw-provider-grok` — official plugin binaries.
+- `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-pi`, `gw-provider-grok`, `gw-provider-cursor` — official plugin binaries.
 
 ## Backlog
 

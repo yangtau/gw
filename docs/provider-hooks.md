@@ -1,6 +1,6 @@
 # Provider hook reference
 
-Authoritative reference for the hook systems of the six providers gw integrates
+Authoritative reference for the hook systems of the seven providers gw integrates
 with: what events exist, how hooks are configured, how the hook process is invoked,
 and the exact payload each event delivers. This is the factual basis for the unified
 event vocabulary in `protocol.md`.
@@ -23,10 +23,15 @@ Sources and confidence:
   documented; `Notification` type `permission_prompt` is inferred from the
   binary's notification vocabulary plus Claude-compatible naming (Grok has no
   `PermissionRequest` hook).
+- **cursor**: official Hooks reference (`cursor.com/docs/hooks`) and CLI
+  parameter docs (`cursor.com/docs/cli`), verified against Cursor Agent
+  2026.08.11-e8db854. Config keys and `hook_event_name` values are camelCase
+  (`sessionStart`, `beforeSubmitPrompt`, `stop`). There is no
+  `PermissionRequest` or `Notification` hook.
 
 ## Shared model
 
-Claude, Codex, and Grok run external hook commands that receive one JSON object on
+Claude, Codex, Grok, and Cursor run external hook commands that receive one JSON object on
 **stdin** and communicate back via exit code (and optionally stdout JSON for
 decision-making hooks). Amp, OpenCode, and Pi instead deliver typed events to TypeScript
 integrations; gw installs small observer files that forward compact JSON to
@@ -555,26 +560,106 @@ gates. Other events default to 5s. Failures fail-open.
 
 ---
 
+## cursor
+
+### Configuration and invocation
+
+- User hooks live at `~/.cursor/hooks.json` (schema version 1). Project hooks
+  under `<repo>/.cursor/hooks.json` are for that repository only; gw installs
+  the user file so every Cursor Agent CLI session is observed.
+- `gw setup` writes `version: 1` (kept on uninstall) and surgical `ensure`
+  patches for each subscribed event. Cursor watches the file and reloads it
+  automatically.
+- The hook command is spawned as a process. JSON arrives on stdin; Cursor also
+  sets `CURSOR_PROJECT_DIR` / `CURSOR_VERSION` / `CURSOR_TRANSCRIPT_PATH` in
+  the environment. gw reads stdin only.
+- Hook entries are a flat `{ "command": "gw hook cursor" }` object, not
+  Claude's nested `{ hooks: [{ type, command }] }` shape. `gw hook cursor`
+  writes nothing to stdout and always exits 0 after reading the payload, so
+  it cannot deny a `preToolUse` or inject a `stop` follow-up.
+- Process discovery targets the interactive TUI (`cursor-agent`, or `agent`
+  from the official installer). Headless (`-p` / `--print`), `acp`, and
+  `worker` are excluded, along with utility subcommands (`login`, `models`,
+  `mcp`, …).
+
+### Common payload fields
+
+Every agent hook includes:
+
+| Field              | Type             | Notes                                                                 |
+| ------------------ | ---------------- | --------------------------------------------------------------------- |
+| `conversation_id`  | string           | stable native session id across turns                                 |
+| `generation_id`    | string           | changes with every user message                                       |
+| `model`            | string           | legacy model slug                                                     |
+| `model_id`         | string, optional | structured model id when available                                    |
+| `hook_event_name`  | string           | camelCase event name (`sessionStart`, `beforeSubmitPrompt`, `stop`)   |
+| `cursor_version`   | string           |                                                                       |
+| `workspace_roots`  | string[]         |                                                                       |
+| `transcript_path`  | string \| null   | path to the conversation transcript; null if transcripts are disabled |
+
+`sessionStart` / `sessionEnd` also carry `session_id`, documented as the same
+value as `conversation_id`. `gw show --transcript` uses the hook-captured
+`transcript_path`, falling back to
+`~/.cursor/projects/*/agent-transcripts/{session_id}/{session_id}.jsonl`.
+
+### Events relevant to gw
+
+| Event                 | Extra fields                                                                 | Notes                                                                                                                                     |
+| --------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessionStart`        | `session_id`, `is_background_agent`, `composer_mode`                         | fire-and-forget; `session_id` equals `conversation_id`                                                                                    |
+| `beforeSubmitPrompt`  | `prompt`, `attachments`                                                      | Claude's `UserPromptSubmit`. Can block submission; gw stays silent                                                                        |
+| `postToolUse`         | `tool_name`, `tool_input`, `tool_output`, `tool_use_id`, `duration`          | success only                                                                                                                              |
+| `preCompact`          | `trigger`: `auto` / `manual`                                                 | observational                                                                                                                             |
+| `subagentStart`       | `subagent_id`, `subagent_type`, `task`, `subagent_model`                     | fires with the parent's `conversation_id`                                                                                                 |
+| `subagentStop`        | `subagent_type`, `status`, `task`, `summary`                                 | documented payload has **no** `subagent_id`; gw emits `subagent_end` only when an id is present                                           |
+| `stop`                | `status`: `completed` / `aborted` / `error`, `loop_count`                    | turn boundary. `error` is a failure; `aborted` settles as Done. Returning `followup_message` would auto-continue — gw writes nothing      |
+| `sessionEnd`          | `session_id`, `reason`, `duration_ms`                                        |                                                                                                                                           |
+
+Notably absent vs claude: no `PermissionRequest`, no `Notification`, no
+`StopFailure` (failures arrive as `stop` with `status: "error"`). Approvals
+are the CLI permission prompt. `beforeShellExecution` / `preToolUse` fire for
+every matching tool whether or not that prompt is showing, so gw does not
+subscribe — mapping them to Attention would false-trigger on `--force` and
+already-allowed commands. There is no `AskUserQuestion` / `exit_plan_mode`
+equivalent. A Cursor Agent can therefore reach every gw status except
+Attention.
+
+### Example payload (`beforeSubmitPrompt`)
+
+```json
+{
+  "hook_event_name": "beforeSubmitPrompt",
+  "conversation_id": "2cd828a4-8667-48c0-8cdd-2a8945e429b6",
+  "generation_id": "gen-1",
+  "model": "composer-2.5",
+  "prompt": "fix the tests",
+  "transcript_path": "/Users/me/.cursor/projects/…/agent-transcripts/2cd828a4-…/2cd828a4-….jsonl",
+  "workspace_roots": ["/Users/me/project"]
+}
+```
+
+---
+
 ## Cross-provider comparison
 
-| Capability          | claude                                              | codex                                            | amp                              | opencode                         | pi                                      | grok                                              |
-| ------------------- | --------------------------------------------------- | ------------------------------------------------ | -------------------------------- | -------------------------------- | --------------------------------------- | ------------------------------------------------- |
-| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus) | `session.created` / status busy  | `session_start` (reason)                | `SessionStart` (source)                           |
-| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                | `session.deleted`                | `session_shutdown`                      | `SessionEnd`                                      |
-| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                    | `chat.message`                   | `before_agent_start`                    | `UserPromptSubmit`                                |
-| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end`                      | `session.status` idle            | `agent_settled` after final `turn_end`   | `Stop` (`reason == end_turn`)                     |
-| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)            | `session.error`                  | assistant `stopReason == "error"`       | `StopFailure` (`error`)                           |
-| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | state `awaiting-approval`        | `permission.asked`               | cooperative `ui:prompt:opened` bus      | `Notification(permission_prompt)`                 |
-| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                    | `tool.execute.before`            | `tool_execution_start`                  | `PreToolUse` / `PostToolUse`                      |
-| Typed notifications | `Notification`                                      | —                                                | —                                | —                                | —                                       | `Notification`                                    |
-| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                | child sessions (ignored)         | — (extension-specific, no shared event) | `SubagentStart` / `SubagentStop`                  |
-| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                | `session.compacted`              | `session_before_compact`/`session_compact` | `PreCompact` / `PostCompact`                   |
-| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                      | Session `id`                     | `SessionManager.getSessionId()`         | `sessionId`                                       |
-| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + feature flag             | Amp global plugin                | OpenCode global plugin           | Pi global extension                     | `~/.grok/hooks/*.json`                            |
+| Capability          | claude                                              | codex                                            | amp                              | opencode                         | pi                                      | grok                                              | cursor                                            |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------ | -------------------------------- | -------------------------------- | --------------------------------------- | ------------------------------------------------- | ------------------------------------------------- |
+| Session begin/focus | `SessionStart` (source)                             | `SessionStart` (source)                          | `session.start` (begin or focus) | `session.created` / status busy  | `session_start` (reason)                | `SessionStart` (source)                           | `sessionStart`                                    |
+| Session end         | `SessionEnd` (end_reason)                           | —                                                | —                                | `session.deleted`                | `session_shutdown`                      | `SessionEnd`                                      | `sessionEnd`                                      |
+| Turn begin          | `UserPromptSubmit`                                  | `UserPromptSubmit` (turn_id)                     | `agent.start`                    | `chat.message`                   | `before_agent_start`                    | `UserPromptSubmit`                                | `beforeSubmitPrompt`                              |
+| Turn end            | `Stop` (last_assistant_message)                     | `Stop` (last_assistant_message)                  | `agent.end`                      | `session.status` idle            | `agent_settled` after final `turn_end`   | `Stop` (`reason == end_turn`)                     | `stop` (`completed` / `aborted`)                  |
+| Turn failed         | `StopFailure` (error_type)                          | —                                                | `agent.end` (`error`)            | `session.error`                  | assistant `stopReason == "error"`       | `StopFailure` (`error`)                           | `stop` (`error`)                                  |
+| Approval dialog     | `PermissionRequest`                                 | `PermissionRequest`                              | state `awaiting-approval`        | `permission.asked`               | cooperative `ui:prompt:opened` bus      | `Notification(permission_prompt)`                 | —                                                |
+| Tool activity       | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `PreToolUse` / `PostToolUse`                     | `tool.result`                    | `tool.execute.before`            | `tool_execution_start`                  | `PreToolUse` / `PostToolUse`                      | `postToolUse`                                     |
+| Typed notifications | `Notification`                                      | —                                                | —                                | —                                | —                                       | `Notification`                                    | —                                                |
+| Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                | child sessions (ignored)         | — (extension-specific, no shared event) | `SubagentStart` / `SubagentStop`                  | `subagentStart` / `subagentStop`                  |
+| Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                | `session.compacted`              | `session_before_compact`/`session_compact` | `PreCompact` / `PostCompact`                   | `preCompact`                                      |
+| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                      | Session `id`                     | `SessionManager.getSessionId()`         | `sessionId`                                       | `conversation_id` (`session_id` on boundaries)    |
+| Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + feature flag             | Amp global plugin                | OpenCode global plugin           | Pi global extension                     | `~/.grok/hooks/*.json`                            | `~/.cursor/hooks.json`                            |
 
 Consequences for gw:
 
-- Claude, Amp, OpenCode, Pi, and Grok report turn failures. A Codex agent killed by a rate limit
+- Claude, Amp, OpenCode, Pi, Grok, and Cursor report turn failures. A Codex agent killed by a rate limit
   emits nothing and decays through Working → Stale.
 - Claude and Codex expose dedicated approval events. Amp exposes approval as a
   thread state when a user permission policy is active. Pi has no built-in
@@ -583,6 +668,8 @@ Consequences for gw:
   user extension that shows a blocking prompt can produce Attention. Without
   at least one cooperating extension a Pi Agent cannot enter Attention.
   Grok likewise has no `PermissionRequest`; gw uses `Notification(permission_prompt)`.
+  Cursor has neither an approval hook nor a question hook; a Cursor Agent
+  cannot enter Attention.
 - Claude fires both `PermissionRequest` and `Notification(permission_prompt)`
   for the same dialog; a provider plugin must subscribe exactly one. Grok
   only has the notification.
@@ -650,6 +737,15 @@ What the shipped plugins subscribe and how they map to unified events
 | grok     | `Stop` (`end_turn` or no reason)                     | `turn_end` {lastAssistantMessage}             |
 | grok     | `StopFailure`                                        | `turn_error` {error, errorDetails}            |
 | grok     | `SessionEnd`                                         | `session_end`                                 |
+| cursor   | `sessionStart`                                       | `session_start` {model}                       |
+| cursor   | `beforeSubmitPrompt`                                 | `turn_start` {prompt}                         |
+| cursor   | `postToolUse`                                        | `heartbeat` {tool summary}                    |
+| cursor   | `preCompact`                                         | `heartbeat` {"compact"}                       |
+| cursor   | `subagentStart`                                      | `subagent_start` {subagent_id, type, model}   |
+| cursor   | `subagentStop` (when `subagent_id` is present)       | `subagent_end` {subagent_id}                  |
+| cursor   | `stop` (`completed` / `aborted` / no status)         | `turn_end`                                    |
+| cursor   | `stop` (`error`)                                     | `turn_error`                                  |
+| cursor   | `sessionEnd`                                         | `session_end`                                 |
 
 Deliberately unsubscribed on claude: `Notification` types `permission_prompt`
 (duplicate of `PermissionRequest`), `idle_prompt` (Done already expresses it),
@@ -679,3 +775,11 @@ than `permission_prompt` (`tool_execution` is activity noise); the session-end
 `Stop` (`reason: channel_closed` / `shutdown`) — `SessionEnd` is the boundary.
 `PreToolUse` is subscribed only for the question tools; every-tool PreToolUse
 would fire whether or not a permission prompt is showing.
+
+Deliberately unsubscribed on Cursor: `beforeShellExecution` / `preToolUse`
+(decision hooks that fire for every matching tool, not only when a permission
+prompt is showing); `postToolUseFailure` (the agent is still working); Tab,
+file, MCP-specific, and `afterAgentThought` hooks (noise or IDE-only);
+`afterAgentResponse` (assistant text mid-turn is not a turn boundary — `stop`
+is). `subagentStop` is subscribed but produces no event unless the payload
+carries a `subagent_id`, which the public schema omits.
