@@ -2,11 +2,11 @@
   "nodes": {
     "nix-rust-prebuilt": {
       "locked": {
-        "lastModified": 1786970272,
-        "narHash": "sha256-dE+j3PwKuYGPT/sG5gUQAmchJUI0Ic0iI7Lwgsx5USw=",
+        "lastModified": 1786970574,
+        "narHash": "sha256-WyMev0ZkZXZp6yToFu3RkyhcDaq+6pmb/PRe/wcP2/U=",
         "owner": "yangtau",
         "repo": "nix-rust-prebuilt",
-        "rev": "bff6d5f5f111172e86a065c7a9ffc6a5ddef7fa7",
+        "rev": "3719898054bdfc253859b16c063a80f933683c89",
         "type": "github"
       },
       "original": {
