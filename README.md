@@ -74,12 +74,15 @@ and configuration compatibility may still change between releases.
 
 ## Install
 
-There are no tagged binary releases yet. Install the latest development version
-directly from GitHub with Nix (installs `gw` and all official provider plugins):
+Each push to `main` publishes release binaries. Nix downloads those instead of
+compiling (installs `gw` and all official provider plugins):
 
 ```sh
 nix profile install github:yangtau/gw
 ```
+
+A dirty checkout, or a system with no published hash, builds from source.
+Force a source build with `nix build .#gw-from-source`.
 
 Or clone the repository and install with Cargo:
 
