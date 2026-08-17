@@ -9,17 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  GW_BINS: >-
-    gw
-    gw-provider-claude
-    gw-provider-codex
-    gw-provider-amp
-    gw-provider-opencode
-    gw-provider-pi
-    gw-provider-grok
-    gw-provider-cursor
-
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -47,129 +36,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   prebuilt:
-    name: Prebuilt (${{ matrix.system }})
-    if: >-
-      github.ref == 'refs/heads/main'
-      && (github.event_name == 'workflow_dispatch'
-          || (github.event_name == 'push'
-              && !contains(github.event.head_commit.message, 'record prebuilt hashes')))
-    needs: [test, lint]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            system: x86_64-linux
-          - os: ubuntu-24.04-arm
-            system: aarch64-linux
-          - os: macos-latest
-            system: aarch64-darwin
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: prebuilt-${{ matrix.system }}
-      - name: Build release binaries
-        env:
-          CARGO_PROFILE_RELEASE_STRIP: symbols
-        run: |
-          packages=()
-          for crate in $GW_BINS; do
-            packages+=(-p "$crate")
-          done
-          cargo build --release --locked "${packages[@]}"
-      - name: Package
-        run: tar -czf "gw-${{ matrix.system }}.tar.gz" -C target/release $GW_BINS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.system }}
-          path: gw-${{ matrix.system }}.tar.gz
-
-  publish-prebuilt:
     name: Publish prebuilt
     if: >-
       github.ref == 'refs/heads/main'
       && (github.event_name == 'workflow_dispatch'
           || (github.event_name == 'push'
               && !contains(github.event.head_commit.message, 'record prebuilt hashes')))
-    needs: [prebuilt]
-    runs-on: ubuntu-latest
+    needs: [test, lint]
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish release and record hashes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          sha="$GITHUB_SHA"
-          tag=prebuilt
-
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "Prebuilt binaries" --prerelease \
-              --notes "CI binaries for \`nix profile install github:yangtau/gw\`. Assets are \`gw-<system>-<git-sha>.tar.gz\`."
-          fi
-
-          for archive in dist/gw-*.tar.gz; do
-            name=$(basename "$archive" .tar.gz)
-            named="dist/${name}-${sha}.tar.gz"
-            cp "$archive" "$named"
-            gh release upload "$tag" "$named" --clobber
-          done
-
-          python3 - "$sha" <<'PY'
-          import base64, hashlib, json, sys
-          from pathlib import Path
-
-          def sri(path):
-              digest = hashlib.sha256(Path(path).read_bytes()).digest()
-              return "sha256-" + base64.b64encode(digest).decode()
-
-          sha = sys.argv[1]
-          systems = [
-              "aarch64-darwin",
-              "aarch64-linux",
-              "x86_64-linux",
-          ]
-          Path("nix/prebuilt-hashes.json").write_text(
-              json.dumps(
-                  {
-                      "rev": sha,
-                      "hashes": {system: sri(f"dist/gw-{system}.tar.gz") for system in systems},
-                  },
-                  indent=2,
-              )
-              + "\n"
-          )
-          PY
-
-          git fetch origin main
-          if [ "$(git rev-parse origin/main)" != "$sha" ]; then
-            echo "main moved to $(git rev-parse origin/main); not recording hashes"
-            exit 0
-          fi
-
-          # Drop assets from older commits so the rolling release stays small.
-          while read -r asset; do
-            case "$asset" in
-              *"$sha"*) ;;
-              "") ;;
-              *) gh release delete-asset "$tag" "$asset" --yes ;;
-            esac
-          done < <(gh release view "$tag" --json assets --jq '.assets[].name')
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add nix/prebuilt-hashes.json
-          git diff --cached --quiet && exit 0
-          git commit -m "chore(nix): record prebuilt hashes for ${sha:0:7}"
-          git push origin HEAD:main
+    uses: yangtau/nix-prebuilt/.github/workflows/publish.yml@main
+    with:
+      name: gw
+      bins: >-
+        gw
+        gw-provider-claude
+        gw-provider-codex
+        gw-provider-amp
+        gw-provider-opencode
+        gw-provider-pi
+        gw-provider-grok
+        gw-provider-cursor
+    secrets: inherit
