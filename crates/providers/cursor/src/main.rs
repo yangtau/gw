@@ -6,22 +6,22 @@ use gw_provider_sdk::{excerpt, flat_command_hook_patch, one_liner, text};
 use serde_json::{json, Map, Value};
 
 fn main() {
-    gw_provider_sdk::run_session_fields(manifest(), &["conversation_id", "session_id"], map_kind);
+    gw_provider_sdk::run(manifest(), "conversation_id", map_kind);
 }
 
 // Cursor has no PermissionRequest or Notification hook. The CLI permission
 // prompt is not observable without treating every beforeShellExecution as
 // Attention, which fires whether or not a dialog is showing. Questions have
 // no provider-wide event either. Statuses other than Attention still work.
-const SUBSCRIPTIONS: [(&str, Option<&str>); 8] = [
-    ("sessionStart", None),
-    ("beforeSubmitPrompt", None),
-    ("postToolUse", None),
-    ("preCompact", None),
-    ("subagentStart", None),
-    ("subagentStop", None),
-    ("stop", None),
-    ("sessionEnd", None),
+const SUBSCRIPTIONS: [&str; 8] = [
+    "sessionStart",
+    "beforeSubmitPrompt",
+    "postToolUse",
+    "preCompact",
+    "subagentStart",
+    "subagentStop",
+    "stop",
+    "sessionEnd",
 ];
 
 fn manifest() -> Manifest {
@@ -33,7 +33,7 @@ fn manifest() -> Manifest {
     patches.extend(
         SUBSCRIPTIONS
             .into_iter()
-            .map(|(event, matcher)| flat_command_hook_patch("cursor", event, matcher)),
+            .map(|event| flat_command_hook_patch("cursor", event)),
     );
 
     Manifest {
@@ -114,103 +114,53 @@ fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
     let event_name = payload.get("hook_event_name").and_then(Value::as_str)?;
 
     match event_name {
-        "sessionStart" | "SessionStart" | "session_start" => Some(EventKind::SessionStart {
+        "sessionStart" => Some(EventKind::SessionStart {
             model: text(payload, "model").or_else(|| text(payload, "model_id")),
         }),
-        "beforeSubmitPrompt" | "UserPromptSubmit" | "before_submit_prompt" => {
-            Some(EventKind::TurnStart {
-                summary: excerpt(payload, "prompt"),
-            })
-        }
-        "postToolUse" | "PostToolUse" | "post_tool_use" => Some(EventKind::Heartbeat {
+        "beforeSubmitPrompt" => Some(EventKind::TurnStart {
+            summary: excerpt(payload, "prompt"),
+        }),
+        "postToolUse" => Some(EventKind::Heartbeat {
             activity: tool_summary(payload),
         }),
-        "preCompact" | "PreCompact" | "pre_compact" => Some(EventKind::Heartbeat {
+        "preCompact" => Some(EventKind::Heartbeat {
             activity: Some("compact".into()),
         }),
-        "subagentStart" | "SubagentStart" | "subagent_start" => {
-            str_field(payload, "subagent_id", "agent_id").map(|agent| EventKind::SubagentStart {
-                agent,
-                agent_type: str_field(payload, "subagent_type", "agent_type"),
-                model: text(payload, "subagent_model").or_else(|| text(payload, "model")),
-                summary: excerpt(payload, "task").or_else(|| excerpt(payload, "description")),
-            })
+        "subagentStart" => text(payload, "subagent_id").map(|agent| EventKind::SubagentStart {
+            agent,
+            agent_type: text(payload, "subagent_type"),
+            model: text(payload, "subagent_model"),
+            summary: excerpt(payload, "task"),
+        }),
+        "subagentStop" => {
+            text(payload, "subagent_id").map(|agent| EventKind::SubagentEnd { agent })
         }
-        "subagentStop" | "SubagentStop" | "subagent_stop" => {
-            str_field(payload, "subagent_id", "agent_id")
-                .map(|agent| EventKind::SubagentEnd { agent })
-        }
-        "stop" | "Stop" => match text(payload, "status").as_deref() {
+        "stop" => match payload.get("status").and_then(Value::as_str) {
             Some("error") => Some(EventKind::TurnError {
                 reason: Some("error".into()),
-                summary: excerpt(payload, "error_message").or_else(|| excerpt(payload, "text")),
+                summary: None,
             }),
-            _ => Some(EventKind::TurnEnd {
-                summary: excerpt(payload, "text")
-                    .or_else(|| excerpt(payload, "last_assistant_message")),
-            }),
+            _ => Some(EventKind::TurnEnd { summary: None }),
         },
-        "sessionEnd" | "SessionEnd" | "session_end" => Some(EventKind::SessionEnd),
+        "sessionEnd" => Some(EventKind::SessionEnd),
         _ => None,
     }
-}
-
-fn str_field(payload: &Map<String, Value>, preferred: &str, fallback: &str) -> Option<String> {
-    text(payload, preferred).or_else(|| text(payload, fallback))
-}
-
-fn tool_name(payload: &Map<String, Value>) -> Option<&str> {
-    payload
-        .get("tool_name")
-        .or_else(|| payload.get("toolName"))
-        .and_then(Value::as_str)
-}
-
-fn tool_input(payload: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    payload
-        .get("tool_input")
-        .or_else(|| payload.get("toolInput"))
-        .and_then(Value::as_object)
 }
 
 /// "Shell: cargo test" — tool name plus its most telling argument.
 fn tool_summary(payload: &Map<String, Value>) -> Option<String> {
-    let tool = tool_name(payload)?;
-    let argument = tool_input(payload).and_then(|input| {
-        command_argument(input.get("command")).or_else(|| {
-            [
-                "file_path",
-                "target_file",
-                "path",
-                "target_directory",
-                "query",
-                "pattern",
-                "description",
-                "task",
-            ]
-            .iter()
-            .find_map(|key| input.get(*key).and_then(Value::as_str).map(str::to_owned))
-        })
-    });
-    match argument.as_deref().and_then(one_liner) {
+    let tool = payload.get("tool_name").and_then(Value::as_str)?;
+    let argument = payload
+        .get("tool_input")
+        .and_then(Value::as_object)
+        .and_then(|input| {
+            ["command", "file_path", "path", "query", "pattern"]
+                .iter()
+                .find_map(|key| input.get(*key).and_then(Value::as_str))
+        });
+    match argument.and_then(one_liner) {
         Some(argument) => one_liner(&format!("{tool}: {argument}")),
         None => Some(tool.to_owned()),
-    }
-}
-
-fn command_argument(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(command) => Some(command.clone()),
-        Value::Array(argv) => Some(
-            argv.iter()
-                .map(|arg| match arg {
-                    Value::String(arg) => arg.clone(),
-                    other => other.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        _ => None,
     }
 }
 
@@ -220,7 +170,7 @@ mod tests {
     use gw_plugin_protocol::Event;
 
     fn normalize_payload(raw: &[u8]) -> Vec<Event> {
-        gw_provider_sdk::normalize_session_fields(&["conversation_id", "session_id"], map_kind, raw)
+        gw_provider_sdk::normalize("conversation_id", map_kind, raw)
     }
 
     fn events(payload: &str) -> Vec<Event> {
@@ -259,16 +209,14 @@ mod tests {
                 },
             ),
             (
-                r#"{"conversation_id":"s1","hook_event_name":"stop","status":"completed","text":"done"}"#,
-                EventKind::TurnEnd {
-                    summary: Some("done".into()),
-                },
+                r#"{"conversation_id":"s1","hook_event_name":"stop","status":"completed"}"#,
+                EventKind::TurnEnd { summary: None },
             ),
             (
-                r#"{"conversation_id":"s1","hook_event_name":"stop","status":"error","error_message":"try later"}"#,
+                r#"{"conversation_id":"s1","hook_event_name":"stop","status":"error"}"#,
                 EventKind::TurnError {
                     reason: Some("error".into()),
-                    summary: Some("try later".into()),
+                    summary: None,
                 },
             ),
             (
@@ -286,11 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn session_start_falls_back_to_session_id_and_model_id() {
+    fn session_start_falls_back_to_model_id() {
         let start = event(
-            r#"{"session_id":"s1","hook_event_name":"sessionStart","model_id":"composer-2.5"}"#,
+            r#"{"conversation_id":"s1","hook_event_name":"sessionStart","model_id":"composer-2.5"}"#,
         );
-        assert_eq!(start.session, "s1");
         assert_eq!(
             start.kind,
             EventKind::SessionStart {
@@ -300,23 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn conversation_id_wins_over_session_id() {
-        let start =
-            event(r#"{"conversation_id":"c1","session_id":"s1","hook_event_name":"sessionStart"}"#);
-        assert_eq!(start.session, "c1");
-    }
-
-    #[test]
-    fn accepts_claude_compat_event_names() {
-        let start = event(
-            r#"{"conversation_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hello"}"#,
-        );
-        assert_eq!(
-            start.kind,
-            EventKind::TurnStart {
-                summary: Some("hello".into()),
-            }
-        );
+    fn ignores_session_id_alias() {
+        assert!(events(
+            r#"{"session_id":"s1","hook_event_name":"sessionStart","model":"composer-2.5"}"#
+        )
+        .is_empty());
     }
 
     #[test]
@@ -438,7 +373,6 @@ mod tests {
             events(r#"{"conversation_id":"s1","hook_event_name":"afterAgentThought"}"#).is_empty()
         );
         assert!(events(r#"{"hook_event_name":"sessionStart"}"#).is_empty());
-        assert!(events(r#"{"conversation_id":"","hook_event_name":"sessionStart"}"#).is_empty());
     }
 
     #[test]

@@ -598,8 +598,8 @@ Every agent hook includes:
 | `transcript_path`  | string \| null   | path to the conversation transcript; null if transcripts are disabled |
 
 `sessionStart` / `sessionEnd` also carry `session_id`, documented as the same
-value as `conversation_id`. `gw show --transcript` uses the hook-captured
-`transcript_path`, falling back to
+value as `conversation_id`. gw reads only `conversation_id`. `gw show
+--transcript` uses the hook-captured `transcript_path`, falling back to
 `~/.cursor/projects/*/agent-transcripts/{session_id}/{session_id}.jsonl`.
 
 ### Events relevant to gw
@@ -654,7 +654,7 @@ Attention.
 | Typed notifications | `Notification`                                      | —                                                | —                                | —                                | —                                       | `Notification`                                    | —                                                |
 | Subagents           | `SubagentStart/Stop` + task events                  | `SubagentStart/Stop`                             | —                                | child sessions (ignored)         | — (extension-specific, no shared event) | `SubagentStart` / `SubagentStop`                  | `subagentStart` / `subagentStop`                  |
 | Compaction          | `PreCompact`/`PostCompact`                          | `PreCompact`/`PostCompact`                       | —                                | `session.compacted`              | `session_before_compact`/`session_compact` | `PreCompact` / `PostCompact`                   | `preCompact`                                      |
-| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                      | Session `id`                     | `SessionManager.getSessionId()`         | `sessionId`                                       | `conversation_id` (`session_id` on boundaries)    |
+| Session identity    | `session_id`                                        | `session_id` (+ `turn_id`)                       | `thread.id`                      | Session `id`                     | `SessionManager.getSessionId()`         | `sessionId`                                       | `conversation_id`                                 |
 | Config surface      | `~/.claude/settings.json`                           | `~/.codex/hooks.json` + feature flag             | Amp global plugin                | OpenCode global plugin           | Pi global extension                     | `~/.grok/hooks/*.json`                            | `~/.cursor/hooks.json`                            |
 
 Consequences for gw:
