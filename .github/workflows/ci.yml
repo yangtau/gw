@@ -120,8 +120,10 @@ jobs:
           fi
 
           for archive in dist/gw-*.tar.gz; do
-            system=$(basename "$archive" .tar.gz)
-            gh release upload "$tag" "$archive#${system}-${sha}.tar.gz" --clobber
+            name=$(basename "$archive" .tar.gz)
+            named="dist/${name}-${sha}.tar.gz"
+            cp "$archive" "$named"
+            gh release upload "$tag" "$named" --clobber
           done
 
           python3 - "$sha" <<'PY'
