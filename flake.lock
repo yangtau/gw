@@ -1,17 +1,17 @@
 {
   "nodes": {
-    "nix-prebuilt": {
+    "nix-rust-prebuilt": {
       "locked": {
-        "lastModified": 1786967615,
-        "narHash": "sha256-9ZM0R6QGf+ZBwltY/75Lu5s5bKVzS8PIt948MLzVzSw=",
+        "lastModified": 1786970272,
+        "narHash": "sha256-dE+j3PwKuYGPT/sG5gUQAmchJUI0Ic0iI7Lwgsx5USw=",
         "owner": "yangtau",
-        "repo": "nix-prebuilt",
-        "rev": "9821d0d196dccf32b229a7c81fd6b1ac283ecaad",
+        "repo": "nix-rust-prebuilt",
+        "rev": "bff6d5f5f111172e86a065c7a9ffc6a5ddef7fa7",
         "type": "github"
       },
       "original": {
         "owner": "yangtau",
-        "repo": "nix-prebuilt",
+        "repo": "nix-rust-prebuilt",
         "type": "github"
       }
     },
@@ -33,7 +33,7 @@
     },
     "root": {
       "inputs": {
-        "nix-prebuilt": "nix-prebuilt",
+        "nix-rust-prebuilt": "nix-rust-prebuilt",
         "nixpkgs": "nixpkgs"
       }
     }

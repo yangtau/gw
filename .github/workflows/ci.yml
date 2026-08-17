@@ -45,7 +45,7 @@ jobs:
     needs: [test, lint]
     permissions:
       contents: write
-    uses: yangtau/nix-prebuilt/.github/workflows/publish.yml@main
+    uses: yangtau/nix-rust-prebuilt/.github/workflows/publish.yml@main
     with:
       name: gw
       hashes-path: .nix/prebuilt-hashes.json
