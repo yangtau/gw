@@ -31,7 +31,7 @@
         pname = "gw";
         owner = "yangtau";
         repo = "gw";
-        hashes = ./nix/prebuilt-hashes.json;
+        hashes = ./.nix/prebuilt-hashes.json;
         fromSource =
           pkgs:
           pkgs.rustPlatform.buildRustPackage {

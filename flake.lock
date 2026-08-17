@@ -2,11 +2,11 @@
   "nodes": {
     "nix-prebuilt": {
       "locked": {
-        "lastModified": 1786967191,
-        "narHash": "sha256-JgsOSePa3HoiFDTDREnN+Kffk0Syv+n69voogUxsh0I=",
+        "lastModified": 1786967615,
+        "narHash": "sha256-9ZM0R6QGf+ZBwltY/75Lu5s5bKVzS8PIt948MLzVzSw=",
         "owner": "yangtau",
         "repo": "nix-prebuilt",
-        "rev": "756d5ac46a92a0414c6bf22128ab25bc0dac515f",
+        "rev": "9821d0d196dccf32b229a7c81fd6b1ac283ecaad",
         "type": "github"
       },
       "original": {
