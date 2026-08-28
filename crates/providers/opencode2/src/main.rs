@@ -13,7 +13,7 @@ fn manifest() -> Manifest {
         protocol: PROTOCOL_VERSION,
         id: "opencode2".into(),
         label: "OpenCode2".into(),
-        color: Some("#FF6B35".into()),
+        color: Some("#FF9F1C".into()),
         process: ProcessMatch {
             argv0: vec!["opencode2".into()],
             exclude_args: [
@@ -229,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_uses_observer_only_opencode_hooks() {
+    fn bridge_uses_observer_only_opencode2_hooks() {
         let bridge = &manifest().managed_files[0].content;
         assert!(bridge.contains("eventType === \"session.status\""));
         assert!(bridge.contains("eventType === \"permission.asked\""));
