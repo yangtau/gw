@@ -15,6 +15,7 @@
         "gw-provider-codex"
         "gw-provider-amp"
         "gw-provider-opencode"
+        "gw-provider-opencode2"
         "gw-provider-pi"
         "gw-provider-grok"
         "gw-provider-cursor"

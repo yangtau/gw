@@ -94,6 +94,7 @@ cargo install --path crates/providers/claude
 cargo install --path crates/providers/codex
 cargo install --path crates/providers/amp
 cargo install --path crates/providers/opencode
+cargo install --path crates/providers/opencode2
 cargo install --path crates/providers/pi
 cargo install --path crates/providers/grok
 cargo install --path crates/providers/cursor
@@ -176,7 +177,8 @@ available under the [MIT License](LICENSE).
 - `crates/gw-plugin-protocol` — serde types of the plugin protocol, for Rust
   plugin authors.
 - `crates/providers/claude`, `crates/providers/codex`, `crates/providers/amp`,
-  `crates/providers/opencode`, `crates/providers/pi`, `crates/providers/grok`,
+  `crates/providers/opencode`, `crates/providers/opencode2`,
+  `crates/providers/pi`, `crates/providers/grok`,
   `crates/providers/cursor` — official provider plugins.
 
 Amp support targets its interactive TUI. One Amp pane remains one gw Agent row,
@@ -193,6 +195,10 @@ already-running TUI after setup.
 OpenCode support targets its interactive TUI; commands such as `run`, `serve`,
 `web`, and `attach` are excluded from pane discovery. `gw setup` installs the
 observer plugin at `~/.config/opencode/plugins/gw.ts`; restart OpenCode after setup.
+
+OpenCode2 is the same integration targeting the `opencode2` binary. `gw setup`
+installs the observer plugin at `~/.config/opencode2/plugins/gw.ts`; restart
+OpenCode2 after setup.
 
 Grok Build support targets its interactive TUI. Headless (`-p`) and `grok agent`
 are excluded from pane discovery. `gw setup` installs hooks at
