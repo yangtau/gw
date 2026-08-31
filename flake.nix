@@ -9,17 +9,7 @@
     let
       inherit (nixpkgs) lib;
       systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
-      bins = [
-        "gw"
-        "gw-provider-claude"
-        "gw-provider-codex"
-        "gw-provider-amp"
-        "gw-provider-opencode"
-        "gw-provider-opencode2"
-        "gw-provider-pi"
-        "gw-provider-grok"
-        "gw-provider-cursor"
-      ];
+      bins = builtins.fromJSON (builtins.readFile ./.nix/bins.json);
       meta = {
         description = "tmux-native status panel for coding agents";
         homepage = "https://github.com/yangtau/gw";

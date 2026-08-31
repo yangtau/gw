@@ -35,6 +35,19 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  bins:
+    name: Prebuilt bins stay in sync
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.read.outputs.bins }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          set -euo pipefail
+          python3 .nix/check-prebuilt-bins.py
+          echo "bins=$(jq -r 'join(" ")' .nix/bins.json)" >> "$GITHUB_OUTPUT"
+
   prebuilt:
     name: Publish prebuilt
     if: >-
@@ -42,20 +55,12 @@ jobs:
       && (github.event_name == 'workflow_dispatch'
           || (github.event_name == 'push'
               && !contains(github.event.head_commit.message, 'record prebuilt hashes')))
-    needs: [test, lint]
+    needs: [test, lint, bins]
     permissions:
       contents: write
     uses: yangtau/nix-rust-prebuilt/.github/workflows/publish.yml@main
     with:
       name: gw
       hashes-path: .nix/prebuilt-hashes.json
-      bins: >-
-        gw
-        gw-provider-claude
-        gw-provider-codex
-        gw-provider-amp
-        gw-provider-opencode
-        gw-provider-pi
-        gw-provider-grok
-        gw-provider-cursor
+      bins: ${{ needs.bins.outputs.list }}
     secrets: inherit
