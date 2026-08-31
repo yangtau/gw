@@ -45,7 +45,11 @@ fn manifest() -> Manifest {
             argv: vec!["opencode2".into()],
         },
         resume: Some(Command {
-            argv: vec!["opencode2".into(), "--session".into(), "{session_id}".into()],
+            argv: vec![
+                "opencode2".into(),
+                "--session".into(),
+                "{session_id}".into(),
+            ],
         }),
         resume_prompt: Some(Command {
             argv: vec![
