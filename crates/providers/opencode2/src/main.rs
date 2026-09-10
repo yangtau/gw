@@ -249,7 +249,9 @@ mod tests {
         let bridge = &manifest().managed_files[0].content;
         assert!(bridge.contains("id: \"gw.opencode2\""));
         assert!(bridge.contains("ctx.event.subscribe"));
-        assert!(bridge.contains("session.next.prompted"));
+        assert!(bridge.contains("session.execution.succeeded"));
+        assert!(bridge.contains("session.step.started"));
+        assert!(bridge.contains("session.inbox.enqueued"));
         assert!(bridge.contains("permission.v2.asked"));
         assert!(bridge.contains("\"execute.before\""));
         assert!(bridge.contains("Bun.spawn([\"gw\", \"hook\", \"opencode2\"]"));

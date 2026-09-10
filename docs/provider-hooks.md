@@ -508,13 +508,13 @@ It still reads global config from `~/.config/opencode/`, not
 | Signal | Fields relevant to gw | Notes |
 |---|---|---|
 | `session.created` | `data.info` / `data.sessionID` | native Session begin; child `parentID` ignored |
-| `session.next.prompted` / `prompt.admitted` / `session.hook("prompt")` | session, prompt text, model | user turn admitted |
-| `session.status` busy / `session.next.step.started` | session, model | `session_focus` |
-| `session.next.tool.called` / `tool.hook("execute.before")` | tool, input | tool activity |
+| `session.inbox.enqueued` / `session.hook("prompt")` | session, prompt text | user turn admitted |
+| `session.execution.started` / `session.step.started` | session, model | `session_focus` |
+| `session.tool.started` / `tool.hook("execute.before")` | tool, input | tool activity |
 | `permission.asked` / `permission.v2.asked` | action, resources | blocking approval |
 | `question.asked` / `question.v2.asked` | question text | blocking question |
-| `session.status` idle / `session.idle` | last assistant text | successful turn boundary |
-| `session.next.step.failed` / `session.error` | typed error | provider-reported turn failure |
+| `session.execution.succeeded` / `session.status` idle | last assistant text | successful turn boundary |
+| `session.execution.failed` / `session.error` | typed error | provider-reported turn failure |
 | `session.deleted` | Session info | native Session end |
 
 Child sessions are OpenCode subagents and are ignored so the pane's row
@@ -769,13 +769,13 @@ What the shipped plugins subscribe and how they map to unified events
 | opencode | `session.error`                                      | `turn_error` {error type/message}             |
 | opencode | root `session.deleted`                               | `session_end`                                 |
 | opencode2 | root `session.created`                              | `session_start`                               |
-| opencode2 | `session.next.prompted` / `prompt` hook             | `turn_start` {user text}                      |
-| opencode2 | `session.status` busy / `session.next.step.started` | `session_focus`                               |
-| opencode2 | `session.next.tool.called` / `execute.before`       | `heartbeat` {tool summary}                    |
+| opencode2 | `session.inbox.enqueued` / `prompt` hook            | `turn_start` {user text}                      |
+| opencode2 | `session.execution.started` / `session.step.started` | `session_focus`                             |
+| opencode2 | `session.tool.started` / `execute.before`           | `heartbeat` {tool summary}                    |
 | opencode2 | `permission.asked` / `permission.v2.asked`          | `attention` approval                          |
 | opencode2 | `question.asked` / `question.v2.asked`              | `attention` question                          |
-| opencode2 | `session.status` idle / `session.idle`              | `turn_end` {last assistant text}              |
-| opencode2 | `session.next.step.failed` / `session.error`        | `turn_error` {error type/message}             |
+| opencode2 | `session.execution.succeeded` / `session.status` idle | `turn_end` {last assistant text}            |
+| opencode2 | `session.execution.failed` / `session.error`        | `turn_error` {error type/message}             |
 | opencode2 | root `session.deleted`                              | `session_end`                                 |
 | pi       | new `session_start`                                  | `session_start` {model}                       |
 | pi       | resumed/reloaded `session_start`                     | `session_focus`                               |

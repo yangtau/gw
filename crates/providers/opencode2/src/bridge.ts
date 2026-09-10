@@ -141,7 +141,7 @@ export default {
           if (type === "session.created") {
             const sessionID = classify(info) ?? classify({ id: body.sessionID, parentID: info.parentID });
             if (!sessionID) continue;
-            await remember(sessionID, modelOf(body.model ?? info));
+            void remember(sessionID, modelOf(body.model ?? info));
             continue;
           }
 
@@ -153,7 +153,7 @@ export default {
           if (type === "session.deleted") {
             const sessionID = root(sessionIDOf(body, info));
             if (!sessionID) continue;
-            await emit(sessionID, "session_end");
+            void emit(sessionID, "session_end");
             forget(sessionID);
             continue;
           }
@@ -165,62 +165,88 @@ export default {
             const status = record(body.status);
             const statusType = compact(status?.type ?? body.type);
             if (statusType === "busy") {
-              await emit(sessionID, "session_focus");
+              void emit(sessionID, "session_focus");
             } else if (statusType === "retry") {
-              await emit(sessionID, "tool_start", {
+              void emit(sessionID, "tool_start", {
                 activity: compact(status?.message) ?? "retrying",
               });
             } else if (statusType === "idle") {
-              await emit(sessionID, "turn_end", { summary: summaries.get(sessionID) });
+              void emit(sessionID, "turn_end", { summary: summaries.get(sessionID) });
             }
             continue;
           }
 
-          if (type === "session.idle") {
-            await emit(sessionID, "turn_end", { summary: summaries.get(sessionID) });
+          if (type === "session.idle" || type === "session.execution.succeeded") {
+            void emit(sessionID, "turn_end", { summary: summaries.get(sessionID) });
             continue;
           }
 
-          if (type === "session.next.prompted" || type === "session.next.prompt.admitted") {
-            const summary = promptText(body.prompt) ?? compact(body.text);
+          if (
+            type === "session.next.prompted" ||
+            type === "session.next.prompt.admitted" ||
+            type === "session.inbox.enqueued"
+          ) {
+            const item = record(body.item);
+            const summary =
+              promptText(body.prompt) ??
+              promptText(item) ??
+              compact(body.text) ??
+              compact(item?.text);
             const model = modelOf(body.model);
-            await remember(sessionID, model);
-            await emit(sessionID, "turn_start", { summary });
+            void remember(sessionID, model);
+            if (summary) void emit(sessionID, "turn_start", { summary });
             continue;
           }
 
-          if (type === "session.next.step.started") {
-            await remember(sessionID, modelOf(body.model));
-            await emit(sessionID, "session_focus");
+          if (
+            type === "session.execution.started" ||
+            type === "session.step.started" ||
+            type === "session.next.step.started"
+          ) {
+            void remember(sessionID, modelOf(body.model));
+            void emit(sessionID, "session_focus");
             continue;
           }
 
-          if (type === "session.next.step.failed" || type === "session.error") {
+          if (
+            type === "session.execution.failed" ||
+            type === "session.step.failed" ||
+            type === "session.next.step.failed" ||
+            type === "session.error"
+          ) {
             const error = record(body.error) ?? body;
-            await emit(sessionID, "turn_error", {
+            void emit(sessionID, "turn_error", {
               reason: compact(error.name ?? error.type) ?? "error",
               summary: errorText(error),
             });
             continue;
           }
 
-          if (type === "session.next.tool.called") {
+          if (
+            type === "session.tool.started" ||
+            type === "session.tool.called" ||
+            type === "session.next.tool.called"
+          ) {
             const tool = compact(body.tool) ?? "tool";
             const toolDetail = detail(body.input);
-            await emit(sessionID, "tool_start", {
+            void emit(sessionID, "tool_start", {
               activity: compact(toolDetail ? `${tool}: ${toolDetail}` : tool),
             });
             continue;
           }
 
-          if (type === "session.next.retried") {
-            await emit(sessionID, "tool_start", {
+          if (type === "session.next.retried" || type === "session.step.retried") {
+            void emit(sessionID, "tool_start", {
               activity: errorText(body.error) ?? "retrying",
             });
             continue;
           }
 
-          if (type === "session.next.text.ended" || type === "message.part.updated") {
+          if (
+            type === "session.text.ended" ||
+            type === "session.next.text.ended" ||
+            type === "message.part.updated"
+          ) {
             const part = record(body.part);
             const text = compact(body.text) ?? (part?.type === "text" ? compact(part.text) : undefined);
             if (text) summaries.set(sessionID, text);
@@ -253,7 +279,7 @@ export default {
           }
 
           if (type === "question.asked" || type === "question.v2.asked") {
-            await emit(sessionID, "question_asked", {
+            void emit(sessionID, "question_asked", {
               summary: compact(body.question ?? body.title ?? body.text) ?? "question",
             });
           }
@@ -300,6 +326,9 @@ export default {
       ctx.permission.hook("evaluate", onPermission),
     ]);
 
-    return () => controller.abort();
+    return async () => {
+      controller.abort();
+      await sending;
+    };
   },
 };
