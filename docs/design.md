@@ -34,7 +34,7 @@ The hook process is a child of the agent process. The core walks the ppid chain 
 - Discovery: `gw-provider-*` on PATH and in `~/.config/gw/providers/bin/`.
 - `manifest` → JSON: protocol version, provider id, display label/color, process match rules (argv basename patterns plus excluded args/sequences), launch command, resume command template (`{session_id}`, `{cwd}`), hook install specs (target files, entries to merge), and optional managed integration files.
 - `normalize` → stdin: raw hook payload JSON; stdout: zero or more unified events (JSONL): `session_focus`, `session_start`, `turn_start`, `turn_end`, `turn_error`, `attention` (kind: approval | question), `heartbeat`, `subagent_start`, `subagent_end`, `session_end` — each with native session id; see `protocol.md` for the per-kind optional fields. `session_focus` changes correlation without changing status.
-- Official plugins: `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-pi`, `gw-provider-grok`, `gw-provider-cursor` (same workspace, same protocol, no fast path).
+- Official plugins: `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-opencode2`, `gw-provider-pi`, `gw-provider-grok`, `gw-provider-cursor` (same workspace, same protocol, no fast path).
 
 ## Storage
 
@@ -48,7 +48,7 @@ Cargo workspace:
 - `gw-core` — domain: discovery, event model, Session interpretation (pure Status, Subagent, and Activity replay), correlation, log store, plugin client, tmux shell-out wrapper.
 - `gw` — the binary: CLI (`panel`, `hook`, `setup`), ratatui TUI (fullscreen alt-screen; `TuiEvent`/`AppEvent` split, single `tokio::select!` loop, frame coalescing — patterned after codex-rs's tui architecture).
 - `gw-plugin-protocol` — serde types for manifest/events, published for Rust plugin authors (the protocol itself is JSON-over-CLI; non-Rust plugins just follow the spec).
-- `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-pi`, `gw-provider-grok`, `gw-provider-cursor` — official plugin binaries.
+- `gw-provider-claude`, `gw-provider-codex`, `gw-provider-amp`, `gw-provider-opencode`, `gw-provider-opencode2`, `gw-provider-pi`, `gw-provider-grok`, `gw-provider-cursor` — official plugin binaries.
 
 ## Backlog
 

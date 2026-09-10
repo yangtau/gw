@@ -1,6 +1,6 @@
 # Provider hook reference
 
-Authoritative reference for the hook systems of the seven providers gw integrates
+Authoritative reference for the hook systems of the official providers gw integrates
 with: what events exist, how hooks are configured, how the hook process is invoked,
 and the exact payload each event delivers. This is the factual basis for the unified
 event vocabulary in `protocol.md`.
@@ -18,6 +18,9 @@ Sources and confidence:
   Pi 0.82.1.
 - **opencode**: official plugin documentation and generated SDK event types,
   verified against OpenCode 1.18.9.
+- **opencode2**: OpenCode 2 plugin and CLI docs (`opencode.ai/v2/docs`),
+  verified against `opencode2` 0.0.0-beta-19271 (`debug paths`, plugin load,
+  TUI flags). The V2 plugin API is `setup(ctx)` with `{ type, data }` events.
 - **grok**: official Grok Build user-guide (`10-hooks.md`, `17-sessions.md`)
   verified against Grok 1.0.0. Event names and camelCase envelope are
   documented; `Notification` type `permission_prompt` is inferred from the
@@ -467,6 +470,56 @@ live-captured payloads (gw stores it as the attention summary today). Treat
 caches full text parts but forwards only a bounded one-line summary. A `retry`
 status is activity rather than failure because OpenCode is still working.
 
+---
+
+## opencode2
+
+OpenCode 2 (`opencode2`) is a separate binary and plugin API from OpenCode 1.
+It still reads global config from `~/.config/opencode/`, not
+`~/.config/opencode2/`.
+
+### Configuration and invocation
+
+- Global V2 plugins are discovered under `~/.config/opencode/plugins/` as
+  loose `.ts`/`.js` files or immediate package directories. `gw setup`
+  installs `~/.config/opencode/plugins/gw-opencode2/index.ts` as a
+  hash-protected managed file. The subdirectory keeps the V2 observer out of
+  OpenCode 1's top-level `*.ts` glob (`gw.ts`).
+- The V2 plugin API is `export default { id, setup(ctx) }`. A V1
+  `export const GwPlugin` observer is ignored. Local plugins must not import
+  `@opencode-ai/plugin` — V2 does not resolve that package for discovered
+  files.
+- The bridge invokes `gw hook opencode2` with compact JSON on stdin via
+  `Bun.spawn`. Calls are serialized; failures are swallowed.
+- Observer sources: `ctx.event.subscribe()` (events use `{ type, data }`)
+  plus non-mutating `session.hook("prompt")`, `tool.hook("execute.before")`,
+  and `permission.hook("evaluate")` (only when `effect === "ask"`).
+- Process discovery targets the interactive TUI. Non-interactive and
+  service commands including `run`, `serve`, `service`, `api`, `auth`,
+  `console`, and `pair` are excluded. `mini` is kept — it is an interactive
+  client.
+- Panel launch/resume uses `opencode2 --standalone`. Plugins run inside the
+  background server; without a private server the shared service is not an
+  ancestor of the TUI pane, so hook correlation cannot bind events to that
+  Agent. The interactive TUI has no `--fork` flag.
+
+### Public lifecycle surface
+
+| Signal | Fields relevant to gw | Notes |
+|---|---|---|
+| `session.created` | `data.info` / `data.sessionID` | native Session begin; child `parentID` ignored |
+| `session.inbox.enqueued` / `session.hook("prompt")` | session, prompt text | user turn admitted |
+| `session.execution.started` / `session.step.started` | session, model | `session_focus` |
+| `session.tool.started` / `tool.hook("execute.before")` | tool, input | tool activity |
+| `permission.asked` / `permission.v2.asked` | action, resources | blocking approval |
+| `question.asked` / `question.v2.asked` | question text | blocking question |
+| `session.execution.succeeded` / `session.status` idle | last assistant text | successful turn boundary |
+| `session.execution.failed` / `session.error` | typed error | provider-reported turn failure |
+| `session.deleted` | Session info | native Session end |
+
+Child sessions are OpenCode subagents and are ignored so the pane's row
+stays bound to the root interactive Session.
+
 ### Bridge payload
 
 ```json
@@ -715,6 +768,15 @@ What the shipped plugins subscribe and how they map to unified events
 | opencode | `session.status` idle                                | `turn_end` {last assistant text}              |
 | opencode | `session.error`                                      | `turn_error` {error type/message}             |
 | opencode | root `session.deleted`                               | `session_end`                                 |
+| opencode2 | root `session.created`                              | `session_start`                               |
+| opencode2 | `session.inbox.enqueued` / `prompt` hook            | `turn_start` {user text}                      |
+| opencode2 | `session.execution.started` / `session.step.started` | `session_focus`                             |
+| opencode2 | `session.tool.started` / `execute.before`           | `heartbeat` {tool summary}                    |
+| opencode2 | `permission.asked` / `permission.v2.asked`          | `attention` approval                          |
+| opencode2 | `question.asked` / `question.v2.asked`              | `attention` question                          |
+| opencode2 | `session.execution.succeeded` / `session.status` idle | `turn_end` {last assistant text}            |
+| opencode2 | `session.execution.failed` / `session.error`        | `turn_error` {error type/message}             |
+| opencode2 | root `session.deleted`                              | `session_end`                                 |
 | pi       | new `session_start`                                  | `session_start` {model}                       |
 | pi       | resumed/reloaded `session_start`                     | `session_focus`                               |
 | pi       | `before_agent_start`                                 | `turn_start` {prompt}                         |

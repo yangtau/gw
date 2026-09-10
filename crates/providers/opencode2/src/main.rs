@@ -18,22 +18,28 @@ fn manifest() -> Manifest {
             argv0: vec!["opencode2".into()],
             exclude_args: [
                 "acp",
+                "api",
                 "attach",
+                "auth",
                 "completion",
+                "console",
                 "debug",
                 "export",
                 "github",
                 "import",
                 "mcp",
                 "models",
+                "pair",
                 "plugin",
                 "pr",
                 "providers",
                 "run",
                 "serve",
+                "service",
                 "session",
                 "stats",
                 "uninstall",
+                "update",
                 "upgrade",
                 "web",
             ]
@@ -42,11 +48,12 @@ fn manifest() -> Manifest {
             exclude_arg_sequences: Vec::new(),
         },
         launch: Command {
-            argv: vec!["opencode2".into()],
+            argv: vec!["opencode2".into(), "--standalone".into()],
         },
         resume: Some(Command {
             argv: vec![
                 "opencode2".into(),
+                "--standalone".into(),
                 "--session".into(),
                 "{session_id}".into(),
             ],
@@ -54,27 +61,21 @@ fn manifest() -> Manifest {
         resume_prompt: Some(Command {
             argv: vec![
                 "opencode2".into(),
+                "--standalone".into(),
                 "--session".into(),
                 "{session_id}".into(),
                 "--prompt".into(),
                 "{prompt}".into(),
             ],
         }),
-        fork: Some(Command {
-            argv: vec![
-                "opencode2".into(),
-                "--session".into(),
-                "{session_id}".into(),
-                "--fork".into(),
-            ],
-        }),
+        fork: None,
         transcript: Some(Command {
             argv: vec!["opencode2".into(), "export".into(), "{session_id}".into()],
         }),
         transcript_glob: None,
         hooks: Vec::new(),
         managed_files: vec![ManagedFile {
-            path: "~/.config/opencode2/plugins/gw.ts".into(),
+            path: "~/.config/opencode/plugins/gw-opencode2/index.ts".into(),
             content: include_str!("bridge.ts").into(),
             comment_prefix: "//".into(),
             comment_suffix: String::new(),
@@ -96,6 +97,10 @@ fn map_kind(payload: &Map<String, Value>) -> Option<EventKind> {
         }),
         "permission_asked" => Some(EventKind::Attention {
             attention: AttentionKind::Approval,
+            summary: excerpt(payload, "summary"),
+        }),
+        "question_asked" => Some(EventKind::Attention {
+            attention: AttentionKind::Question,
             summary: excerpt(payload, "summary"),
         }),
         "turn_end" => Some(EventKind::TurnEnd {
@@ -129,25 +134,23 @@ mod tests {
         assert_eq!(manifest.process.argv0, ["opencode2"]);
         assert!(manifest.process.exclude_args.contains(&"run".into()));
         assert!(manifest.process.exclude_args.contains(&"attach".into()));
-        assert_eq!(manifest.launch.argv, ["opencode2"]);
+        assert_eq!(manifest.launch.argv, ["opencode2", "--standalone"]);
         assert_eq!(
             manifest.resume.as_ref().unwrap().argv,
-            ["opencode2", "--session", "{session_id}"]
+            ["opencode2", "--standalone", "--session", "{session_id}"]
         );
         assert_eq!(
             manifest.resume_prompt.as_ref().unwrap().argv,
             [
                 "opencode2",
+                "--standalone",
                 "--session",
                 "{session_id}",
                 "--prompt",
                 "{prompt}"
             ]
         );
-        assert_eq!(
-            manifest.fork.as_ref().unwrap().argv,
-            ["opencode2", "--session", "{session_id}", "--fork"]
-        );
+        assert!(manifest.fork.is_none());
         assert_eq!(
             manifest.transcript.as_ref().unwrap().argv,
             ["opencode2", "export", "{session_id}"]
@@ -156,8 +159,10 @@ mod tests {
         assert_eq!(manifest.managed_files.len(), 1);
         assert_eq!(
             manifest.managed_files[0].path,
-            "~/.config/opencode2/plugins/gw.ts"
+            "~/.config/opencode/plugins/gw-opencode2/index.ts"
         );
+        assert!(manifest.process.exclude_args.contains(&"service".into()));
+        assert!(manifest.process.exclude_args.contains(&"api".into()));
     }
 
     #[test]
@@ -190,6 +195,13 @@ mod tests {
                 EventKind::Attention {
                     attention: AttentionKind::Approval,
                     summary: Some("bash: cargo test".into()),
+                },
+            ),
+            (
+                r#"{"session_id":"s1","event":"question_asked","summary":"which file?"}"#,
+                EventKind::Attention {
+                    attention: AttentionKind::Question,
+                    summary: Some("which file?".into()),
                 },
             ),
             (
@@ -235,9 +247,17 @@ mod tests {
     #[test]
     fn bridge_uses_observer_only_opencode2_hooks() {
         let bridge = &manifest().managed_files[0].content;
-        assert!(bridge.contains("eventType === \"session.status\""));
-        assert!(bridge.contains("eventType === \"permission.asked\""));
-        assert!(bridge.contains("\"tool.execute.before\""));
+        assert!(bridge.contains("id: \"gw.opencode2\""));
+        assert!(bridge.contains("ctx.event.subscribe"));
+        assert!(bridge.contains("session.execution.succeeded"));
+        assert!(bridge.contains("session.step.started"));
+        assert!(bridge.contains("session.inbox.enqueued"));
+        assert!(bridge.contains("permission.v2.asked"));
+        assert!(bridge.contains("\"execute.before\""));
+        assert!(bridge.contains("Bun.spawn([\"gw\", \"hook\", \"opencode2\"]"));
+        assert!(!bridge.contains("@opencode-ai/plugin"));
+        assert!(!bridge.contains("export const GwPlugin"));
+        assert!(!bridge.contains("\"chat.message\""));
         assert!(!bridge.contains("\"permission.ask\""));
     }
 }

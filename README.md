@@ -196,9 +196,14 @@ OpenCode support targets its interactive TUI; commands such as `run`, `serve`,
 `web`, and `attach` are excluded from pane discovery. `gw setup` installs the
 observer plugin at `~/.config/opencode/plugins/gw.ts`; restart OpenCode after setup.
 
-OpenCode2 is the same integration targeting the `opencode2` binary. `gw setup`
-installs the observer plugin at `~/.config/opencode2/plugins/gw.ts`; restart
-OpenCode2 after setup.
+OpenCode2 is a separate integration for the OpenCode 2 `opencode2` binary. V2
+shares OpenCode 1's config directory, not `~/.config/opencode2`. `gw setup`
+installs a V2 observer at `~/.config/opencode/plugins/gw-opencode2/index.ts`
+(a subdirectory so it does not collide with the V1 `gw.ts` plugin). Panel
+launch/resume uses `opencode2 --standalone` so the observer runs in that
+pane's process tree — the default shared background service cannot be
+correlated back to a tmux pane. Restart OpenCode2 after setup. The
+interactive TUI has no `--fork` flag, so fork from the panel is unavailable.
 
 Grok Build support targets its interactive TUI. Headless (`-p`) and `grok agent`
 are excluded from pane discovery. `gw setup` installs hooks at
